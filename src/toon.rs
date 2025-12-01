@@ -911,13 +911,18 @@ pub fn encode_toon_clean(summary: &SemanticSummary) -> String {
             if raw.trim().is_empty() {
                 obj.insert("note".to_string(), json!("(empty file)"));
             } else {
-                let truncated: String = raw.lines().take(10).collect::<Vec<_>>().join("\n");
-                let suffix = if raw.lines().count() > 10 {
-                    "\n..."
+                // Compact representation: single line or line count
+                let lines: Vec<&str> = raw.lines().collect();
+                if lines.len() <= 3 {
+                    let content = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+                    if content.len() <= 100 {
+                        obj.insert("raw".to_string(), json!(content));
+                    } else {
+                        obj.insert("raw".to_string(), json!(format!("{}...", &content[..97])));
+                    }
                 } else {
-                    ""
-                };
-                obj.insert("raw".to_string(), json!(format!("{}{}", truncated, suffix)));
+                    obj.insert("raw".to_string(), json!(format!("({} lines)", lines.len())));
+                }
             }
         }
     }
@@ -1041,22 +1046,27 @@ pub fn encode_toon(summary: &SemanticSummary) -> String {
             && summary.state_changes.is_empty()
             && summary.control_flow_changes.is_empty()
             && summary.symbol.is_none()
+            && summary.insertions.is_empty()
         {
-            // Truncate to 20 lines
-            let truncated: String = raw
-                .lines()
-                .take(20)
-                .collect::<Vec<_>>()
-                .join("\n");
-            let suffix = if raw.lines().count() > 20 {
-                "\n...(truncated)"
+            // For non-code files, provide a compact single-line summary
+            let lines: Vec<&str> = raw.lines().collect();
+            let line_count = lines.len();
+
+            if line_count <= 3 {
+                // Very short files: include as single line
+                let content = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+                if content.len() <= 200 {
+                    obj.insert("raw_source".to_string(), json!(content));
+                } else {
+                    obj.insert("raw_source".to_string(), json!(format!("{}...", &content[..197])));
+                }
             } else {
-                ""
-            };
-            obj.insert(
-                "raw_source".to_string(),
-                json!(format!("{}{}", truncated, suffix)),
-            );
+                // Longer files: just report structure
+                obj.insert(
+                    "raw_source".to_string(),
+                    json!(format!("({} lines)", line_count)),
+                );
+            }
         }
     }
 

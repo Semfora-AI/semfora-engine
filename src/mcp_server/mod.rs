@@ -398,15 +398,58 @@ impl ServerHandler for McpDiffServer {
                 website_url: None,
                 icons: None,
             },
-            instructions: Some(
-                "MCP Semantic Diff server - Analyzes source code and produces highly compressed \
-                 semantic summaries in TOON format. Use analyze_file for single files, \
-                 analyze_directory for entire codebases, and analyze_diff for git changes."
-                    .to_string(),
-            ),
+            instructions: Some(MCP_INSTRUCTIONS.to_string()),
         }
     }
 }
+
+/// Instructions for AI agents using the mcp-diff tools
+const MCP_INSTRUCTIONS: &str = r#"MCP Semantic Diff - Code Analysis for AI Review
+
+## Purpose
+Produces highly compressed semantic summaries in TOON format, enabling efficient code review without reading entire files.
+
+## Tools
+- analyze_file: Analyze a single source file
+- analyze_directory: Analyze entire codebases with framework detection
+- analyze_diff: Compare git branches/commits for code review
+
+## Output Fields
+- symbol: Primary function/class/component name
+- symbol_kind: function|component|class|struct|trait|enum
+- behavioral_risk: low|medium|high (based on complexity and I/O)
+- added_dependencies: Imports and dependencies
+- state_changes: Variables with {name, type, initializer}
+- control_flow: List of if/for/while/match/try constructs
+- calls: Deduplicated function calls with await/try context
+- insertions: Semantic descriptions (e.g., "Next.js API route (GET)")
+
+## Code Review Guidelines
+When reviewing code using analyze_diff output:
+
+1. **Security Review** (behavioral_risk: high)
+   - Check path traversal in file operations
+   - Validate user input handling
+   - Review authentication/authorization patterns
+   - Identify SQL injection, XSS, command injection risks
+
+2. **Quality Review**
+   - Consistent error handling (calls with try: Y are wrapped)
+   - Proper async patterns (calls with await: Y)
+   - State management complexity (state_changes count)
+   - Control flow complexity (control_flow patterns)
+
+3. **Architecture Review**
+   - Module dependencies (added_dependencies)
+   - Public API changes (public_surface_changed)
+   - Framework patterns (insertions describe detected patterns)
+
+4. **Action Items**
+   - For high-risk files: Request full file read for detailed review
+   - For medium-risk: Note concerns, suggest improvements
+   - For low-risk: Approve or note minor style issues
+
+Act as a senior/staff engineer focused on production readiness. Provide actionable feedback with specific file:line references where possible."#;
 
 // ============================================================================
 // Helper Functions

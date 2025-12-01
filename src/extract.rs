@@ -1205,12 +1205,17 @@ fn extract_imports_rust(summary: &mut SemanticSummary, root: &tree_sitter::Node,
         if child.kind() == "use_declaration" {
             // Get the full use path
             if let Some(arg) = child.child_by_field_name("argument") {
-                let use_text = get_node_text(&arg, source);
+                let use_text = get_node_text_normalized(&arg, source);
                 // Extract the last segment as the imported name
                 if let Some(last) = use_text.split("::").last() {
-                    let name = last.trim_matches('{').trim_matches('}').trim();
-                    if !name.is_empty() && name != "*" {
-                        summary.added_dependencies.push(name.to_string());
+                    // Clean up braces and normalize the import names
+                    let cleaned = last.trim_matches('{').trim_matches('}').trim();
+                    // Split comma-separated imports in a use group
+                    for name in cleaned.split(',') {
+                        let name = name.trim();
+                        if !name.is_empty() && name != "*" {
+                            summary.added_dependencies.push(name.to_string());
+                        }
                     }
                 }
             }
@@ -1222,14 +1227,14 @@ fn extract_state_rust(summary: &mut SemanticSummary, root: &tree_sitter::Node, s
     visit_all(root, |node| {
         if node.kind() == "let_declaration" {
             if let Some(pattern) = node.child_by_field_name("pattern") {
-                let name = get_node_text(&pattern, source);
+                let name = get_node_text_normalized(&pattern, source);
                 let type_str = node
                     .child_by_field_name("type")
-                    .map(|t| get_node_text(&t, source))
+                    .map(|t| get_node_text_normalized(&t, source))
                     .unwrap_or_else(|| "_".to_string());
                 let init = node
                     .child_by_field_name("value")
-                    .map(|v| get_node_text(&v, source))
+                    .map(|v| compress_initializer(&get_node_text(&v, source)))
                     .unwrap_or_else(|| "_".to_string());
 
                 summary.state_changes.push(crate::schema::StateChange {
@@ -1616,6 +1621,98 @@ fn get_node_text(node: &tree_sitter::Node, source: &str) -> String {
     node.utf8_text(source.as_bytes())
         .unwrap_or("")
         .to_string()
+}
+
+/// Get text content of a node, normalized to single line (collapse whitespace)
+fn get_node_text_normalized(node: &tree_sitter::Node, source: &str) -> String {
+    normalize_whitespace(&get_node_text(node, source))
+}
+
+/// Normalize whitespace: collapse multiple spaces/newlines to single space
+fn normalize_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Compress a complex initializer expression to a semantic summary
+/// Multi-line match/if/closures become "match Foo::bar(...)" style summaries
+fn compress_initializer(init: &str) -> String {
+    let normalized = normalize_whitespace(init);
+
+    // If it's a simple value, return as-is
+    if normalized.len() <= 60 && !normalized.contains('{') {
+        return normalized;
+    }
+
+    // For complex expressions, extract the essence
+    let trimmed = normalized.trim();
+
+    // Match expressions: extract "match expr {...}"
+    if trimmed.starts_with("match ") {
+        if let Some(brace_pos) = trimmed.find('{') {
+            let match_expr = &trimmed[6..brace_pos].trim();
+            // Truncate long match subjects
+            let subject = if match_expr.len() > 40 {
+                format!("{}...", &match_expr[..40])
+            } else {
+                match_expr.to_string()
+            };
+            return format!("match {} {{...}}", subject);
+        }
+    }
+
+    // If expressions
+    if trimmed.starts_with("if ") {
+        if let Some(brace_pos) = trimmed.find('{') {
+            let condition = &trimmed[3..brace_pos].trim();
+            let cond_short = if condition.len() > 40 {
+                format!("{}...", &condition[..40])
+            } else {
+                condition.to_string()
+            };
+            return format!("if {} {{...}}", cond_short);
+        }
+    }
+
+    // Function/method chains: extract first call
+    if trimmed.contains("(") {
+        // Find the function name before first paren
+        if let Some(paren_pos) = trimmed.find('(') {
+            let prefix = &trimmed[..paren_pos];
+            // Get last identifier in the chain
+            let func_name = prefix.rsplit(&['.', ':'][..]).next().unwrap_or(prefix);
+            if func_name.len() <= 30 {
+                return format!("{}(...)", func_name);
+            }
+        }
+    }
+
+    // Struct/vec literals: summarize
+    if trimmed.starts_with("vec![") || trimmed.starts_with("Vec::") {
+        return "vec![...]".to_string();
+    }
+
+    if trimmed.starts_with("SemanticSummary {") || trimmed.contains("Summary {") {
+        return "SemanticSummary {...}".to_string();
+    }
+
+    if trimmed.starts_with("HashMap::new") {
+        return "HashMap::new()".to_string();
+    }
+
+    // Generic struct literal
+    if let Some(brace_pos) = trimmed.find(" {") {
+        let struct_name = &trimmed[..brace_pos];
+        if struct_name.len() <= 30 && !struct_name.contains('\n') {
+            return format!("{} {{...}}", struct_name);
+        }
+    }
+
+    // Fallback: truncate long expressions
+    if normalized.len() > 60 {
+        format!("{}...", &normalized[..57])
+    } else {
+        normalized
+    }
 }
 
 /// Visit all nodes in a tree
