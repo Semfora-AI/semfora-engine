@@ -58,11 +58,11 @@ pub use lang::{Lang, LangFamily};
 pub use risk::calculate_risk;
 pub use schema::{
     Argument, Call, ControlFlowChange, ControlFlowKind, Import, ImportedName, JsxElement, Location,
-    Prop, RiskLevel, SemanticSummary, StateChange, SymbolKind,
+    ModuleGroup, Prop, RepoOverview, RepoStats, RiskLevel, SemanticSummary, StateChange, SymbolKind,
 };
 // Note: Call is included above for function call tracking
 pub use tokens::{format_analysis_compact, format_analysis_report, TokenAnalysis, TokenAnalyzer};
-pub use toon::encode_toon;
+pub use toon::{encode_toon, encode_toon_clean, encode_toon_directory, generate_repo_overview};
 
 // Re-export git module types
 pub use git::{

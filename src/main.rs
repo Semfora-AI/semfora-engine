@@ -12,8 +12,8 @@ use mcp_diff::git::{
     get_merge_base, get_repo_root, is_git_repo, ChangedFile, ChangeType,
 };
 use mcp_diff::{
-    encode_toon, extract, format_analysis_compact, format_analysis_report, Cli, Lang, McpDiffError,
-    OutputFormat, SemanticSummary, TokenAnalyzer,
+    encode_toon, encode_toon_directory, extract, format_analysis_compact, format_analysis_report,
+    generate_repo_overview, Cli, Lang, McpDiffError, OutputFormat, SemanticSummary, TokenAnalyzer,
 };
 
 fn main() -> ExitCode {
@@ -129,10 +129,11 @@ fn run_directory(cli: &Cli, dir_path: &Path, max_depth: usize) -> mcp_diff::Resu
         eprintln!("Found {} files to analyze", files.len());
     }
 
-    let mut output = String::new();
-    let mut all_toon_output = String::new();
+    // First pass: collect all summaries
+    let mut summaries: Vec<SemanticSummary> = Vec::new();
     let mut all_source_len = 0usize;
-    let mut stats = DirectoryStats::default();
+    let mut _failed_count = 0usize;
+    let mut total_lines = 0usize;
 
     for file_path in &files {
         let relative_path = file_path
@@ -159,6 +160,7 @@ fn run_directory(cli: &Cli, dir_path: &Path, max_depth: usize) -> mcp_diff::Resu
         };
 
         all_source_len += source.len();
+        total_lines += source.lines().count();
 
         let summary = match parse_and_extract_string(file_path, &source, lang) {
             Ok(s) => s,
@@ -166,67 +168,30 @@ fn run_directory(cli: &Cli, dir_path: &Path, max_depth: usize) -> mcp_diff::Resu
                 if cli.verbose {
                     eprintln!("Failed to analyze {}: {}", relative_path, e);
                 }
-                stats.failed += 1;
+                _failed_count += 1;
                 continue;
             }
         };
 
-        // Update stats
-        stats.total += 1;
-        stats.total_lines += source.lines().count();
-        stats.total_control_flow += summary.control_flow_changes.len();
-        stats.total_dependencies += summary.added_dependencies.len();
-        stats.total_calls += summary.calls.len();
-
-        match summary.behavioral_risk {
-            mcp_diff::RiskLevel::High => stats.high_risk += 1,
-            mcp_diff::RiskLevel::Medium => stats.medium_risk += 1,
-            mcp_diff::RiskLevel::Low => stats.low_risk += 1,
-        }
-
-        // Track by language
-        *stats.by_language.entry(lang.name().to_string()).or_insert(0) += 1;
-
-        // Output file analysis (unless summary-only) - pure TOON format
-        if !cli.summary_only {
-            let toon = encode_toon(&summary);
-            output.push_str("---\n");  // TOON record separator
-            output.push_str(&toon);
-            all_toon_output.push_str(&toon);
-        }
+        summaries.push(summary);
     }
 
-    // Summary record - pure TOON format
-    output.push_str("---\n");
-    output.push_str("_type: summary\n");
-    output.push_str(&format!("directory: {}\n", dir_path.display()));
-    output.push_str(&format!("files_analyzed: {}\n", stats.total));
-    if stats.failed > 0 {
-        output.push_str(&format!("files_failed: {}\n", stats.failed));
-    }
-    output.push_str(&format!("total_lines: {}\n", stats.total_lines));
-    output.push_str(&format!(
-        "risk_breakdown: high:{},medium:{},low:{}\n",
-        stats.high_risk, stats.medium_risk, stats.low_risk
-    ));
-    output.push_str(&format!("total_control_flow: {}\n", stats.total_control_flow));
-    output.push_str(&format!("total_dependencies: {}\n", stats.total_dependencies));
-    output.push_str(&format!("total_calls: {}\n", stats.total_calls));
+    // Generate repository overview
+    let dir_str = dir_path.display().to_string();
+    let overview = generate_repo_overview(&summaries, &dir_str);
 
-    // Language breakdown
-    if !stats.by_language.is_empty() {
-        let lang_summary: Vec<String> = stats
-            .by_language
-            .iter()
-            .map(|(k, v)| format!("{}:{}", k, v))
-            .collect();
-        output.push_str(&format!("by_language: {}\n", lang_summary.join(",")));
-    }
+    // Generate output
+    let output = if cli.summary_only {
+        // Just the overview
+        encode_toon_directory(&overview, &[])
+    } else {
+        // Full output with overview and all files
+        encode_toon_directory(&overview, &summaries)
+    };
 
     // Run token analysis if requested
     if let Some(mode) = cli.analyze_tokens {
-        // Calculate compression ratio: source chars vs TOON chars
-        let toon_len = all_toon_output.len();
+        let toon_len = output.len();
         let compression_ratio = if all_source_len > 0 {
             ((all_source_len as f64 - toon_len as f64) / all_source_len as f64) * 100.0
         } else {
@@ -240,12 +205,13 @@ fn run_directory(cli: &Cli, dir_path: &Path, max_depth: usize) -> mcp_diff::Resu
                  toon_chars: {}\n\
                  compression: {:.1}%\n\
                  files: {}\n\
+                 lines: {}\n\
                  ================================",
-                all_source_len, toon_len, compression_ratio, stats.total
+                all_source_len, toon_len, compression_ratio, summaries.len(), total_lines
             ),
             TokenAnalysisMode::Compact => format!(
                 "compression: {:.1}% ({} source → {} toon, {} files)",
-                compression_ratio, all_source_len, toon_len, stats.total
+                compression_ratio, all_source_len, toon_len, summaries.len()
             ),
         };
         eprintln!("{}", report);
@@ -312,21 +278,6 @@ fn collect_files_recursive(
             }
         }
     }
-}
-
-/// Statistics for directory analysis
-#[derive(Default)]
-struct DirectoryStats {
-    total: usize,
-    failed: usize,
-    total_lines: usize,
-    total_control_flow: usize,
-    total_dependencies: usize,
-    total_calls: usize,
-    high_risk: usize,
-    medium_risk: usize,
-    low_risk: usize,
-    by_language: std::collections::HashMap<String, usize>,
 }
 
 /// Run diff branch analysis (Phase 2 mode)

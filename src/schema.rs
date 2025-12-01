@@ -1,6 +1,81 @@
 //! Semantic model data structures for code analysis
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+/// Repository overview for whole-repo analysis
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct RepoOverview {
+    /// Detected framework (Next.js, React, Express, etc.)
+    pub framework: Option<String>,
+
+    /// Detected database/ORM (Drizzle, Prisma, etc.)
+    pub database: Option<String>,
+
+    /// Package manager (npm, pnpm, yarn, cargo, etc.)
+    pub package_manager: Option<String>,
+
+    /// Detected patterns/architectures
+    pub patterns: Vec<String>,
+
+    /// Module groups (files organized by directory/purpose)
+    pub modules: Vec<ModuleGroup>,
+
+    /// Key entry points
+    pub entry_points: Vec<String>,
+
+    /// Internal data flow (file -> files it imports from)
+    pub data_flow: HashMap<String, Vec<String>>,
+
+    /// Total statistics
+    pub stats: RepoStats,
+}
+
+/// A group of related files (by directory or purpose)
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ModuleGroup {
+    /// Module name/path
+    pub name: String,
+
+    /// Purpose description
+    pub purpose: String,
+
+    /// Number of files
+    pub file_count: usize,
+
+    /// Risk level for this module
+    pub risk: RiskLevel,
+
+    /// Key files in this module
+    pub key_files: Vec<String>,
+}
+
+/// Repository statistics
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct RepoStats {
+    /// Total files analyzed
+    pub total_files: usize,
+
+    /// Total lines of code
+    pub total_lines: usize,
+
+    /// Risk breakdown
+    pub high_risk: usize,
+    pub medium_risk: usize,
+    pub low_risk: usize,
+
+    /// Files by language
+    pub by_language: HashMap<String, usize>,
+
+    /// Total API endpoints
+    pub api_endpoints: usize,
+
+    /// Total database tables
+    pub database_tables: usize,
+
+    /// Total React components
+    pub components: usize,
+}
 
 /// Complete semantic summary of a file
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -31,6 +106,10 @@ pub struct SemanticSummary {
 
     /// Added imports/dependencies
     pub added_dependencies: Vec<String>,
+
+    /// Local file imports (for data flow tracking)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub local_imports: Vec<String>,
 
     /// State variable changes
     pub state_changes: Vec<StateChange>,

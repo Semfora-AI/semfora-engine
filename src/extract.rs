@@ -56,8 +56,11 @@ pub fn extract(file_path: &Path, source: &str, tree: &Tree, lang: Lang) -> Resul
     // Calculate risk score
     summary.behavioral_risk = calculate_risk(&summary);
 
-    // Mark extraction as complete if we got a symbol
-    summary.extraction_complete = summary.symbol.is_some();
+    // Mark extraction as complete if we got meaningful semantic info
+    summary.extraction_complete = summary.symbol.is_some()
+        || !summary.insertions.is_empty()
+        || !summary.calls.is_empty()
+        || !summary.added_dependencies.is_empty();
 
     // Add raw fallback if extraction was incomplete
     if !summary.extraction_complete {
@@ -102,7 +105,99 @@ fn extract_javascript_family(
     // Extract function calls with context (awaited, in_try)
     extract_calls_js(summary, &root, source);
 
+    // Generate semantic insertions based on file context
+    generate_js_insertions(summary, source);
+
     Ok(())
+}
+
+/// Generate semantic insertions for JavaScript/TypeScript files
+fn generate_js_insertions(summary: &mut SemanticSummary, source: &str) {
+    let file_lower = summary.file.to_lowercase();
+
+    // Next.js API route detection
+    if file_lower.contains("/api/") && file_lower.ends_with("route.ts") {
+        if let Some(ref sym) = summary.symbol {
+            let method = sym.to_uppercase();
+            if matches!(method.as_str(), "GET" | "POST" | "PUT" | "DELETE" | "PATCH") {
+                summary.insertions.push(format!("Next.js API route ({})", method));
+            }
+        }
+    }
+
+    // Next.js layout detection
+    if file_lower.ends_with("layout.tsx") || file_lower.ends_with("layout.jsx") {
+        if summary.symbol_kind == Some(crate::schema::SymbolKind::Component) {
+            summary.insertions.push("Next.js layout component".to_string());
+        }
+    }
+
+    // Next.js page detection
+    if file_lower.ends_with("page.tsx") || file_lower.ends_with("page.jsx") {
+        if summary.symbol_kind == Some(crate::schema::SymbolKind::Component) {
+            summary.insertions.push("Next.js page component".to_string());
+        }
+    }
+
+    // Database schema detection (drizzle)
+    if file_lower.contains("schema") && (file_lower.ends_with(".ts") || file_lower.ends_with(".js")) {
+        let has_table = summary.calls.iter().any(|c| c.name == "pgTable" || c.name == "mysqlTable" || c.name == "sqliteTable");
+        if has_table {
+            let table_count = summary.calls.iter().filter(|c| c.name.contains("Table")).count();
+            if table_count > 0 {
+                summary.insertions.push(format!("database schema ({} table definition{})", table_count, if table_count > 1 { "s" } else { "" }));
+            }
+        }
+    }
+
+    // Migration file detection
+    if file_lower.contains("migrate") || file_lower.contains("migration") {
+        if summary.calls.iter().any(|c| c.name == "migrate") {
+            summary.insertions.push("database migration script".to_string());
+        }
+    }
+
+    // Seed file detection
+    if file_lower.contains("seed") {
+        let has_insert = summary.calls.iter().any(|c| c.name == "insert" || c.name == "create");
+        if has_insert {
+            summary.insertions.push("database seed data".to_string());
+        }
+    }
+
+    // Drizzle index/db setup
+    if file_lower.ends_with("/db/index.ts") || file_lower.ends_with("/db/index.js") {
+        if summary.calls.iter().any(|c| c.name == "drizzle" || c.name == "postgres" || c.name == "mysql") {
+            summary.insertions.push("database connection setup".to_string());
+        }
+    }
+
+    // Tailwind config detection
+    if file_lower.contains("tailwind.config") {
+        summary.insertions.push("Tailwind CSS configuration".to_string());
+    }
+
+    // PostCSS config detection
+    if file_lower.contains("postcss.config") {
+        summary.insertions.push("PostCSS configuration".to_string());
+    }
+
+    // Next.js config detection
+    if file_lower.contains("next.config") {
+        summary.insertions.push("Next.js configuration".to_string());
+    }
+
+    // Drizzle config detection
+    if file_lower.contains("drizzle.config") {
+        summary.insertions.push("Drizzle ORM configuration".to_string());
+    }
+
+    // Detect async data fetching patterns
+    if source.contains("fetch(") || source.contains("axios") {
+        if !summary.insertions.iter().any(|i| i.contains("network") || i.contains("fetch")) {
+            summary.insertions.push("network data fetching".to_string());
+        }
+    }
 }
 
 /// Extract from Rust files
@@ -216,8 +311,78 @@ fn extract_config(
         _ => {}
     }
 
+    // Generate semantic insertions for config files based on filename
+    generate_config_insertions(summary);
+
     summary.extraction_complete = true;
     Ok(())
+}
+
+/// Generate semantic insertions for config files
+fn generate_config_insertions(summary: &mut SemanticSummary) {
+    let file_lower = summary.file.to_lowercase();
+
+    // Package manifest detection
+    if file_lower.ends_with("package.json") {
+        let dep_count = summary.added_dependencies.iter()
+            .filter(|d| *d == "dependencies" || *d == "devDependencies")
+            .count();
+        if dep_count > 0 {
+            summary.insertions.push("npm package manifest".to_string());
+        }
+    }
+    // TypeScript config
+    else if file_lower.ends_with("tsconfig.json") {
+        summary.insertions.push("TypeScript configuration".to_string());
+    }
+    // Docker compose
+    else if file_lower.contains("docker-compose") {
+        let has_services = summary.added_dependencies.iter().any(|d| d == "services");
+        if has_services {
+            summary.insertions.push("Docker Compose configuration".to_string());
+        }
+    }
+    // ESLint
+    else if file_lower.contains("eslint") {
+        summary.insertions.push("ESLint configuration".to_string());
+    }
+    // Prettier
+    else if file_lower.contains("prettier") {
+        summary.insertions.push("Prettier configuration".to_string());
+    }
+    // Drizzle config
+    else if file_lower.contains("drizzle") {
+        summary.insertions.push("Drizzle ORM configuration".to_string());
+    }
+    // Tailwind config
+    else if file_lower.contains("tailwind") {
+        summary.insertions.push("Tailwind CSS configuration".to_string());
+    }
+    // Next.js config
+    else if file_lower.contains("next.config") {
+        summary.insertions.push("Next.js configuration".to_string());
+    }
+    // PostCSS config
+    else if file_lower.contains("postcss") {
+        summary.insertions.push("PostCSS configuration".to_string());
+    }
+    // Cargo.toml
+    else if file_lower.ends_with("cargo.toml") {
+        summary.insertions.push("Rust package manifest".to_string());
+    }
+
+    // Clear config keys from added_dependencies - they're not imports
+    // Keep them only for semantic meaning, move to a summary
+    let config_keys: Vec<String> = summary.added_dependencies.drain(..).collect();
+    if !config_keys.is_empty() && summary.insertions.is_empty() {
+        // Generic config file - describe the structure
+        let key_summary = if config_keys.len() <= 3 {
+            config_keys.join(", ")
+        } else {
+            format!("{} sections", config_keys.len())
+        };
+        summary.insertions.push(format!("config with {}", key_summary));
+    }
 }
 
 /// Extract structure from JSON files - identify key fields
@@ -557,6 +722,11 @@ fn extract_imports_js(summary: &mut SemanticSummary, root: &tree_sitter::Node, s
                 let module = get_node_text(&clause, source);
                 let module = module.trim_matches('"').trim_matches('\'');
 
+                // Track local imports for data flow analysis
+                if is_local_import(module) {
+                    summary.local_imports.push(normalize_import_path(module));
+                }
+
                 // Get specific imports
                 let mut inner_cursor = child.walk();
                 for inner in child.children(&mut inner_cursor) {
@@ -566,6 +736,33 @@ fn extract_imports_js(summary: &mut SemanticSummary, root: &tree_sitter::Node, s
                 }
             }
         }
+    }
+}
+
+/// Check if an import is a local file import (not a package)
+fn is_local_import(module: &str) -> bool {
+    module.starts_with("./")
+        || module.starts_with("../")
+        || module.starts_with("@/")
+        || module.starts_with("~/")
+}
+
+/// Normalize import path to a consistent format
+fn normalize_import_path(module: &str) -> String {
+    let path = module
+        .trim_start_matches("@/")
+        .trim_start_matches("~/")
+        .to_string();
+
+    // Remove file extension if present
+    if path.ends_with(".ts")
+        || path.ends_with(".tsx")
+        || path.ends_with(".js")
+        || path.ends_with(".jsx")
+    {
+        path.rsplit_once('.').map(|(p, _)| p.to_string()).unwrap_or(path)
+    } else {
+        path
     }
 }
 
@@ -677,9 +874,12 @@ fn extract_state_hooks(summary: &mut SemanticSummary, root: &tree_sitter::Node, 
                                                 }
                                             }
 
+                                            // Infer type from initializer
+                                            let state_type = infer_type_from_initializer(&init);
+
                                             summary.state_changes.push(crate::schema::StateChange {
                                                 name: state_name,
-                                                state_type: "boolean".to_string(), // Simplified
+                                                state_type,
                                                 initializer: init,
                                             });
 
@@ -1352,6 +1552,52 @@ fn extract_includes_c(summary: &mut SemanticSummary, root: &tree_sitter::Node, s
 // ============================================================================
 // Utility functions
 // ============================================================================
+
+/// Infer type from a JavaScript initializer expression
+fn infer_type_from_initializer(init: &str) -> String {
+    let trimmed = init.trim();
+
+    // Array literal
+    if trimmed.starts_with('[') {
+        return "array".to_string();
+    }
+
+    // Object literal
+    if trimmed.starts_with('{') {
+        return "object".to_string();
+    }
+
+    // Boolean literals
+    if trimmed == "true" || trimmed == "false" {
+        return "boolean".to_string();
+    }
+
+    // Null/undefined
+    if trimmed == "null" || trimmed == "undefined" {
+        return "null".to_string();
+    }
+
+    // Number (integer or float)
+    if trimmed.parse::<f64>().is_ok() {
+        return "number".to_string();
+    }
+
+    // String literal (quoted)
+    if (trimmed.starts_with('"') && trimmed.ends_with('"'))
+        || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+        || (trimmed.starts_with('`') && trimmed.ends_with('`'))
+    {
+        return "string".to_string();
+    }
+
+    // Function/arrow function
+    if trimmed.starts_with("function") || trimmed.contains("=>") {
+        return "function".to_string();
+    }
+
+    // Default - unknown/expression
+    "unknown".to_string()
+}
 
 /// Reorder insertions to put state hooks last (per plan.md spec)
 fn reorder_insertions(insertions: &mut Vec<String>) {
