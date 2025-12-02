@@ -152,6 +152,61 @@ pub fn get_diff_stats(from_ref: &str, to_ref: &str, cwd: Option<&Path>) -> Resul
     git_command(&["diff", "--stat", from_ref, to_ref], cwd)
 }
 
+/// Get uncommitted changes (both staged and unstaged) compared to a base ref
+///
+/// This returns all files that differ from the base ref, including:
+/// - Staged changes (ready to commit)
+/// - Unstaged changes (modified but not staged)
+/// - Untracked files are NOT included (use git status for those)
+///
+/// # Arguments
+/// * `base_ref` - The ref to compare against (e.g., "HEAD", "main", "HEAD~1")
+/// * `cwd` - Working directory (None for current)
+///
+/// # Returns
+/// List of changed files with their change types
+pub fn get_uncommitted_changes(base_ref: &str, cwd: Option<&Path>) -> Result<Vec<ChangedFile>> {
+    // git diff <ref> --name-status shows all changes vs that ref (staged + unstaged)
+    let output = git_command(
+        &["diff", base_ref, "--name-status", "-M"],
+        cwd,
+    )?;
+
+    parse_name_status_output(&output)
+}
+
+/// Get staged changes only (changes added to index, ready to commit)
+///
+/// # Arguments
+/// * `cwd` - Working directory (None for current)
+///
+/// # Returns
+/// List of staged files with their change types
+pub fn get_staged_changes(cwd: Option<&Path>) -> Result<Vec<ChangedFile>> {
+    let output = git_command(
+        &["diff", "--cached", "--name-status", "-M"],
+        cwd,
+    )?;
+
+    parse_name_status_output(&output)
+}
+
+/// Get unstaged changes only (modified files not yet staged)
+///
+/// # Arguments
+/// * `cwd` - Working directory (None for current)
+///
+/// # Returns
+/// List of unstaged modified files with their change types
+pub fn get_unstaged_changes(cwd: Option<&Path>) -> Result<Vec<ChangedFile>> {
+    let output = git_command(
+        &["diff", "--name-status", "-M"],
+        cwd,
+    )?;
+
+    parse_name_status_output(&output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -13,7 +13,7 @@ use crate::tokens::{format_analysis_compact, format_analysis_report, TokenAnalyz
 #[command(author)]
 pub struct Cli {
     /// Path to file to analyze (single file mode)
-    #[arg(value_name = "FILE", required_unless_present_any = ["diff", "commit", "commits", "cache_info", "cache_clear", "cache_prune"])]
+    #[arg(value_name = "FILE", required_unless_present_any = ["diff", "commit", "commits", "cache_info", "cache_clear", "cache_prune", "dir", "benchmark"])]
     pub file: Option<PathBuf>,
 
     /// Output format

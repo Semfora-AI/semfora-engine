@@ -11,21 +11,7 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
-use crate::schema::SCHEMA_VERSION;
-
-// FNV-1a constants for 64-bit hash (same as schema.rs for consistency)
-const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-const FNV_PRIME: u64 = 0x100000001b3;
-
-/// Compute a stable FNV-1a hash
-fn fnv1a_hash(data: &str) -> u64 {
-    let mut hash = FNV_OFFSET;
-    for byte in data.bytes() {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
-}
+use crate::schema::{fnv1a_hash, SCHEMA_VERSION};
 
 /// Metadata for cached files to detect staleness
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -324,6 +310,176 @@ impl CacheDir {
         }
         Ok(())
     }
+
+    // ========== Query-Driven API (v1) ==========
+
+    /// Path to the symbol index file (JSONL format)
+    pub fn symbol_index_path(&self) -> PathBuf {
+        self.root.join("symbol_index.jsonl")
+    }
+
+    /// Check if symbol index exists
+    pub fn has_symbol_index(&self) -> bool {
+        self.symbol_index_path().exists()
+    }
+
+    /// Search symbol index with filters
+    /// Returns lightweight entries matching the query
+    pub fn search_symbols(
+        &self,
+        query: &str,
+        module_filter: Option<&str>,
+        kind_filter: Option<&str>,
+        risk_filter: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<SymbolIndexEntry>> {
+        use std::io::BufRead;
+
+        let index_path = self.symbol_index_path();
+        if !index_path.exists() {
+            return Err(crate::McpDiffError::FileNotFound {
+                path: index_path.display().to_string(),
+            });
+        }
+
+        let file = fs::File::open(&index_path)?;
+        let reader = std::io::BufReader::new(file);
+        let query_lower = query.to_lowercase();
+        let mut results = Vec::new();
+
+        for line in reader.lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            let entry: SymbolIndexEntry = match serde_json::from_str(&line) {
+                Ok(e) => e,
+                Err(_) => continue, // Skip malformed lines
+            };
+
+            // Match query against symbol name (case-insensitive, partial)
+            if !entry.symbol.to_lowercase().contains(&query_lower) {
+                continue;
+            }
+
+            // Apply optional filters
+            if let Some(m) = module_filter {
+                if entry.module != m {
+                    continue;
+                }
+            }
+            if let Some(k) = kind_filter {
+                if entry.kind != k {
+                    continue;
+                }
+            }
+            if let Some(r) = risk_filter {
+                if entry.risk != r {
+                    continue;
+                }
+            }
+
+            results.push(entry);
+
+            if results.len() >= limit {
+                break;
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// List symbols in a module (lightweight index only)
+    pub fn list_module_symbols(
+        &self,
+        module: &str,
+        kind_filter: Option<&str>,
+        risk_filter: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<SymbolIndexEntry>> {
+        use std::io::BufRead;
+
+        let index_path = self.symbol_index_path();
+        if !index_path.exists() {
+            return Err(crate::McpDiffError::FileNotFound {
+                path: index_path.display().to_string(),
+            });
+        }
+
+        let file = fs::File::open(&index_path)?;
+        let reader = std::io::BufReader::new(file);
+        let mut results = Vec::new();
+
+        for line in reader.lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            let entry: SymbolIndexEntry = match serde_json::from_str(&line) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            // Must match module
+            if entry.module != module {
+                continue;
+            }
+
+            // Apply optional filters
+            if let Some(k) = kind_filter {
+                if entry.kind != k {
+                    continue;
+                }
+            }
+            if let Some(r) = risk_filter {
+                if entry.risk != r {
+                    continue;
+                }
+            }
+
+            results.push(entry);
+
+            if results.len() >= limit {
+                break;
+            }
+        }
+
+        Ok(results)
+    }
+}
+
+/// Lightweight symbol index entry for query-driven access
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SymbolIndexEntry {
+    /// Symbol name
+    #[serde(rename = "s")]
+    pub symbol: String,
+
+    /// Symbol hash (for get_symbol lookup)
+    #[serde(rename = "h")]
+    pub hash: String,
+
+    /// Symbol kind (fn, struct, component, enum, trait, etc.)
+    #[serde(rename = "k")]
+    pub kind: String,
+
+    /// Module name
+    #[serde(rename = "m")]
+    pub module: String,
+
+    /// File path (relative to repo root)
+    #[serde(rename = "f")]
+    pub file: String,
+
+    /// Line range (e.g., "45-89")
+    #[serde(rename = "l")]
+    pub lines: String,
+
+    /// Risk level (high, medium, low)
+    #[serde(rename = "r")]
+    pub risk: String,
 }
 
 /// Get the base cache directory (XDG-compliant)

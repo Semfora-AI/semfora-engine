@@ -11,7 +11,9 @@ const FNV_OFFSET: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
 
 /// Compute a stable FNV-1a hash (deterministic across runs and platforms)
-fn fnv1a_hash(data: &str) -> u64 {
+///
+/// Used for generating stable symbol IDs and repo cache keys.
+pub fn fnv1a_hash(data: &str) -> u64 {
     let mut hash = FNV_OFFSET;
     for byte in data.bytes() {
         hash ^= byte as u64;
@@ -455,6 +457,14 @@ pub struct SemanticSummary {
 
     /// Kind of the primary symbol
     pub symbol_kind: Option<SymbolKind>,
+
+    /// Start line of the primary symbol (1-indexed)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<usize>,
+
+    /// End line of the primary symbol (1-indexed, inclusive)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<usize>,
 
     /// Component props (for React/Vue components)
     pub props: Vec<Prop>,

@@ -855,6 +855,11 @@ pub fn encode_toon_clean(summary: &SemanticSummary) -> String {
         obj.insert("symbol_kind".to_string(), json!(kind.as_str()));
     }
 
+    // Line range for source extraction
+    if let (Some(start), Some(end)) = (summary.start_line, summary.end_line) {
+        obj.insert("lines".to_string(), json!(format!("{}-{}", start, end)));
+    }
+
     if let Some(ref ret) = summary.return_type {
         obj.insert("return_type".to_string(), json!(ret));
     }
@@ -978,6 +983,11 @@ pub fn encode_toon(summary: &SemanticSummary) -> String {
 
     if let Some(ref kind) = summary.symbol_kind {
         obj.insert("symbol_kind".to_string(), json!(kind.as_str()));
+    }
+
+    // Line range for source extraction
+    if let (Some(start), Some(end)) = (summary.start_line, summary.end_line) {
+        obj.insert("lines".to_string(), json!(format!("{}-{}", start, end)));
     }
 
     if let Some(ref ret) = summary.return_type {

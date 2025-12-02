@@ -79,6 +79,9 @@ impl ShardWriter {
         // Write graph shards
         self.write_graph_shards(&mut stats)?;
 
+        // Write symbol index (query-driven API v1)
+        self.write_symbol_index(&mut stats)?;
+
         Ok(stats)
     }
 
@@ -161,6 +164,47 @@ impl ShardWriter {
         Ok(())
     }
 
+    /// Write the lightweight symbol index for query-driven access
+    fn write_symbol_index(&self, stats: &mut ShardStats) -> Result<()> {
+        use crate::cache::SymbolIndexEntry;
+
+        let path = self.cache.symbol_index_path();
+        let mut file = fs::File::create(&path)?;
+
+        for summary in &self.all_summaries {
+            if let Some(ref symbol_id) = summary.symbol_id {
+                let entry = SymbolIndexEntry {
+                    symbol: summary.symbol.clone().unwrap_or_default(),
+                    hash: symbol_id.hash.clone(),
+                    kind: summary.symbol_kind
+                        .map(|k| format!("{:?}", k).to_lowercase())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    module: extract_module_name(&summary.file),
+                    file: summary.file.clone(),
+                    lines: match (summary.start_line, summary.end_line) {
+                        (Some(s), Some(e)) => format!("{}-{}", s, e),
+                        (Some(s), None) => format!("{}", s),
+                        _ => String::new(),
+                    },
+                    risk: format!("{:?}", summary.behavioral_risk).to_lowercase(),
+                };
+
+                // Write as JSONL (one JSON object per line)
+                let json = serde_json::to_string(&entry)
+                    .map_err(|e| crate::McpDiffError::ExtractionFailure {
+                        message: format!("Failed to serialize symbol index entry: {}", e),
+                    })?;
+                writeln!(file, "{}", json)?;
+
+                stats.index_entries += 1;
+            }
+        }
+
+        stats.index_bytes = fs::metadata(&path)?.len() as usize;
+        stats.files_written += 1;
+        Ok(())
+    }
+
     /// Get the cache directory path
     pub fn cache_path(&self) -> &Path {
         &self.cache.root
@@ -195,12 +239,18 @@ pub struct ShardStats {
 
     /// Bytes written for graphs
     pub graph_bytes: usize,
+
+    /// Number of entries in symbol index
+    pub index_entries: usize,
+
+    /// Bytes written for symbol index
+    pub index_bytes: usize,
 }
 
 impl ShardStats {
     /// Total bytes written
     pub fn total_bytes(&self) -> usize {
-        self.overview_bytes + self.module_bytes + self.symbol_bytes + self.graph_bytes
+        self.overview_bytes + self.module_bytes + self.symbol_bytes + self.graph_bytes + self.index_bytes
     }
 }
 
@@ -341,17 +391,47 @@ fn build_call_graph(summaries: &[SemanticSummary]) -> HashMap<String, Vec<String
 
     for summary in summaries {
         if let Some(ref symbol_id) = summary.symbol_id {
-            let calls: Vec<String> = summary
-                .calls
-                .iter()
-                .map(|c| {
-                    if let Some(ref obj) = c.object {
-                        format!("{}.{}", obj, c.name)
-                    } else {
-                        c.name.clone()
+            let mut calls: Vec<String> = Vec::new();
+
+            // Extract from explicit calls array (JS/TS/Python)
+            for c in &summary.calls {
+                let call_name = if let Some(ref obj) = c.object {
+                    format!("{}.{}", obj, c.name)
+                } else {
+                    c.name.clone()
+                };
+                if !calls.contains(&call_name) {
+                    calls.push(call_name);
+                }
+            }
+
+            // Extract function calls from state_changes initializers (Rust/Go)
+            // These look like: "CacheDir::for_repo(repo_path)?", "build_call_graph(&self.all_summaries)"
+            for state in &summary.state_changes {
+                if !state.initializer.is_empty() {
+                    // Look for function call patterns: name(...) or path::name(...)
+                    if let Some(call_name) = extract_call_from_initializer(&state.initializer) {
+                        if !calls.contains(&call_name) {
+                            calls.push(call_name);
+                        }
                     }
-                })
-                .collect();
+                }
+            }
+
+            // Extract from added_dependencies that look like function calls
+            // (e.g., "encode_toon", "generate_repo_overview")
+            for dep in &summary.added_dependencies {
+                // Skip type-like dependencies (capitalized or contains ::)
+                if !dep.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+                    && !dep.contains("::")
+                    && !calls.contains(dep)
+                {
+                    // Only add if it looks like a function (lowercase start)
+                    if dep.chars().next().map(|c| c.is_lowercase()).unwrap_or(false) {
+                        calls.push(dep.clone());
+                    }
+                }
+            }
 
             if !calls.is_empty() {
                 graph.insert(symbol_id.hash.clone(), calls);
@@ -360,6 +440,70 @@ fn build_call_graph(summaries: &[SemanticSummary]) -> HashMap<String, Vec<String
     }
 
     graph
+}
+
+/// Extract a function call name from an initializer expression
+fn extract_call_from_initializer(init: &str) -> Option<String> {
+    let trimmed = init.trim();
+
+    // Skip simple literals and keywords
+    if trimmed.is_empty()
+        || trimmed.starts_with('"')
+        || trimmed.starts_with('\'')
+        || trimmed.parse::<i64>().is_ok()
+        || trimmed.parse::<f64>().is_ok()
+        || trimmed == "true"
+        || trimmed == "false"
+        || trimmed == "None"
+        || trimmed == "null"
+        || trimmed == "undefined"
+    {
+        return None;
+    }
+
+    // Look for function call pattern: something(...)
+    // Use split_once for guaranteed UTF-8 safety
+    if let Some((before_paren, _)) = trimmed.split_once('(') {
+
+        // Handle method chains: take the last part
+        // e.g., "self.cache.repo_overview_path()" -> "repo_overview_path"
+        let call_part = before_paren
+            .rsplit(&['.', ':'][..])
+            .next()
+            .unwrap_or(before_paren)
+            .trim();
+
+        // Skip if it's a type constructor (starts with uppercase)
+        if call_part.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+            // But allow things like Vec::new, HashMap::new
+            if call_part == "new" || call_part == "default" {
+                // Try to get the type name
+                if let Some(type_part) = before_paren.rsplit("::").nth(1) {
+                    return Some(format!("{}::{}", type_part.trim(), call_part));
+                }
+            }
+            return None;
+        }
+
+        // Skip very short names that are likely not meaningful
+        if call_part.len() < 2 {
+            return None;
+        }
+
+        // Skip common noise
+        let noise = [
+            "iter", "map", "filter", "collect", "clone", "to_string", "len",
+            "is_empty", "unwrap", "unwrap_or", "ok", "err", "as_ref", "as_str",
+            "into", "from", "push", "pop", "get", "insert", "remove",
+        ];
+        if noise.contains(&call_part) {
+            return None;
+        }
+
+        return Some(call_part.to_string());
+    }
+
+    None
 }
 
 /// Encode call graph
@@ -481,7 +625,46 @@ fn extract_module_name(file_path: &str) -> String {
         return "lib".to_string();
     }
 
-    // Try to get first directory under src/
+    // MCP server
+    if path_lower.contains("/mcp_server/") || path_lower.contains("/mcp-server/") {
+        return "mcp_server".to_string();
+    }
+
+    // Git module
+    if path_lower.contains("/git/") {
+        return "git".to_string();
+    }
+
+    // Find the src/ portion of the path (handles absolute paths)
+    let src_marker = "/src/";
+    if let Some(src_pos) = file_path.find(src_marker) {
+        let after_src = &file_path[src_pos + src_marker.len()..];
+
+        // Check if it's a direct file in src/ (like src/main.rs) or a subdirectory
+        if let Some(slash_pos) = after_src.find('/') {
+            // It's a subdirectory - use the directory name as module
+            let module = &after_src[..slash_pos];
+            if !module.is_empty() {
+                return module.to_string();
+            }
+        } else {
+            // Direct file in src/ - use the filename without extension as module
+            let module = after_src
+                .trim_end_matches(".rs")
+                .trim_end_matches(".ts")
+                .trim_end_matches(".tsx")
+                .trim_end_matches(".js")
+                .trim_end_matches(".jsx")
+                .trim_end_matches(".go")
+                .trim_end_matches(".py");
+
+            if !module.is_empty() && module != "index" && module != "mod" && module != "lib" {
+                return module.to_string();
+            }
+        }
+    }
+
+    // Fallback: Try relative path prefixes
     if let Some(stripped) = file_path.strip_prefix("src/").or_else(|| file_path.strip_prefix("./src/")) {
         if let Some(first_part) = stripped.split('/').next() {
             let module = first_part
@@ -508,11 +691,21 @@ mod tests {
 
     #[test]
     fn test_extract_module_name() {
+        // Relative paths
         assert_eq!(extract_module_name("src/api/users.ts"), "api");
         assert_eq!(extract_module_name("src/components/Button.tsx"), "components");
         assert_eq!(extract_module_name("src/lib/utils.ts"), "lib");
         assert_eq!(extract_module_name("tests/unit/foo.test.ts"), "tests");
         assert_eq!(extract_module_name("src/main.rs"), "main");
+
+        // Absolute paths
+        assert_eq!(extract_module_name("/home/user/project/src/cache.rs"), "cache");
+        assert_eq!(extract_module_name("/home/user/project/src/git/branch.rs"), "git");
+        assert_eq!(extract_module_name("/home/user/project/src/mcp_server/mod.rs"), "mcp_server");
+        assert_eq!(extract_module_name("/home/user/project/src/schema.rs"), "database"); // contains /schema
+
+        // Edge cases
+        assert_eq!(extract_module_name("/random/path/file.rs"), "other");
     }
 
     #[test]

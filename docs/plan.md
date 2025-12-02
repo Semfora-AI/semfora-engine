@@ -112,6 +112,15 @@ semfora/
 
 ---
 
+## Related Documents
+
+| Document | Description |
+|----------|-------------|
+| [Semfora Agent Architecture](./semfora-agent-architecture.md) | Google ADK + Claude API code editor/CI integration design |
+| [Query-Driven Architecture](./query-driven-architecture.md) | Token-efficient semantic query patterns |
+
+---
+
 ## 4. Semantic Model
 
 ### 4.1 Core Schema (Current)
@@ -318,13 +327,13 @@ Each file is independently fetchable by an AI agent.
 | get_diff | Fetch typed diffs for a commit |
 | get_impact_radius | Return transitive change impact |
 
-#### Agent Consumption Flow
+#### Agent Consumption Workflow
 
-1. Agent loads `repo_overview`
-2. Agent selects a module
-3. Agent selects involved symbols
-4. Agent proposes change
-5. Semfora returns typed diff + updated risk
+See [Semfora Agent Architecture](./semfora-agent-architecture.md#workflow-patterns) for detailed workflow patterns including:
+- Token budget comparisons (6x improvement over raw file reads)
+- Interactive session flows
+- CI review automation
+- Memory and context management
 
 **Agents never ingest full repository context.**
 
@@ -472,54 +481,16 @@ This only re-indexes files that changed between checkouts, not the entire repo.
 
 ---
 
-#### Query Frequency: Semantic Queries vs Read Commands
+#### Query Frequency & Token Efficiency
 
-**Key Insight: Semantic queries REPLACE file reads at approximately 3:1 ratio.**
+**Key Insight: Semantic queries REPLACE file reads at approximately 6:1 ratio.**
 
-**Current Workflow (without semantic sharding):**
+For detailed workflow comparisons and token budget analysis, see [Semfora Agent Architecture - Token Budget Comparison](./semfora-agent-architecture.md#token-budget-comparison).
 
-```
-Agent task: "Add pagination to the users API"
-
-Tool calls:
-1. Glob **/*.ts                           → 847 files
-2. Grep "users"                           → 23 matches
-3. Read src/api/users.ts                  → 450 lines
-4. Read src/types/user.ts                 → 120 lines
-5. Read src/db/queries/users.ts           → 280 lines
-6. Grep "pagination"                      → 5 matches
-7. Read src/components/Pagination.tsx     → 95 lines
-8. Read src/hooks/usePagination.ts        → 60 lines
-... (continues)
-
-Total: 15-35 tool calls, ~2000+ lines of raw source ingested
-```
-
-**With Semantic Queries:**
-
-```
-Agent task: "Add pagination to the users API"
-
-Tool calls:
-1. get_repo_overview                      → 50 lines, knows API is in src/api/
-2. get_module("api")                      → 200 lines, sees users.ts symbols
-3. get_symbol("a]4f2...")                 → 30 lines, getUsersHandler details
-4. get_call_graph("a]4f2...")             → 40 lines, sees DB dependencies
-5. Read src/api/users.ts                  → For actual editing
-6. get_module("components")               → 150 lines, finds Pagination
-7. get_symbol("b]8e1...")                 → 25 lines, Pagination props
-
-Total: 7 tool calls, ~500 lines of structured semantic data + 1 file read
-```
-
-**Comparison:**
-
-| Metric | Without Sharding | With Sharding | Improvement |
-|--------|------------------|---------------|-------------|
-| Tool calls | 15-35 | 5-12 | ~3x fewer |
-| Context tokens | 2000+ lines raw | ~500 lines semantic | ~4x smaller |
-| Agent parsing work | High (must understand raw code) | Low (pre-analyzed) | Significant |
-| Time to first insight | Slow (multiple reads) | Fast (overview immediate) | Much faster |
+Summary:
+- **Without semantic layer:** 15-35 tool calls, ~25,000 tokens of raw source
+- **With semantic layer:** 6 tool calls, ~4,150 tokens
+- **Improvement:** ~6x fewer tokens, ~3x fewer tool calls
 
 **When Agents Still Use Read:**
 
@@ -531,16 +502,7 @@ Semantic queries are for **understanding**. Read is for **editing**.
 | "Show me the API handlers" | `get_module("api")` |
 | "What calls this function?" | `get_call_graph(symbol_id)` |
 | "I need to edit this file" | `Read` (for exact source) |
-| "Show me the comments on line 45" | `Read` (semantic layer strips comments) |
 | "What changed in this PR?" | `get_diff(commit)` |
-
-**Caching Strategy for Hot Paths:**
-
-Since agents query `repo_overview` on nearly every session:
-1. Keep `repo_overview` in memory always
-2. LRU cache for recently accessed modules (keep 10)
-3. Mmap symbol files for fast random access
-4. Pre-warm entry points on startup
 
 ---
 
@@ -626,22 +588,23 @@ semfora cache prune --orphaned
 - Plan migration strategy
 - Critical for: downstream consumer stability
 
-**Priority 3.0E: Graph Aggregation**
-- Populate RepoOverview.data_flow from local_imports
-- Add DependencyGraph to output
-- Add module_graph generation
-- Consider StateInteractionGraph for complex repos
+**Priority 3.0E: Graph Aggregation** (COMPLETED)
+- Populate RepoOverview.data_flow from local_imports ✓
+- Add DependencyGraph to output (call_graph, import_graph in shard.rs) ✓
+- Add module_graph generation ✓
+- Consider StateInteractionGraph for complex repos (deferred to future)
 - Critical for: impact radius queries, safe refactoring
 
-**Priority 3.0F: Detector Modularization + Symbol Selection**
-- Split extract.rs into language-family modules
-- Structure: src/detectors/{js,rust,python,go}/
-- Each detector: stateless, single-purpose, unit-testable
-- **Improve primary symbol selection heuristics:**
-  - Prioritize public/exported symbols over private helpers
-  - Prefer structs/enums/traits over functions for Rust
-  - Consider filename matching (e.g., `toon.rs` → prefer `encode_toon`)
-  - For multi-symbol files, consider emitting a `symbols[]` array in addition to primary
+**Priority 3.0F: Detector Modularization + Symbol Selection** (IN PROGRESS)
+- Split extract.rs into language-family modules ✓
+- Structure: src/detectors/{common,javascript,rust,python,go}.rs ✓
+- Each detector: stateless, single-purpose, unit-testable ✓
+- **Improve primary symbol selection heuristics:** ✓
+  - Prioritize public/exported symbols over private helpers ✓
+  - Prefer structs/enums/traits over functions for Rust ✓
+  - Consider filename matching (e.g., `toon.rs` → prefer `encode_toon`) ✓
+  - For multi-symbol files, consider emitting a `symbols[]` array in addition to primary (deferred)
+- Remaining: Java, C/C++, Markup, Config detectors (lower priority)
 - Critical for: maintainability, new language support, accurate semantic representation
 
 ---
@@ -739,6 +702,8 @@ intent:
 ---
 
 ### Phase 7.0: Hosted Semfora Platform (Separate Program)
+
+> **Note:** The local agent architecture using Google ADK is documented in [Semfora Agent Architecture](./semfora-agent-architecture.md). The hosted platform extends this with cloud sync capabilities, enabling 1-3 second cold starts instead of 30-60 second local index generation.
 
 **Strategic Context:**
 
