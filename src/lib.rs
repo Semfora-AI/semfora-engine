@@ -39,6 +39,7 @@
 //! println!("{}", toon);
 //! ```
 
+pub mod benchmark;
 pub mod cache;
 pub mod cli;
 pub mod detectors;
@@ -83,3 +84,9 @@ pub use cache::{
 
 // Re-export shard module types
 pub use shard::{ShardStats, ShardWriter};
+
+// Re-export benchmark types
+pub use benchmark::{
+    analyze_repo_tokens, estimate_tokens, RawFileRead, RepoTokenMetrics, SemanticQuery,
+    TaskBenchmark, TokenMetrics,
+};

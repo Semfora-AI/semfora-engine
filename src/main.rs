@@ -15,6 +15,7 @@ use mcp_diff::{
     encode_toon, encode_toon_directory, extract, format_analysis_compact, format_analysis_report,
     generate_repo_overview, Cli, Lang, McpDiffError, OutputFormat, SemanticSummary, TokenAnalyzer,
     CacheDir, ShardWriter, get_cache_base_dir, list_cached_repos, prune_old_caches,
+    analyze_repo_tokens,
 };
 
 fn main() -> ExitCode {
@@ -44,6 +45,16 @@ fn run() -> mcp_diff::Result<String> {
 
     if let Some(days) = cli.cache_prune {
         return run_cache_prune(days);
+    }
+
+    // Handle benchmark mode
+    if cli.benchmark {
+        let dir_path = cli.file.as_ref()
+            .filter(|p| p.is_dir())
+            .or(cli.dir.as_ref())
+            .map(|p| p.clone())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        return run_benchmark(&dir_path);
     }
 
     let mode = cli.operation_mode()?;
@@ -431,6 +442,12 @@ fn run_cache_prune(days: u32) -> mcp_diff::Result<String> {
     output.push_str(&format!("Pruned {} cache(s) older than {} days.\n", count, days));
 
     Ok(output)
+}
+
+/// Run token efficiency benchmark
+fn run_benchmark(dir_path: &Path) -> mcp_diff::Result<String> {
+    let metrics = analyze_repo_tokens(dir_path)?;
+    Ok(metrics.report())
 }
 
 /// Recursively collect supported files from a directory

@@ -129,6 +129,14 @@ pub struct GenerateIndexRequest {
     pub max_depth: Option<usize>,
 }
 
+/// Request to get call graph from sharded index
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetCallGraphRequest {
+    /// Path to the repository (defaults to current directory)
+    #[schemars(description = "Path to the repository root (defaults to current directory)")]
+    pub path: Option<String>,
+}
+
 // ============================================================================
 // MCP Server Implementation
 // ============================================================================
@@ -710,6 +718,50 @@ impl McpDiffServer {
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
+
+    /// Get call graph from sharded index
+    #[tool(description = "Get the call graph showing which functions call which other functions. Returns a mapping of symbol -> [called symbols] that can be used to understand code flow and impact radius of changes.")]
+    async fn get_call_graph(
+        &self,
+        Parameters(request): Parameters<GetCallGraphRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let repo_path = match &request.path {
+            Some(p) => self.resolve_path(p).await,
+            None => self.working_dir.lock().await.clone(),
+        };
+
+        let cache = match CacheDir::for_repo(&repo_path) {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Failed to access cache: {}",
+                    e
+                ))]));
+            }
+        };
+
+        if !cache.exists() {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "No sharded index found for {}. Run generate_index first.",
+                repo_path.display()
+            ))]));
+        }
+
+        let call_graph_path = cache.call_graph_path();
+        if !call_graph_path.exists() {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "Call graph not found in index. The index may need to be regenerated.",
+            )]));
+        }
+
+        match fs::read_to_string(&call_graph_path) {
+            Ok(content) => Ok(CallToolResult::success(vec![Content::text(content)])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Failed to read call graph: {}",
+                e
+            ))])),
+        }
+    }
 }
 
 #[tool_handler]
@@ -752,6 +804,7 @@ For repositories over 100 files, use the **sharded index workflow**:
 - **list_modules**: List available module shards (api, components, lib, tests, etc.)
 - **get_module**: Get all symbols in a specific module
 - **get_symbol**: Get detailed info for a specific symbol by hash
+- **get_call_graph**: Get function call relationships for impact analysis
 - **generate_index**: Create/regenerate the sharded index
 
 ### On-Demand Analysis (For small repos or quick checks)

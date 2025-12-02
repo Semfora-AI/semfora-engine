@@ -92,6 +92,14 @@ pub struct Cli {
     /// Prune caches older than N days
     #[arg(long, value_name = "DAYS")]
     pub cache_prune: Option<u32>,
+
+    // ============================================
+    // Benchmark Options
+    // ============================================
+
+    /// Run token efficiency benchmark comparing semantic vs raw file reads
+    #[arg(long)]
+    pub benchmark: bool,
 }
 
 /// Token analysis output mode
