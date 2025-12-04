@@ -13,8 +13,8 @@ use std::path::Path;
 
 use crate::cache::{CacheDir, IndexingStatus, SourceFileInfo};
 use crate::error::Result;
-use crate::schema::{RepoOverview, RiskLevel, SemanticSummary, SCHEMA_VERSION};
-use crate::toon::{encode_toon, generate_repo_overview};
+use crate::schema::{RepoOverview, RiskLevel, SemanticSummary, SymbolId, SymbolInfo, SymbolKind, SCHEMA_VERSION};
+use crate::toon::{encode_toon, generate_repo_overview, is_meaningful_call};
 
 /// Write sharded IR output for a repository
 pub struct ShardWriter {
@@ -122,9 +122,28 @@ impl ShardWriter {
     }
 
     /// Write per-symbol shards
+    ///
+    /// This now iterates over summary.symbols to capture ALL symbols in each file,
+    /// not just the primary symbol. This is the key fix for multi-symbol files.
     fn write_symbol_shards(&self, stats: &mut ShardStats) -> Result<()> {
         for summary in &self.all_summaries {
-            if let Some(ref symbol_id) = summary.symbol_id {
+            let namespace = SymbolId::namespace_from_path(&summary.file);
+
+            // If we have symbols in the new multi-symbol format, use those
+            if !summary.symbols.is_empty() {
+                for symbol_info in &summary.symbols {
+                    let symbol_id = symbol_info.to_symbol_id(&namespace);
+                    let toon = encode_symbol_shard_from_info(summary, symbol_info, &symbol_id);
+                    let path = self.cache.symbol_path(&symbol_id.hash);
+
+                    let mut file = fs::File::create(&path)?;
+                    file.write_all(toon.as_bytes())?;
+
+                    stats.symbol_bytes += toon.len();
+                    stats.symbols_written += 1;
+                }
+            } else if let Some(ref symbol_id) = summary.symbol_id {
+                // Fallback to old single-symbol format for backward compatibility
                 let toon = encode_symbol_shard(summary);
                 let path = self.cache.symbol_path(&symbol_id.hash);
 
@@ -165,6 +184,8 @@ impl ShardWriter {
     }
 
     /// Write the lightweight symbol index for query-driven access
+    ///
+    /// Now writes entries for ALL symbols in summary.symbols, not just the primary one.
     fn write_symbol_index(&self, stats: &mut ShardStats) -> Result<()> {
         use crate::cache::SymbolIndexEntry;
 
@@ -172,14 +193,41 @@ impl ShardWriter {
         let mut file = fs::File::create(&path)?;
 
         for summary in &self.all_summaries {
-            if let Some(ref symbol_id) = summary.symbol_id {
+            let namespace = SymbolId::namespace_from_path(&summary.file);
+            let module_name = extract_module_name(&summary.file);
+
+            // If we have symbols in the new multi-symbol format, use those
+            if !summary.symbols.is_empty() {
+                for symbol_info in &summary.symbols {
+                    let symbol_id = symbol_info.to_symbol_id(&namespace);
+                    let entry = SymbolIndexEntry {
+                        symbol: symbol_info.name.clone(),
+                        hash: symbol_id.hash.clone(),
+                        kind: format!("{:?}", symbol_info.kind).to_lowercase(),
+                        module: module_name.clone(),
+                        file: summary.file.clone(),
+                        lines: format!("{}-{}", symbol_info.start_line, symbol_info.end_line),
+                        risk: format!("{:?}", symbol_info.behavioral_risk).to_lowercase(),
+                    };
+
+                    // Write as JSONL (one JSON object per line)
+                    let json = serde_json::to_string(&entry)
+                        .map_err(|e| crate::McpDiffError::ExtractionFailure {
+                            message: format!("Failed to serialize symbol index entry: {}", e),
+                        })?;
+                    writeln!(file, "{}", json)?;
+
+                    stats.index_entries += 1;
+                }
+            } else if let Some(ref symbol_id) = summary.symbol_id {
+                // Fallback to old single-symbol format
                 let entry = SymbolIndexEntry {
                     symbol: summary.symbol.clone().unwrap_or_default(),
                     hash: symbol_id.hash.clone(),
                     kind: summary.symbol_kind
                         .map(|k| format!("{:?}", k).to_lowercase())
                         .unwrap_or_else(|| "unknown".to_string()),
-                    module: extract_module_name(&summary.file),
+                    module: module_name,
                     file: summary.file.clone(),
                     lines: match (summary.start_line, summary.end_line) {
                         (Some(s), Some(e)) => format!("{}-{}", s, e),
@@ -322,6 +370,8 @@ fn encode_repo_overview_with_meta(overview: &RepoOverview, progress: &IndexingSt
 }
 
 /// Encode a module shard with all its files
+///
+/// Now lists ALL symbols from each file's summary.symbols, not just the primary one.
 fn encode_module_shard(module_name: &str, summaries: &[SemanticSummary], repo_root: &Path) -> String {
     let mut lines = Vec::new();
 
@@ -330,23 +380,70 @@ fn encode_module_shard(module_name: &str, summaries: &[SemanticSummary], repo_ro
     lines.push(format!("module: \"{}\"", module_name));
     lines.push(format!("file_count: {}", summaries.len()));
 
-    // Calculate aggregate risk
-    let high = summaries.iter().filter(|s| s.behavioral_risk == RiskLevel::High).count();
-    let medium = summaries.iter().filter(|s| s.behavioral_risk == RiskLevel::Medium).count();
-    let low = summaries.len() - high - medium;
+    // Collect ALL symbols from all files in this module
+    let mut all_symbols: Vec<(String, String, SymbolKind, String, RiskLevel)> = Vec::new();
+    let mut high = 0;
+    let mut medium = 0;
+    let mut low = 0;
+
+    for summary in summaries {
+        let namespace = SymbolId::namespace_from_path(&summary.file);
+
+        // If we have multi-symbol format, use those
+        if !summary.symbols.is_empty() {
+            for symbol_info in &summary.symbols {
+                let symbol_id = symbol_info.to_symbol_id(&namespace);
+                let lines_str = format!("{}-{}", symbol_info.start_line, symbol_info.end_line);
+                all_symbols.push((
+                    symbol_id.hash,
+                    symbol_info.name.clone(),
+                    symbol_info.kind,
+                    lines_str,
+                    symbol_info.behavioral_risk,
+                ));
+
+                match symbol_info.behavioral_risk {
+                    RiskLevel::High => high += 1,
+                    RiskLevel::Medium => medium += 1,
+                    RiskLevel::Low => low += 1,
+                }
+            }
+        } else if let Some(ref symbol_id) = summary.symbol_id {
+            // Fallback to old format
+            let lines_str = match (summary.start_line, summary.end_line) {
+                (Some(s), Some(e)) => format!("{}-{}", s, e),
+                _ => String::new(),
+            };
+            all_symbols.push((
+                symbol_id.hash.clone(),
+                summary.symbol.clone().unwrap_or_default(),
+                summary.symbol_kind.unwrap_or_default(),
+                lines_str,
+                summary.behavioral_risk,
+            ));
+
+            match summary.behavioral_risk {
+                RiskLevel::High => high += 1,
+                RiskLevel::Medium => medium += 1,
+                RiskLevel::Low => low += 1,
+            }
+        }
+    }
+
     lines.push(format!("risk_breakdown: \"high:{},medium:{},low:{}\"", high, medium, low));
 
-    // List symbols in this module
-    let symbols: Vec<_> = summaries
-        .iter()
-        .filter_map(|s| s.symbol_id.as_ref().map(|id| (&id.hash, s.symbol.as_ref(), &s.behavioral_risk)))
-        .collect();
-
-    if !symbols.is_empty() {
-        lines.push(format!("symbols[{}]{{hash,name,risk}}:", symbols.len()));
-        for (hash, name, risk) in symbols {
-            let name_str = name.map(|n| n.as_str()).unwrap_or("_");
-            lines.push(format!("  {},\"{}\",{}", hash, name_str, risk.as_str()));
+    // List all symbols with expanded info
+    if !all_symbols.is_empty() {
+        lines.push(format!("symbols[{}]{{hash,name,kind,lines,risk}}:", all_symbols.len()));
+        for (hash, name, kind, lines_str, risk) in &all_symbols {
+            lines.push(format!(
+                "  {},\"{}\",{},{},{}",
+                hash,
+                name,
+                kind.as_str(),
+                lines_str,
+                risk.as_str()
+            ));
         }
     }
 
@@ -364,7 +461,7 @@ fn encode_module_shard(module_name: &str, summaries: &[SemanticSummary], repo_ro
     lines.join("\n")
 }
 
-/// Encode a single symbol shard
+/// Encode a single symbol shard (legacy format)
 fn encode_symbol_shard(summary: &SemanticSummary) -> String {
     let mut lines = Vec::new();
 
@@ -373,6 +470,131 @@ fn encode_symbol_shard(summary: &SemanticSummary) -> String {
 
     // Full symbol encoding
     lines.push(encode_toon(summary));
+
+    lines.join("\n")
+}
+
+/// Encode a symbol shard from SymbolInfo (new multi-symbol format)
+///
+/// This creates a complete symbol shard from a SymbolInfo struct,
+/// combining file-level metadata from the summary with symbol-specific data.
+fn encode_symbol_shard_from_info(
+    summary: &SemanticSummary,
+    symbol_info: &SymbolInfo,
+    symbol_id: &SymbolId,
+) -> String {
+    let mut lines = Vec::new();
+
+    lines.push(format!("_type: symbol_shard"));
+    lines.push(format!("schema_version: \"{}\"", SCHEMA_VERSION));
+    lines.push(format!("file: \"{}\"", summary.file));
+    lines.push(format!("language: {}", summary.language));
+    lines.push(format!("symbol_id: {}", symbol_id.hash));
+    lines.push(format!("symbol_namespace: \"{}\"", symbol_id.namespace));
+    lines.push(format!("symbol: {}", symbol_info.name));
+    lines.push(format!("symbol_kind: {}", symbol_info.kind.as_str()));
+    lines.push(format!("lines: \"{}-{}\"", symbol_info.start_line, symbol_info.end_line));
+
+    if symbol_info.is_exported {
+        lines.push(format!("public_surface_changed: true"));
+    }
+
+    lines.push(format!("behavioral_risk: {}", symbol_info.behavioral_risk.as_str()));
+
+    // Arguments
+    if !symbol_info.arguments.is_empty() {
+        let args: Vec<String> = symbol_info
+            .arguments
+            .iter()
+            .map(|a| {
+                if let Some(ref t) = a.arg_type {
+                    format!("{}:{}", a.name, t)
+                } else {
+                    a.name.clone()
+                }
+            })
+            .collect();
+        lines.push(format!("arguments[{}]: {}", args.len(), args.join(",")));
+    }
+
+    // Props
+    if !symbol_info.props.is_empty() {
+        let props: Vec<String> = symbol_info
+            .props
+            .iter()
+            .map(|p| {
+                if let Some(ref t) = p.prop_type {
+                    format!("{}:{}", p.name, t)
+                } else {
+                    p.name.clone()
+                }
+            })
+            .collect();
+        lines.push(format!("props[{}]: {}", props.len(), props.join(",")));
+    }
+
+    // Return type
+    if let Some(ref ret) = symbol_info.return_type {
+        lines.push(format!("return_type: \"{}\"", ret));
+    }
+
+    // Control flow
+    if !symbol_info.control_flow.is_empty() {
+        let cf: Vec<String> = symbol_info
+            .control_flow
+            .iter()
+            .map(|c| c.kind.as_str().to_string())
+            .collect();
+        lines.push(format!("control_flow[{}]: {}", cf.len(), cf.join(",")));
+    }
+
+    // Calls (use file-level calls for now, filtered by line range would be ideal)
+    // For now, include all file-level calls as context
+    if !summary.calls.is_empty() {
+        let meaningful_calls: Vec<_> = summary
+            .calls
+            .iter()
+            .filter(|c| is_meaningful_call(&c.name, c.object.as_deref()))
+            .collect();
+
+        if !meaningful_calls.is_empty() {
+            lines.push(format!("calls[{}]{{name,obj,await,try,count}}:", meaningful_calls.len()));
+
+            // Deduplicate calls
+            let mut call_counts: HashMap<String, (Option<String>, bool, bool, usize)> = HashMap::new();
+            for call in &meaningful_calls {
+                let key = format!("{}:{:?}", call.name, call.object);
+                call_counts
+                    .entry(key)
+                    .and_modify(|e| e.3 += 1)
+                    .or_insert((call.object.clone(), call.is_awaited, call.in_try, 1));
+            }
+
+            for (key, (obj, is_awaited, in_try, count)) in call_counts {
+                let name = key.split(':').next().unwrap_or(&key);
+                let obj_str = obj.as_deref().unwrap_or("_");
+                let await_str = if is_awaited { "Y" } else { "_" };
+                let try_str = if in_try { "Y" } else { "_" };
+                let count_str = if count > 1 {
+                    format!("\"{}\"", count)
+                } else {
+                    "_".to_string()
+                };
+                lines.push(format!("  {},{},{},{},{}", name, obj_str, await_str, try_str, count_str));
+            }
+        }
+    }
+
+    // Include file-level dependencies as context
+    if !summary.added_dependencies.is_empty() {
+        let deps: Vec<String> = summary
+            .added_dependencies
+            .iter()
+            .take(20) // Limit to avoid huge output
+            .cloned()
+            .collect();
+        lines.push(format!("added_dependencies[{}]: {}", deps.len(), deps.join(",")));
+    }
 
     lines.join("\n")
 }

@@ -3,7 +3,7 @@
 use tree_sitter::{Node, Tree};
 use crate::detectors::common::get_node_text;
 use crate::error::Result;
-use crate::schema::{SemanticSummary, SymbolKind};
+use crate::schema::{RiskLevel, SemanticSummary, SymbolInfo, SymbolKind};
 
 pub fn extract(summary: &mut SemanticSummary, _source: &str, tree: &Tree) -> Result<()> {
     let root = tree.root_node();
@@ -18,7 +18,18 @@ pub fn extract(summary: &mut SemanticSummary, _source: &str, tree: &Tree) -> Res
     Ok(())
 }
 
+/// Candidate symbol for ranking
+struct SymbolCandidate {
+    name: String,
+    kind: SymbolKind,
+    is_public: bool,
+    start_line: usize,
+    end_line: usize,
+    score: i32,
+}
+
 fn find_primary_symbol(summary: &mut SemanticSummary, root: &Node, is_header: bool) {
+    let mut candidates: Vec<SymbolCandidate> = Vec::new();
     let mut cursor = root.walk();
 
     for child in root.children(&mut cursor) {
@@ -26,27 +37,38 @@ fn find_primary_symbol(summary: &mut SemanticSummary, root: &Node, is_header: bo
             "function_definition" => {
                 if let Some(declarator) = child.child_by_field_name("declarator") {
                     if let Some(name) = extract_declarator_name(&declarator, &summary.file) {
-                        summary.symbol = Some(name);
-                        summary.symbol_kind = Some(SymbolKind::Function);
-                        summary.start_line = Some(child.start_position().row + 1);
-                        summary.end_line = Some(child.end_position().row + 1);
-                        if is_header {
-                            summary.public_surface_changed = true;
+                        // Functions in headers are public, main gets bonus
+                        let is_public = is_header;
+                        let mut score = if is_public { 50 } else { 10 };
+                        if name == "main" {
+                            score += 40;
                         }
-                        return;
+
+                        candidates.push(SymbolCandidate {
+                            name,
+                            kind: SymbolKind::Function,
+                            is_public,
+                            start_line: child.start_position().row + 1,
+                            end_line: child.end_position().row + 1,
+                            score,
+                        });
                     }
                 }
             }
             "struct_specifier" | "class_specifier" => {
                 if let Some(name_node) = child.child_by_field_name("name") {
-                    summary.symbol = Some(get_node_text(&name_node, &summary.file));
-                    summary.symbol_kind = Some(SymbolKind::Struct);
-                    summary.start_line = Some(child.start_position().row + 1);
-                    summary.end_line = Some(child.end_position().row + 1);
-                    if is_header {
-                        summary.public_surface_changed = true;
-                    }
-                    return;
+                    let name = get_node_text(&name_node, &summary.file);
+                    let is_public = is_header;
+                    let score = if is_public { 80 } else { 30 }; // Structs/classes are important
+
+                    candidates.push(SymbolCandidate {
+                        name,
+                        kind: SymbolKind::Struct,
+                        is_public,
+                        start_line: child.start_position().row + 1,
+                        end_line: child.end_position().row + 1,
+                        score,
+                    });
                 }
             }
             "declaration" => {
@@ -56,6 +78,41 @@ fn find_primary_symbol(summary: &mut SemanticSummary, root: &Node, is_header: bo
                 }
             }
             _ => {}
+        }
+    }
+
+    // Sort by score (highest first)
+    candidates.sort_by(|a, b| b.score.cmp(&a.score));
+
+    // Convert ALL candidates to SymbolInfo and add to summary.symbols
+    for candidate in &candidates {
+        let symbol_info = SymbolInfo {
+            name: candidate.name.clone(),
+            kind: candidate.kind,
+            start_line: candidate.start_line,
+            end_line: candidate.end_line,
+            is_exported: candidate.is_public,
+            is_default_export: false,
+            hash: None,
+            arguments: Vec::new(),
+            props: Vec::new(),
+            return_type: None,
+            calls: Vec::new(),
+            control_flow: Vec::new(),
+            state_changes: Vec::new(),
+            behavioral_risk: RiskLevel::Low,
+        };
+        summary.symbols.push(symbol_info);
+    }
+
+    // Use the best candidate for primary symbol (backward compatibility)
+    if let Some(best) = candidates.first() {
+        summary.symbol = Some(best.name.clone());
+        summary.symbol_kind = Some(best.kind);
+        summary.start_line = Some(best.start_line);
+        summary.end_line = Some(best.end_line);
+        if best.is_public {
+            summary.public_surface_changed = true;
         }
     }
 }

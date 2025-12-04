@@ -25,7 +25,7 @@ use crate::{
 
 // Re-export types for external use
 pub use types::*;
-use helpers::{check_cache_staleness, collect_files, parse_and_extract};
+use helpers::{check_cache_staleness, check_cache_staleness_detailed, collect_files, parse_and_extract};
 
 // ============================================================================
 // MCP Server Implementation
@@ -395,6 +395,7 @@ impl McpDiffServer {
         }
 
         let max_depth = request.max_depth.unwrap_or(10);
+        let extensions = request.extensions.unwrap_or_default();
 
         let mut shard_writer = match ShardWriter::new(&dir_path) {
             Ok(w) => w,
@@ -403,7 +404,7 @@ impl McpDiffServer {
             ))])),
         };
 
-        let files = collect_files(&dir_path, max_depth, &[]);
+        let files = collect_files(&dir_path, max_depth, &extensions);
 
         if files.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(format!(
@@ -596,6 +597,164 @@ impl McpDiffServer {
         };
 
         let output = format_module_symbols(&request.module, &results, &cache);
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    // ========================================================================
+    // Batch Operation Tools
+    // ========================================================================
+
+    #[tool(description = "Get detailed semantic information for multiple symbols by their hashes. More efficient than multiple get_symbol calls. Returns up to 20 symbols per request. Use this for batch fetching after search_symbols.")]
+    async fn get_symbols(
+        &self,
+        Parameters(request): Parameters<GetSymbolsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let repo_path = match &request.path {
+            Some(p) => self.resolve_path(p).await,
+            None => self.get_working_dir().await,
+        };
+
+        let cache = match CacheDir::for_repo(&repo_path) {
+            Ok(c) => c,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Failed to access cache: {}", e
+            ))])),
+        };
+
+        if !cache.exists() {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "No sharded index found for {}. Run generate_index first.", repo_path.display()
+            ))]));
+        }
+
+        // Limit to 20 symbols per request for token efficiency
+        let hashes: Vec<&str> = request.hashes.iter()
+            .take(20)
+            .map(|s| s.as_str())
+            .collect();
+
+        let include_source = request.include_source.unwrap_or(false);
+        let context = request.context.unwrap_or(3);
+
+        let mut output = String::new();
+        output.push_str("_type: batch_symbols\n");
+        output.push_str(&format!("requested: {}\n", hashes.len()));
+
+        let mut found = 0;
+        let mut not_found: Vec<&str> = Vec::new();
+
+        for hash in &hashes {
+            let symbol_path = cache.symbol_path(hash);
+            if symbol_path.exists() {
+                match fs::read_to_string(&symbol_path) {
+                    Ok(content) => {
+                        output.push_str(&format!("\n--- {} ---\n", hash));
+                        output.push_str(&content);
+
+                        // Optionally include source code
+                        if include_source {
+                            if let Some(source_snippet) = extract_source_for_symbol(&cache, &content, context) {
+                                output.push_str("\n__source__:\n");
+                                output.push_str(&source_snippet);
+                            }
+                        }
+                        found += 1;
+                    }
+                    Err(_) => not_found.push(hash),
+                }
+            } else {
+                not_found.push(hash);
+            }
+        }
+
+        output.push_str(&format!("\n_summary:\n  found: {}\n", found));
+        if !not_found.is_empty() {
+            output.push_str(&format!("  not_found: {}\n", not_found.join(",")));
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    #[tool(description = "Check if the semantic index is fresh or stale. Returns staleness status, age, and modified files. Use auto_refresh=true to automatically regenerate a stale index.")]
+    async fn check_index(
+        &self,
+        Parameters(request): Parameters<CheckIndexRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let repo_path = match &request.path {
+            Some(p) => self.resolve_path(p).await,
+            None => self.get_working_dir().await,
+        };
+
+        let cache = match CacheDir::for_repo(&repo_path) {
+            Ok(c) => c,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Failed to access cache: {}", e
+            ))])),
+        };
+
+        // Check if index exists
+        if !cache.exists() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "_type: index_status\nstatus: missing\nhint: Run generate_index to create the index."
+            )]));
+        }
+
+        // Get detailed staleness info
+        let max_age = request.max_age.unwrap_or(3600); // Default: 1 hour
+        let staleness = check_cache_staleness_detailed(&cache, max_age);
+
+        let mut output = String::new();
+        output.push_str("_type: index_status\n");
+        output.push_str(&format!("status: {}\n", if staleness.is_stale { "stale" } else { "fresh" }));
+        output.push_str(&format!("age_seconds: {}\n", staleness.age_seconds));
+        output.push_str(&format!("files_checked: {}\n", staleness.files_checked));
+        output.push_str(&format!("modified_count: {}\n", staleness.modified_files.len()));
+
+        if !staleness.modified_files.is_empty() {
+            output.push_str("modified_files:\n");
+            for file in staleness.modified_files.iter().take(10) {
+                output.push_str(&format!("  - {}\n", file));
+            }
+            if staleness.modified_files.len() > 10 {
+                output.push_str(&format!("  ... and {} more\n", staleness.modified_files.len() - 10));
+            }
+        }
+
+        // Auto-refresh if requested and stale
+        if staleness.is_stale && request.auto_refresh.unwrap_or(false) {
+            output.push_str("\nauto_refresh: initiating\n");
+
+            // Create shard writer and regenerate
+            let mut shard_writer = match ShardWriter::new(&repo_path) {
+                Ok(w) => w,
+                Err(e) => {
+                    output.push_str(&format!("refresh_error: {}\n", e));
+                    return Ok(CallToolResult::success(vec![Content::text(output)]));
+                }
+            };
+
+            let files = collect_files(&repo_path, 10, &[]);
+            if files.is_empty() {
+                output.push_str("refresh_error: No supported files found\n");
+                return Ok(CallToolResult::success(vec![Content::text(output)]));
+            }
+
+            let (summaries, _) = analyze_files_with_stats(&files);
+            shard_writer.add_summaries(summaries.clone());
+
+            let dir_str = repo_path.display().to_string();
+            match shard_writer.write_all(&dir_str) {
+                Ok(stats) => {
+                    output.push_str("refresh_status: completed\n");
+                    output.push_str(&format!("refreshed_modules: {}\n", stats.modules_written));
+                    output.push_str(&format!("refreshed_symbols: {}\n", stats.symbols_written));
+                }
+                Err(e) => {
+                    output.push_str(&format!("refresh_error: {}\n", e));
+                }
+            }
+        }
+
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 }
@@ -813,6 +972,47 @@ fn find_cache_for_path(start_path: &Path) -> Result<CacheDir, String> {
     }
 
     Err("Could not find sharded index. Use start_line/end_line directly or run generate_index.".to_string())
+}
+
+/// Extract source code for a symbol given its shard content
+/// Parses the file path and line range from the TOON content
+fn extract_source_for_symbol(cache: &CacheDir, symbol_content: &str, context: usize) -> Option<String> {
+    // Parse file and lines from TOON: "file: ..." and "lines: ..."
+    let mut file_path: Option<String> = None;
+    let mut start_line: Option<usize> = None;
+    let mut end_line: Option<usize> = None;
+
+    for line in symbol_content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("file:") {
+            file_path = Some(
+                trimmed
+                    .trim_start_matches("file:")
+                    .trim()
+                    .trim_matches('"')
+                    .to_string(),
+            );
+        } else if trimmed.starts_with("lines:") {
+            let range_str = trimmed
+                .trim_start_matches("lines:")
+                .trim()
+                .trim_matches('"');
+            if let Some((s, e)) = range_str.split_once('-') {
+                start_line = s.parse().ok();
+                end_line = e.parse().ok();
+            }
+        }
+    }
+
+    let file = file_path?;
+    let start = start_line?;
+    let end = end_line?;
+
+    // Resolve file path relative to repo root
+    let full_path = cache.repo_root.join(&file);
+    let source = fs::read_to_string(&full_path).ok()?;
+
+    Some(format_source_snippet(&full_path, &source, start, end, context))
 }
 
 /// Format a source code snippet with line numbers and markers

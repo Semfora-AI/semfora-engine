@@ -57,6 +57,31 @@ fn run() -> semfora_mcp::Result<String> {
         return run_benchmark(&dir_path);
     }
 
+    // Handle shard query commands
+    if cli.list_modules {
+        return run_list_modules(&cli);
+    }
+
+    if let Some(ref module_name) = cli.get_module {
+        return run_get_module(&cli, module_name);
+    }
+
+    if let Some(ref query) = cli.search_symbols {
+        return run_search_symbols(&cli, query);
+    }
+
+    if let Some(ref module_name) = cli.list_symbols {
+        return run_list_module_symbols(&cli, module_name);
+    }
+
+    if let Some(ref symbol_hash) = cli.get_symbol {
+        return run_get_symbol(&cli, symbol_hash);
+    }
+
+    if cli.get_overview {
+        return run_get_overview(&cli);
+    }
+
     let mode = cli.operation_mode()?;
 
     // Handle sharded output mode
@@ -74,6 +99,7 @@ fn run() -> semfora_mcp::Result<String> {
         OperationMode::SingleFile(path) => run_single_file(&cli, &path),
         OperationMode::Directory { path, max_depth } => run_directory(&cli, &path, max_depth),
         OperationMode::DiffBranch { base_ref } => run_diff_branch(&cli, &base_ref),
+        OperationMode::Uncommitted { base_ref } => run_uncommitted(&cli, &base_ref),
         OperationMode::SingleCommit { sha } => run_single_commit(&cli, &sha),
         OperationMode::AllCommits { base_ref } => run_all_commits(&cli, &base_ref),
     }
@@ -450,6 +476,220 @@ fn run_benchmark(dir_path: &Path) -> semfora_mcp::Result<String> {
     Ok(metrics.report())
 }
 
+// ============================================================================
+// Shard Query Commands
+// ============================================================================
+
+/// List all modules in the cached index
+fn run_list_modules(cli: &Cli) -> semfora_mcp::Result<String> {
+    let current_dir = std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
+        path: format!("current directory: {}", e),
+    })?;
+
+    let cache = CacheDir::for_repo(&current_dir)?;
+
+    if !cache.exists() {
+        return Err(McpDiffError::FileNotFound {
+            path: format!("No index found. Run with --shard first to generate index."),
+        });
+    }
+
+    let modules = cache.list_modules();
+
+    let mut output = String::new();
+
+    match cli.format {
+        OutputFormat::Json => {
+            let json = serde_json::json!({
+                "modules": modules,
+                "count": modules.len()
+            });
+            output = serde_json::to_string_pretty(&json).unwrap_or_default();
+        }
+        OutputFormat::Toon => {
+            output.push_str(&format!("modules[{}]:\n", modules.len()));
+            for module in &modules {
+                output.push_str(&format!("  {}\n", module));
+            }
+        }
+    }
+
+    Ok(output)
+}
+
+/// Get a specific module's content from the cache
+fn run_get_module(cli: &Cli, module_name: &str) -> semfora_mcp::Result<String> {
+    let current_dir = std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
+        path: format!("current directory: {}", e),
+    })?;
+
+    let cache = CacheDir::for_repo(&current_dir)?;
+
+    if !cache.exists() {
+        return Err(McpDiffError::FileNotFound {
+            path: format!("No index found. Run with --shard first to generate index."),
+        });
+    }
+
+    let module_path = cache.module_path(module_name);
+
+    if !module_path.exists() {
+        return Err(McpDiffError::FileNotFound {
+            path: format!("Module '{}' not found in index", module_name),
+        });
+    }
+
+    let content = fs::read_to_string(&module_path)?;
+    Ok(content)
+}
+
+/// Search for symbols by name in the cached index
+fn run_search_symbols(cli: &Cli, query: &str) -> semfora_mcp::Result<String> {
+    let current_dir = std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
+        path: format!("current directory: {}", e),
+    })?;
+
+    let cache = CacheDir::for_repo(&current_dir)?;
+
+    if !cache.has_symbol_index() {
+        return Err(McpDiffError::FileNotFound {
+            path: format!("No symbol index found. Run with --shard first to generate index."),
+        });
+    }
+
+    let results = cache.search_symbols(
+        query,
+        None, // module filter - could add later
+        cli.kind.as_deref(),
+        cli.risk.as_deref(),
+        cli.limit,
+    )?;
+
+    let mut output = String::new();
+
+    match cli.format {
+        OutputFormat::Json => {
+            let json = serde_json::json!({
+                "query": query,
+                "results": results,
+                "count": results.len()
+            });
+            output = serde_json::to_string_pretty(&json).unwrap_or_default();
+        }
+        OutputFormat::Toon => {
+            output.push_str(&format!("query: \"{}\"\n", query));
+            output.push_str(&format!("results[{}]:\n", results.len()));
+            for entry in &results {
+                output.push_str(&format!(
+                    "  {} ({}) - {} [{}] {}:{}\n",
+                    entry.symbol, entry.kind, entry.module, entry.risk, entry.file, entry.lines
+                ));
+            }
+        }
+    }
+
+    Ok(output)
+}
+
+/// List all symbols in a module from the cached index
+fn run_list_module_symbols(cli: &Cli, module_name: &str) -> semfora_mcp::Result<String> {
+    let current_dir = std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
+        path: format!("current directory: {}", e),
+    })?;
+
+    let cache = CacheDir::for_repo(&current_dir)?;
+
+    if !cache.has_symbol_index() {
+        return Err(McpDiffError::FileNotFound {
+            path: format!("No symbol index found. Run with --shard first to generate index."),
+        });
+    }
+
+    let results = cache.list_module_symbols(
+        module_name,
+        cli.kind.as_deref(),
+        cli.risk.as_deref(),
+        cli.limit,
+    )?;
+
+    let mut output = String::new();
+
+    match cli.format {
+        OutputFormat::Json => {
+            let json = serde_json::json!({
+                "module": module_name,
+                "symbols": results,
+                "count": results.len()
+            });
+            output = serde_json::to_string_pretty(&json).unwrap_or_default();
+        }
+        OutputFormat::Toon => {
+            output.push_str(&format!("module: \"{}\"\n", module_name));
+            output.push_str(&format!("symbols[{}]:\n", results.len()));
+            for entry in &results {
+                output.push_str(&format!(
+                    "  {} ({}) [{}] - {}:{}\n",
+                    entry.symbol, entry.kind, entry.risk, entry.file, entry.lines
+                ));
+            }
+        }
+    }
+
+    Ok(output)
+}
+
+/// Get a specific symbol's details by hash
+fn run_get_symbol(cli: &Cli, symbol_hash: &str) -> semfora_mcp::Result<String> {
+    let current_dir = std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
+        path: format!("current directory: {}", e),
+    })?;
+
+    let cache = CacheDir::for_repo(&current_dir)?;
+
+    if !cache.exists() {
+        return Err(McpDiffError::FileNotFound {
+            path: format!("No index found. Run with --shard first to generate index."),
+        });
+    }
+
+    let symbol_path = cache.symbol_path(symbol_hash);
+
+    if !symbol_path.exists() {
+        return Err(McpDiffError::FileNotFound {
+            path: format!("Symbol '{}' not found in index", symbol_hash),
+        });
+    }
+
+    let content = fs::read_to_string(&symbol_path)?;
+    Ok(content)
+}
+
+/// Get the repository overview from the cache
+fn run_get_overview(cli: &Cli) -> semfora_mcp::Result<String> {
+    let current_dir = std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
+        path: format!("current directory: {}", e),
+    })?;
+
+    let cache = CacheDir::for_repo(&current_dir)?;
+
+    if !cache.exists() {
+        return Err(McpDiffError::FileNotFound {
+            path: format!("No index found. Run with --shard first to generate index."),
+        });
+    }
+
+    let overview_path = cache.repo_overview_path();
+
+    if !overview_path.exists() {
+        return Err(McpDiffError::FileNotFound {
+            path: format!("Repository overview not found in index"),
+        });
+    }
+
+    let content = fs::read_to_string(&overview_path)?;
+    Ok(content)
+}
+
 /// Recursively collect supported files from a directory
 fn collect_files(dir: &Path, max_depth: usize, cli: &Cli) -> Vec<PathBuf> {
     let mut files = Vec::new();
@@ -587,6 +827,174 @@ fn run_diff_branch(cli: &Cli, base_ref: &str) -> semfora_mcp::Result<String> {
     ));
 
     Ok(output)
+}
+
+/// Run uncommitted changes analysis (working directory vs base_ref)
+fn run_uncommitted(cli: &Cli, base_ref: &str) -> semfora_mcp::Result<String> {
+    // Verify we're in a git repo
+    if !is_git_repo(None) {
+        return Err(McpDiffError::NotGitRepo);
+    }
+
+    let repo_root_str = get_repo_root(None)?;
+    let repo_root = Path::new(&repo_root_str);
+
+    if cli.verbose {
+        eprintln!("Analyzing uncommitted changes against: {}", base_ref);
+    }
+
+    // Get uncommitted changes (working directory vs base_ref)
+    let changed_files = semfora_mcp::git::get_uncommitted_changes(base_ref, None)?;
+
+    if changed_files.is_empty() {
+        return Ok("No uncommitted changes.\n".to_string());
+    }
+
+    if cli.verbose {
+        eprintln!("Found {} uncommitted files", changed_files.len());
+    }
+
+    let mut output = String::new();
+    output.push_str(&format!(
+        "═══════════════════════════════════════════════════════\n"
+    ));
+    output.push_str(&format!(
+        "  UNCOMMITTED: {} → WORKING ({} files)\n",
+        base_ref,
+        changed_files.len()
+    ));
+    output.push_str(&format!(
+        "═══════════════════════════════════════════════════════\n\n"
+    ));
+
+    let mut total_stats = DiffStats::default();
+
+    for changed_file in &changed_files {
+        // Check extension filter
+        if let Some(ext) = Path::new(&changed_file.path).extension() {
+            if !cli.should_process_extension(ext.to_str().unwrap_or("")) {
+                continue;
+            }
+        }
+
+        // For uncommitted changes, we analyze the current working copy
+        let file_output = process_uncommitted_file(cli, &repo_root, changed_file, base_ref)?;
+        if let Some((summary_output, stats)) = file_output {
+            output.push_str(&summary_output);
+            total_stats.merge(&stats);
+        }
+    }
+
+    // Summary statistics
+    if !cli.summary_only {
+        output.push_str(&format!(
+            "\n═══════════════════════════════════════════════════════\n"
+        ));
+        output.push_str(&format!("  SUMMARY\n"));
+        output.push_str(&format!(
+            "═══════════════════════════════════════════════════════\n"
+        ));
+    }
+    output.push_str(&format!(
+        "files: {} added, {} modified, {} deleted\n",
+        total_stats.added, total_stats.modified, total_stats.deleted
+    ));
+    output.push_str(&format!(
+        "risk: {} high, {} medium, {} low\n",
+        total_stats.high_risk, total_stats.medium_risk, total_stats.low_risk
+    ));
+
+    Ok(output)
+}
+
+/// Process an uncommitted file change
+fn process_uncommitted_file(
+    cli: &Cli,
+    repo_root: &Path,
+    changed_file: &semfora_mcp::git::ChangedFile,
+    _base_ref: &str,
+) -> semfora_mcp::Result<Option<(String, DiffStats)>> {
+    let file_path = repo_root.join(&changed_file.path);
+    let mut stats = DiffStats::default();
+
+    // Update stats based on change type
+    match changed_file.change_type {
+        semfora_mcp::git::ChangeType::Added => stats.added += 1,
+        semfora_mcp::git::ChangeType::Modified => stats.modified += 1,
+        semfora_mcp::git::ChangeType::Deleted => stats.deleted += 1,
+        _ => stats.modified += 1,
+    }
+
+    // Skip deleted files (can't analyze what doesn't exist)
+    if changed_file.change_type == semfora_mcp::git::ChangeType::Deleted {
+        if cli.summary_only {
+            return Ok(Some((String::new(), stats)));
+        }
+        return Ok(Some((
+            format!("[-] {} (deleted)\n", changed_file.path),
+            stats,
+        )));
+    }
+
+    // Check if file exists in working directory
+    if !file_path.exists() {
+        return Ok(None);
+    }
+
+    // Try to detect language
+    let lang = match Lang::from_path(&file_path) {
+        Ok(l) => l,
+        Err(_) => return Ok(None), // Skip unsupported files
+    };
+
+    // Read and analyze current working copy
+    let source = match fs::read_to_string(&file_path) {
+        Ok(s) => s,
+        Err(_) => return Ok(None),
+    };
+
+    let summary = parse_and_extract(&file_path, &source, lang, cli)?;
+
+    // Determine risk level (behavioral_risk is a RiskLevel enum)
+    let risk_str = summary.behavioral_risk.as_str();
+    match risk_str {
+        "high" => stats.high_risk += 1,
+        "medium" => stats.medium_risk += 1,
+        _ => stats.low_risk += 1,
+    }
+
+    if cli.summary_only {
+        return Ok(Some((String::new(), stats)));
+    }
+
+    // Format output
+    let change_marker = match changed_file.change_type {
+        semfora_mcp::git::ChangeType::Added => "[+]",
+        semfora_mcp::git::ChangeType::Modified => "[M]",
+        semfora_mcp::git::ChangeType::Deleted => "[-]",
+        _ => "[?]",
+    };
+
+    let output = match cli.format {
+        OutputFormat::Toon => {
+            format!(
+                "{} {} ({})\n{}\n\n",
+                change_marker,
+                changed_file.path,
+                risk_str,
+                encode_toon(&summary)
+            )
+        }
+        OutputFormat::Json => {
+            let json = serde_json::to_string_pretty(&summary).unwrap_or_default();
+            format!(
+                "{} {} ({})\n{}\n\n",
+                change_marker, changed_file.path, risk_str, json
+            )
+        }
+    };
+
+    Ok(Some((output, stats)))
 }
 
 /// Run single commit analysis

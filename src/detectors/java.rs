@@ -3,7 +3,7 @@
 use tree_sitter::{Node, Tree};
 use crate::detectors::common::get_node_text;
 use crate::error::Result;
-use crate::schema::{SemanticSummary, SymbolKind};
+use crate::schema::{RiskLevel, SemanticSummary, SymbolInfo, SymbolKind};
 
 pub fn extract(summary: &mut SemanticSummary, _source: &str, tree: &Tree) -> Result<()> {
     let root = tree.root_node();
@@ -23,9 +23,19 @@ fn extract_filename_stem(file_path: &str) -> String {
         .to_string()
 }
 
+/// Candidate symbol for ranking
+struct SymbolCandidate {
+    name: String,
+    kind: SymbolKind,
+    is_public: bool,
+    start_line: usize,
+    end_line: usize,
+    score: i32,
+}
+
 fn find_primary_symbol(summary: &mut SemanticSummary, root: &Node, filename_stem: &str) {
+    let mut candidates: Vec<SymbolCandidate> = Vec::new();
     let mut cursor = root.walk();
-    let mut best_score = -1;
 
     for child in root.children(&mut cursor) {
         match child.kind() {
@@ -50,18 +60,53 @@ fn find_primary_symbol(summary: &mut SemanticSummary, root: &Node, filename_stem
                         score += 40;
                     }
 
-                    if score > best_score {
-                        best_score = score;
-                        summary.symbol = Some(name);
-                        summary.symbol_kind = Some(kind);
-                        summary.start_line = Some(child.start_position().row + 1);
-                        summary.end_line = Some(child.end_position().row + 1);
-                        summary.public_surface_changed = is_public;
-                    }
+                    candidates.push(SymbolCandidate {
+                        name,
+                        kind,
+                        is_public,
+                        start_line: child.start_position().row + 1,
+                        end_line: child.end_position().row + 1,
+                        score,
+                    });
                 }
             }
             _ => {}
         }
+    }
+
+    // Sort by score (highest first)
+    candidates.sort_by(|a, b| b.score.cmp(&a.score));
+
+    // Convert ALL public candidates to SymbolInfo and add to summary.symbols
+    for candidate in &candidates {
+        if candidate.is_public || candidate.score > 0 {
+            let symbol_info = SymbolInfo {
+                name: candidate.name.clone(),
+                kind: candidate.kind,
+                start_line: candidate.start_line,
+                end_line: candidate.end_line,
+                is_exported: candidate.is_public,
+                is_default_export: false,
+                hash: None,
+                arguments: Vec::new(),
+                props: Vec::new(),
+                return_type: None,
+                calls: Vec::new(),
+                control_flow: Vec::new(),
+                state_changes: Vec::new(),
+                behavioral_risk: RiskLevel::Low,
+            };
+            summary.symbols.push(symbol_info);
+        }
+    }
+
+    // Use the best candidate for primary symbol (backward compatibility)
+    if let Some(best) = candidates.first() {
+        summary.symbol = Some(best.name.clone());
+        summary.symbol_kind = Some(best.kind);
+        summary.start_line = Some(best.start_line);
+        summary.end_line = Some(best.end_line);
+        summary.public_surface_changed = best.is_public;
     }
 }
 

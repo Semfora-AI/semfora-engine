@@ -9,6 +9,23 @@ use std::time::SystemTime;
 use crate::{extract, Lang, McpDiffError, SemanticSummary, CacheDir};
 
 // ============================================================================
+// Staleness Info Struct
+// ============================================================================
+
+/// Detailed staleness information for cache validation
+#[derive(Debug, Clone)]
+pub struct StalenessInfo {
+    /// Whether the cache is considered stale
+    pub is_stale: bool,
+    /// Age of the cache in seconds
+    pub age_seconds: u64,
+    /// List of modified files (relative paths)
+    pub modified_files: Vec<String>,
+    /// Total number of files checked
+    pub files_checked: usize,
+}
+
+// ============================================================================
 // Cache Staleness Detection
 // ============================================================================
 
@@ -54,6 +71,69 @@ pub fn check_cache_staleness(cache: &CacheDir) -> Option<String> {
                 files_str
             }
         ))
+    }
+}
+
+/// Check cache staleness with detailed information
+///
+/// Returns detailed staleness info including age, modified files, and whether
+/// auto-refresh should be triggered based on the max_age threshold.
+pub fn check_cache_staleness_detailed(cache: &CacheDir, max_age_seconds: u64) -> StalenessInfo {
+    let overview_path = cache.repo_overview_path();
+
+    // Get overview mtime
+    let overview_mtime = match fs::metadata(&overview_path) {
+        Ok(m) => m.modified().ok(),
+        Err(_) => {
+            return StalenessInfo {
+                is_stale: true,
+                age_seconds: 0,
+                modified_files: vec![],
+                files_checked: 0,
+            };
+        }
+    };
+
+    let overview_time = match overview_mtime {
+        Some(t) => t,
+        None => {
+            return StalenessInfo {
+                is_stale: true,
+                age_seconds: 0,
+                modified_files: vec![],
+                files_checked: 0,
+            };
+        }
+    };
+
+    // Calculate age
+    let age_seconds = SystemTime::now()
+        .duration_since(overview_time)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // Collect modified files
+    let mut modified_files = Vec::new();
+    let max_to_check = 200;
+    let mut files_checked = 0;
+
+    if let Ok(entries) = collect_source_files_for_staleness(&cache.repo_root, max_to_check) {
+        files_checked = entries.len();
+        for (path, mtime) in entries {
+            if mtime > overview_time {
+                modified_files.push(path);
+            }
+        }
+    }
+
+    // Determine if stale based on age OR modified files
+    let is_stale = age_seconds > max_age_seconds || !modified_files.is_empty();
+
+    StalenessInfo {
+        is_stale,
+        age_seconds,
+        modified_files,
+        files_checked,
     }
 }
 

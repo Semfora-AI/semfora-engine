@@ -119,6 +119,16 @@ pub struct GenerateIndexRequest {
     /// Maximum directory depth (default: 10)
     #[schemars(description = "Maximum directory depth for file collection (default: 10)")]
     pub max_depth: Option<usize>,
+
+    /// File extensions to include (e.g., ["ts", "tsx", "rs"])
+    #[schemars(
+        description = "File extensions to include (e.g., ['ts', 'tsx']). If empty, all supported extensions are included."
+    )]
+    pub extensions: Option<Vec<String>>,
+
+    /// Force regeneration even if index exists (default: false)
+    #[schemars(description = "Force regeneration even if index appears fresh")]
+    pub force: Option<bool>,
 }
 
 /// Request to get call graph from sharded index
@@ -207,6 +217,46 @@ pub struct ListSymbolsRequest {
     /// Repository path
     #[schemars(description = "Path to the repository root (defaults to current directory)")]
     pub path: Option<String>,
+}
+
+// ============================================================================
+// Batch Operation Types
+// ============================================================================
+
+/// Request to get multiple symbols at once (batch operation)
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetSymbolsRequest {
+    /// Path to the repository (defaults to current directory)
+    #[schemars(description = "Path to the repository root (defaults to current directory)")]
+    pub path: Option<String>,
+
+    /// Symbol hashes to retrieve (max 20)
+    #[schemars(description = "Array of symbol hashes to retrieve (max 20)")]
+    pub hashes: Vec<String>,
+
+    /// If true, include source code snippets (default: false)
+    #[schemars(description = "If true, include source code for each symbol")]
+    pub include_source: Option<bool>,
+
+    /// Context lines for source (default: 3)
+    #[schemars(description = "Context lines before/after symbol source (default: 3)")]
+    pub context: Option<usize>,
+}
+
+/// Request to check index staleness and optionally auto-refresh
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CheckIndexRequest {
+    /// Path to the repository (defaults to current directory)
+    #[schemars(description = "Path to the repository root")]
+    pub path: Option<String>,
+
+    /// If true, automatically regenerate stale index (default: false)
+    #[schemars(description = "Automatically regenerate if stale (default: false)")]
+    pub auto_refresh: Option<bool>,
+
+    /// Maximum age in seconds before considered stale (default: 3600 = 1 hour)
+    #[schemars(description = "Maximum cache age in seconds (default: 3600 = 1 hour)")]
+    pub max_age: Option<u64>,
 }
 
 // ============================================================================

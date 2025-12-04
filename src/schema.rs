@@ -44,6 +44,94 @@ pub struct SymbolId {
     pub arity: usize,
 }
 
+/// Per-symbol semantic information for multi-symbol files
+///
+/// This captures semantic data for each exported symbol in a file,
+/// enabling complete extraction from files with many exports.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SymbolInfo {
+    /// Symbol name
+    pub name: String,
+
+    /// Kind of symbol
+    pub kind: SymbolKind,
+
+    /// Start line (1-indexed)
+    pub start_line: usize,
+
+    /// End line (1-indexed, inclusive)
+    pub end_line: usize,
+
+    /// Whether this symbol is exported
+    pub is_exported: bool,
+
+    /// Whether this is a default export
+    pub is_default_export: bool,
+
+    /// Stable hash identifier for this symbol
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+
+    /// Function arguments (for functions/methods)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub arguments: Vec<Argument>,
+
+    /// Component props (for components)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub props: Vec<Prop>,
+
+    /// Return type annotation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub return_type: Option<String>,
+
+    /// Function calls within this symbol's body
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub calls: Vec<Call>,
+
+    /// Control flow constructs within this symbol
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub control_flow: Vec<ControlFlowChange>,
+
+    /// State changes within this symbol (for components)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub state_changes: Vec<StateChange>,
+
+    /// Behavioral risk level for this symbol
+    pub behavioral_risk: RiskLevel,
+}
+
+impl SymbolInfo {
+    /// Create a SymbolId for this symbol given a namespace
+    pub fn to_symbol_id(&self, namespace: &str) -> SymbolId {
+        let arity = self.arguments.len() + self.props.len();
+        SymbolId::new(namespace, &self.name, self.kind, arity)
+    }
+
+    /// Calculate behavioral risk from calls and control flow
+    pub fn calculate_risk(&self) -> RiskLevel {
+        let mut score = 0;
+
+        // Control flow complexity
+        score += self.control_flow.len().min(3);
+
+        // I/O operations
+        for call in &self.calls {
+            if Call::check_is_io(&call.name) {
+                score += 2;
+            }
+        }
+
+        // Async without try
+        for call in &self.calls {
+            if call.is_awaited && !call.in_try {
+                score += 1;
+            }
+        }
+
+        RiskLevel::from_score(score)
+    }
+}
+
 impl SymbolId {
     /// Create a new SymbolId from components
     pub fn new(namespace: &str, symbol: &str, kind: SymbolKind, arity: usize) -> Self {
@@ -457,6 +545,13 @@ pub struct SemanticSummary {
 
     /// Kind of the primary symbol
     pub symbol_kind: Option<SymbolKind>,
+
+    /// All symbols in this file (for multi-symbol files)
+    ///
+    /// This captures every exported symbol, solving the "single symbol per file"
+    /// limitation. Each SymbolInfo contains full semantic data for that symbol.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub symbols: Vec<SymbolInfo>,
 
     /// Start line of the primary symbol (1-indexed)
     #[serde(skip_serializing_if = "Option::is_none")]

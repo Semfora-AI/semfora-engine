@@ -10,7 +10,10 @@ use tree_sitter::{Node, Tree};
 
 use crate::detectors::common::{get_node_text, visit_all};
 use crate::error::Result;
-use crate::schema::{ControlFlowChange, ControlFlowKind, Location, SemanticSummary, StateChange, SymbolKind};
+use crate::schema::{
+    ControlFlowChange, ControlFlowKind, Location, RiskLevel, SemanticSummary, StateChange,
+    SymbolInfo, SymbolKind,
+};
 
 /// Extract semantic information from a Python source file
 pub fn extract(summary: &mut SemanticSummary, source: &str, tree: &Tree) -> Result<()> {
@@ -47,7 +50,7 @@ struct SymbolCandidate {
     score: i32,
 }
 
-/// Find the primary symbol in a Python file with improved heuristics
+/// Find all symbols in a Python file and populate both primary and symbols vec
 ///
 /// Priority order:
 /// 1. Public classes (especially with decorators like @dataclass)
@@ -65,10 +68,33 @@ fn find_primary_symbol(summary: &mut SemanticSummary, root: &Node, source: &str)
     // Sort by score (highest first)
     candidates.sort_by(|a, b| b.score.cmp(&a.score));
 
-    // Use the best candidate
+    // Convert ALL public candidates to SymbolInfo and add to summary.symbols
+    for candidate in &candidates {
+        if candidate.is_public || candidate.score > 0 {
+            let symbol_info = SymbolInfo {
+                name: candidate.name.clone(),
+                kind: candidate.kind,
+                start_line: candidate.start_line,
+                end_line: candidate.end_line,
+                is_exported: candidate.is_public,
+                is_default_export: false,
+                hash: None,
+                arguments: Vec::new(),
+                props: Vec::new(),
+                return_type: None,
+                calls: Vec::new(),
+                control_flow: Vec::new(),
+                state_changes: Vec::new(),
+                behavioral_risk: RiskLevel::Low,
+            };
+            summary.symbols.push(symbol_info);
+        }
+    }
+
+    // Use the best candidate for primary symbol (backward compatibility)
     if let Some(best) = candidates.first() {
         summary.symbol = Some(best.name.clone());
-        summary.symbol_kind = Some(best.kind.clone());
+        summary.symbol_kind = Some(best.kind);
         summary.start_line = Some(best.start_line);
         summary.end_line = Some(best.end_line);
         summary.public_surface_changed = best.is_public;

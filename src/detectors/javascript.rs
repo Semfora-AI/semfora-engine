@@ -14,8 +14,8 @@ use crate::detectors::common::{get_node_text, push_unique_insertion, visit_all};
 use crate::error::Result;
 use crate::lang::Lang;
 use crate::schema::{
-    Argument, Call, ControlFlowChange, ControlFlowKind, Location, Prop, SemanticSummary,
-    StateChange, SymbolKind,
+    Argument, Call, ControlFlowChange, ControlFlowKind, Location, Prop, RiskLevel,
+    SemanticSummary, StateChange, SymbolInfo, SymbolKind,
 };
 use crate::toon::is_meaningful_call;
 
@@ -68,9 +68,13 @@ struct SymbolCandidate {
     score: i32,
 }
 
-/// Find the primary symbol with improved heuristics
+/// Find all symbols and populate both the primary symbol and symbols vec
 ///
-/// Priority order:
+/// This function now captures ALL exported symbols in summary.symbols,
+/// solving the "single symbol per file" limitation for files like monster.ts
+/// that have many exports.
+///
+/// Priority order for primary symbol:
 /// 1. Default exported components (function returning JSX)
 /// 2. Named exported components
 /// 3. Default exported functions/classes
@@ -85,7 +89,43 @@ fn find_primary_symbol(summary: &mut SemanticSummary, root: &Node, source: &str)
     // Sort by score (highest first)
     candidates.sort_by(|a, b| b.score.cmp(&a.score));
 
-    // Use the best candidate
+    // Convert ALL exported candidates to SymbolInfo and add to summary.symbols
+    // This is the key fix: we now capture every symbol, not just the best one
+    for candidate in &candidates {
+        // Include exported symbols (the main use case) and significant non-exported ones
+        if candidate.is_exported || candidate.score > 0 {
+            let kind = if candidate.returns_jsx {
+                SymbolKind::Component
+            } else {
+                candidate.kind
+            };
+
+            let symbol_info = SymbolInfo {
+                name: candidate.name.clone(),
+                kind,
+                start_line: candidate.start_line,
+                end_line: candidate.end_line,
+                is_exported: candidate.is_exported,
+                is_default_export: candidate.is_default_export,
+                hash: None, // Will be populated during shard generation
+                arguments: candidate.arguments.clone(),
+                props: candidate.props.clone(),
+                return_type: if candidate.returns_jsx {
+                    Some("JSX.Element".to_string())
+                } else {
+                    None
+                },
+                calls: Vec::new(),       // Will be populated per-symbol later
+                control_flow: Vec::new(), // Will be populated per-symbol later
+                state_changes: Vec::new(),
+                behavioral_risk: RiskLevel::Low, // Will be calculated later
+            };
+
+            summary.symbols.push(symbol_info);
+        }
+    }
+
+    // Use the best candidate for primary symbol (backward compatibility)
     if let Some(best) = candidates.into_iter().next() {
         summary.symbol = Some(best.name);
         summary.symbol_kind = Some(if best.returns_jsx {
@@ -139,21 +179,74 @@ fn collect_symbol_candidates(
                         candidates.push(candidate);
                     }
                 } else {
-                    // Direct function/class inside export
+                    // Check for export clause (re-exports or named exports)
+                    let mut found_export_clause = false;
                     let mut inner_cursor = child.walk();
                     for inner in child.children(&mut inner_cursor) {
-                        if inner.kind() == "function_declaration"
-                            || inner.kind() == "class_declaration"
-                        {
-                            if let Some(mut candidate) =
-                                extract_candidate_from_declaration(&inner, source, filename_stem)
+                        if inner.kind() == "export_clause" {
+                            // Handle: export { Foo, Bar } from './module'
+                            // or: export { Foo, Bar }
+                            extract_reexports(&inner, source, filename_stem, candidates);
+                            found_export_clause = true;
+                        }
+                    }
+
+                    if !found_export_clause {
+                        // Direct function/class inside export or default export of expression
+                        let mut inner_cursor = child.walk();
+                        for inner in child.children(&mut inner_cursor) {
+                            if inner.kind() == "function_declaration"
+                                || inner.kind() == "class_declaration"
                             {
-                                candidate.is_exported = true;
-                                candidate.is_default_export = is_default;
-                                candidate.score = calculate_symbol_score(&candidate, filename_stem);
-                                candidates.push(candidate);
+                                if let Some(mut candidate) =
+                                    extract_candidate_from_declaration(&inner, source, filename_stem)
+                                {
+                                    candidate.is_exported = true;
+                                    candidate.is_default_export = is_default;
+                                    candidate.score = calculate_symbol_score(&candidate, filename_stem);
+                                    candidates.push(candidate);
+                                }
+                                break;
                             }
-                            break;
+                            // Handle: export default memo(Component) or export default forwardRef(...)
+                            if inner.kind() == "call_expression" && is_default {
+                                if let Some(candidate) = extract_default_export_call(&inner, source, filename_stem) {
+                                    let mut candidate = candidate;
+                                    candidate.is_exported = true;
+                                    candidate.is_default_export = true;
+                                    candidate.score = calculate_symbol_score(&candidate, filename_stem);
+                                    candidates.push(candidate);
+                                    break;
+                                }
+                            }
+                            // Handle: export default SomeIdentifier
+                            if inner.kind() == "identifier" && is_default {
+                                let name = get_node_text(&inner, source);
+                                candidates.push(SymbolCandidate {
+                                    name,
+                                    kind: SymbolKind::Function,
+                                    is_exported: true,
+                                    is_default_export: true,
+                                    returns_jsx: false,
+                                    start_line: inner.start_position().row + 1,
+                                    end_line: inner.end_position().row + 1,
+                                    arguments: Vec::new(),
+                                    props: Vec::new(),
+                                    score: calculate_symbol_score(&SymbolCandidate {
+                                        name: get_node_text(&inner, source),
+                                        kind: SymbolKind::Function,
+                                        is_exported: true,
+                                        is_default_export: true,
+                                        returns_jsx: false,
+                                        start_line: 0,
+                                        end_line: 0,
+                                        arguments: Vec::new(),
+                                        props: Vec::new(),
+                                        score: 0,
+                                    }, filename_stem),
+                                });
+                                break;
+                            }
                         }
                     }
                 }
@@ -175,6 +268,116 @@ fn collect_symbol_candidates(
 fn has_default_keyword(node: &Node, source: &str) -> bool {
     let text = get_node_text(node, source);
     text.contains("export default")
+}
+
+/// Extract re-exported symbols from export clause
+/// Handles: export { Foo, Bar } from './module'
+fn extract_reexports(
+    node: &Node,
+    source: &str,
+    filename_stem: &str,
+    candidates: &mut Vec<SymbolCandidate>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "export_specifier" {
+            // Get the exported name (could be aliased: export { Foo as Bar })
+            let name = if let Some(alias) = child.child_by_field_name("alias") {
+                get_node_text(&alias, source)
+            } else if let Some(name_node) = child.child_by_field_name("name") {
+                get_node_text(&name_node, source)
+            } else {
+                continue;
+            };
+
+            let mut candidate = SymbolCandidate {
+                name,
+                kind: SymbolKind::Function, // Default, could be component
+                is_exported: true,
+                is_default_export: false,
+                returns_jsx: false,
+                start_line: child.start_position().row + 1,
+                end_line: child.end_position().row + 1,
+                arguments: Vec::new(),
+                props: Vec::new(),
+                score: 0,
+            };
+            candidate.score = calculate_symbol_score(&candidate, filename_stem);
+            candidates.push(candidate);
+        }
+    }
+}
+
+/// Extract symbol from default export of call expression
+/// Handles: export default memo(Component) or export default forwardRef(...)
+fn extract_default_export_call(
+    node: &Node,
+    source: &str,
+    filename_stem: &str,
+) -> Option<SymbolCandidate> {
+    if let Some(func_node) = node.child_by_field_name("function") {
+        let func_text = get_node_text(&func_node, source);
+
+        // Check if this is a React component wrapper pattern
+        let is_component_wrapper = func_text == "forwardRef"
+            || func_text == "memo"
+            || func_text.ends_with(".forwardRef")
+            || func_text.ends_with(".memo");
+
+        if is_component_wrapper {
+            // Try to extract the component name from the arguments
+            // e.g., memo(MyComponent) -> "MyComponent"
+            // e.g., forwardRef((props, ref) => ...) -> use filename
+            if let Some(args) = node.child_by_field_name("arguments") {
+                let mut args_cursor = args.walk();
+                for arg in args.children(&mut args_cursor) {
+                    if arg.kind() == "identifier" {
+                        return Some(SymbolCandidate {
+                            name: get_node_text(&arg, source),
+                            kind: SymbolKind::Function,
+                            is_exported: false,
+                            is_default_export: false,
+                            returns_jsx: true,
+                            start_line: node.start_position().row + 1,
+                            end_line: node.end_position().row + 1,
+                            arguments: Vec::new(),
+                            props: Vec::new(),
+                            score: 0,
+                        });
+                    }
+                }
+            }
+
+            // Fallback: use filename as component name
+            return Some(SymbolCandidate {
+                name: to_pascal_case(filename_stem),
+                kind: SymbolKind::Function,
+                is_exported: false,
+                is_default_export: false,
+                returns_jsx: true,
+                start_line: node.start_position().row + 1,
+                end_line: node.end_position().row + 1,
+                arguments: Vec::new(),
+                props: Vec::new(),
+                score: 0,
+            });
+        }
+    }
+    None
+}
+
+/// Convert string to PascalCase for component naming
+fn to_pascal_case(s: &str) -> String {
+    s.split(|c: char| c == '-' || c == '_' || c == '.')
+        .filter(|s| !s.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                None => String::new(),
+                Some(first) => first.to_uppercase().chain(chars).collect(),
+            }
+        })
+        .collect()
 }
 
 /// Extract a symbol candidate from a declaration node
@@ -226,7 +429,7 @@ fn extract_candidate_from_declaration(
             })
         }
         "lexical_declaration" => {
-            // Look for arrow function assigned to const
+            // Look for arrow function or React component pattern assigned to const
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
                 if child.kind() == "variable_declarator" {
@@ -261,6 +464,51 @@ fn extract_candidate_from_declaration(
                             props,
                             score: 0,
                         });
+                    }
+
+                    // Handle React component patterns: forwardRef, memo, styled, etc.
+                    // e.g., const Button = React.forwardRef(...)
+                    // e.g., const Button = memo(...)
+                    // e.g., const Button = styled.div`...`
+                    if value_node.kind() == "call_expression" {
+                        let name = get_node_text(&name_node, source);
+
+                        // Check if this is a React component wrapper pattern
+                        if let Some(func_node) = value_node.child_by_field_name("function") {
+                            let func_text = get_node_text(&func_node, source);
+
+                            // Check for forwardRef, memo, or styled patterns
+                            let is_component_wrapper = func_text == "forwardRef"
+                                || func_text == "memo"
+                                || func_text.ends_with(".forwardRef")
+                                || func_text.ends_with(".memo")
+                                || func_text.starts_with("styled.");
+
+                            if is_component_wrapper {
+                                // Check if the argument returns JSX
+                                let args_node = value_node.child_by_field_name("arguments");
+                                let returns_jsx_content = args_node
+                                    .map(|args| {
+                                        let args_text = get_node_text(&args, source);
+                                        args_text.contains("return") && (args_text.contains("<") || args_text.contains("jsx"))
+                                            || args_text.contains("=>") && args_text.contains("<")
+                                    })
+                                    .unwrap_or(false);
+
+                                return Some(SymbolCandidate {
+                                    name,
+                                    kind: SymbolKind::Function,
+                                    is_exported: false,
+                                    is_default_export: false,
+                                    returns_jsx: returns_jsx_content,
+                                    start_line: node.start_position().row + 1,
+                                    end_line: node.end_position().row + 1,
+                                    arguments: Vec::new(),
+                                    props: Vec::new(),
+                                    score: 0,
+                                });
+                            }
+                        }
                     }
                 }
             }

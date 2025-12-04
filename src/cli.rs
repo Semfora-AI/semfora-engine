@@ -13,7 +13,7 @@ use crate::tokens::{format_analysis_compact, format_analysis_report, TokenAnalyz
 #[command(author)]
 pub struct Cli {
     /// Path to file to analyze (single file mode)
-    #[arg(value_name = "FILE", required_unless_present_any = ["diff", "commit", "commits", "cache_info", "cache_clear", "cache_prune", "dir", "benchmark"])]
+    #[arg(value_name = "FILE", required_unless_present_any = ["diff", "commit", "commits", "uncommitted", "cache_info", "cache_clear", "cache_prune", "dir", "benchmark", "list_modules", "get_module", "search_symbols", "list_symbols", "get_symbol", "get_overview"])]
     pub file: Option<PathBuf>,
 
     /// Output format
@@ -44,6 +44,11 @@ pub struct Cli {
     /// Optional: specify a ref to diff against (e.g., --diff develop)
     #[arg(long, value_name = "REF", num_args = 0..=1, default_missing_value = "auto")]
     pub diff: Option<String>,
+
+    /// Analyze uncommitted changes (working directory vs HEAD)
+    /// This includes both staged and unstaged changes
+    #[arg(long)]
+    pub uncommitted: bool,
 
     /// Base branch for diff comparison (default: auto-detect main/master)
     #[arg(long, value_name = "BRANCH")]
@@ -94,6 +99,46 @@ pub struct Cli {
     pub cache_prune: Option<u32>,
 
     // ============================================
+    // Shard Query Options (Query-Driven API)
+    // ============================================
+
+    /// List all modules in the cached index
+    #[arg(long)]
+    pub list_modules: bool,
+
+    /// Get a specific module's content from the cache
+    #[arg(long, value_name = "MODULE")]
+    pub get_module: Option<String>,
+
+    /// Search for symbols by name in the cached index
+    #[arg(long, value_name = "QUERY")]
+    pub search_symbols: Option<String>,
+
+    /// List all symbols in a module from the cached index
+    #[arg(long, value_name = "MODULE")]
+    pub list_symbols: Option<String>,
+
+    /// Get a specific symbol's details by hash
+    #[arg(long, value_name = "HASH")]
+    pub get_symbol: Option<String>,
+
+    /// Get the repository overview from the cache
+    #[arg(long)]
+    pub get_overview: bool,
+
+    /// Filter results by symbol kind (fn, struct, component, etc.)
+    #[arg(long, value_name = "KIND")]
+    pub kind: Option<String>,
+
+    /// Filter results by risk level (high, medium, low)
+    #[arg(long, value_name = "RISK")]
+    pub risk: Option<String>,
+
+    /// Limit number of results (default: 50)
+    #[arg(long, default_value = "50")]
+    pub limit: usize,
+
+    // ============================================
     // Benchmark Options
     // ============================================
 
@@ -135,6 +180,10 @@ pub enum OperationMode {
     DiffBranch {
         base_ref: String,
     },
+    /// Analyze uncommitted changes (working directory vs base_ref)
+    Uncommitted {
+        base_ref: String,
+    },
     /// Analyze a specific commit
     SingleCommit {
         sha: String,
@@ -172,6 +221,12 @@ impl Cli {
             return Ok(OperationMode::SingleFile(file.clone()));
         }
 
+        // Uncommitted changes mode (working directory vs HEAD)
+        if self.uncommitted {
+            let base_ref = self.base.clone().unwrap_or_else(|| "HEAD".to_string());
+            return Ok(OperationMode::Uncommitted { base_ref });
+        }
+
         // Git diff mode
         if self.diff.is_some() || self.commits {
             let base_ref = self.resolve_base_ref()?;
@@ -189,7 +244,7 @@ impl Cli {
         }
 
         Err(crate::error::McpDiffError::GitError {
-            message: "No operation specified. Provide a FILE/DIR or use --dir/--diff/--commit/--commits".to_string(),
+            message: "No operation specified. Provide a FILE/DIR or use --dir/--diff/--commit/--commits/--uncommitted".to_string(),
         })
     }
 
@@ -213,7 +268,7 @@ impl Cli {
 
     /// Check if we're in git mode
     pub fn is_git_mode(&self) -> bool {
-        self.diff.is_some() || self.commit.is_some() || self.commits
+        self.diff.is_some() || self.commit.is_some() || self.commits || self.uncommitted
     }
 
     /// Check if a file extension should be processed
