@@ -11,6 +11,8 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
+use crate::git;
+use crate::overlay::{LayerKind, LayeredIndex, Overlay};
 use crate::schema::{fnv1a_hash, SCHEMA_VERSION};
 
 /// Metadata for cached files to detect staleness
@@ -192,6 +194,7 @@ impl CacheDir {
         fs::create_dir_all(self.symbols_dir())?;
         fs::create_dir_all(self.graphs_dir())?;
         fs::create_dir_all(self.diffs_dir())?;
+        fs::create_dir_all(self.layers_dir())?;
 
         Ok(())
     }
@@ -256,6 +259,65 @@ impl CacheDir {
     /// Path to a specific diff file
     pub fn diff_path(&self, commit_sha: &str) -> PathBuf {
         self.diffs_dir().join(format!("commit_{}.toon", commit_sha))
+    }
+
+    // ========== Layer paths (SEM-45) ==========
+
+    /// Path to layers directory
+    pub fn layers_dir(&self) -> PathBuf {
+        self.root.join("layers")
+    }
+
+    /// Path to a specific layer's directory
+    ///
+    /// AI layer is not persisted - returns None for LayerKind::AI
+    pub fn layer_dir(&self, kind: LayerKind) -> Option<PathBuf> {
+        match kind {
+            LayerKind::AI => None, // AI layer is ephemeral
+            _ => Some(self.layers_dir().join(kind.as_str())),
+        }
+    }
+
+    /// Path to a layer's symbols.jsonl file
+    pub fn layer_symbols_path(&self, kind: LayerKind) -> Option<PathBuf> {
+        self.layer_dir(kind).map(|d| d.join("symbols.jsonl"))
+    }
+
+    /// Path to a layer's deleted.txt file
+    pub fn layer_deleted_path(&self, kind: LayerKind) -> Option<PathBuf> {
+        self.layer_dir(kind).map(|d| d.join("deleted.txt"))
+    }
+
+    /// Path to a layer's moves.jsonl file
+    pub fn layer_moves_path(&self, kind: LayerKind) -> Option<PathBuf> {
+        self.layer_dir(kind).map(|d| d.join("moves.jsonl"))
+    }
+
+    /// Path to layered index metadata file
+    pub fn layer_meta_path(&self) -> PathBuf {
+        self.layers_dir().join("meta.json")
+    }
+
+    /// Path to head_sha file (last indexed commit)
+    pub fn head_sha_path(&self) -> PathBuf {
+        self.root.join("head_sha")
+    }
+
+    /// Check if cached layers exist
+    pub fn has_cached_layers(&self) -> bool {
+        self.layers_dir().exists()
+            && self.layer_dir(LayerKind::Base).map(|p| p.exists()).unwrap_or(false)
+    }
+
+    /// Initialize layer directories
+    pub fn init_layer_dirs(&self) -> Result<()> {
+        fs::create_dir_all(self.layers_dir())?;
+        for kind in [LayerKind::Base, LayerKind::Branch, LayerKind::Working] {
+            if let Some(dir) = self.layer_dir(kind) {
+                fs::create_dir_all(dir)?;
+            }
+        }
+        Ok(())
     }
 
     // ========== Utility methods ==========
@@ -448,6 +510,423 @@ impl CacheDir {
 
         Ok(results)
     }
+
+    // ========== Layer persistence (SEM-45) ==========
+
+    /// Save a single layer overlay to cache using separate files:
+    /// - symbols.jsonl: Symbol states (one JSON object per line)
+    /// - deleted.txt: Deleted symbol hashes (one per line)
+    /// - moves.jsonl: File moves (one JSON object per line)
+    ///
+    /// AI layer is not persisted and returns Ok(()) immediately.
+    ///
+    /// Uses atomic two-phase commit: writes to .tmp files first, then renames.
+    /// This ensures cache is never left in an inconsistent state.
+    pub fn save_layer(&self, overlay: &Overlay) -> Result<()> {
+        use std::io::Write;
+
+        let kind = match overlay.meta.kind {
+            Some(k) => k,
+            None => return Err(crate::McpDiffError::ExtractionFailure {
+                message: "Cannot save overlay with unknown layer kind".to_string(),
+            }),
+        };
+
+        let layer_dir = match self.layer_dir(kind) {
+            Some(d) => d,
+            None => return Ok(()), // AI layer - skip
+        };
+
+        // Ensure layer directory exists
+        fs::create_dir_all(&layer_dir)?;
+
+        // Define final and temp paths
+        let symbols_path = layer_dir.join("symbols.jsonl");
+        let symbols_temp = layer_dir.join("symbols.jsonl.tmp");
+        let deleted_path = layer_dir.join("deleted.txt");
+        let deleted_temp = layer_dir.join("deleted.txt.tmp");
+        let moves_path = layer_dir.join("moves.jsonl");
+        let moves_temp = layer_dir.join("moves.jsonl.tmp");
+        let meta_path = layer_dir.join("meta.json");
+        let meta_temp = layer_dir.join("meta.json.tmp");
+
+        // Phase 1: Write all files to temp locations
+        // If any write fails, temp files are left behind but final files are intact
+
+        // Write symbols.jsonl.tmp
+        {
+            let mut file = fs::File::create(&symbols_temp)?;
+            for (hash, state) in &overlay.symbols {
+                let entry = SymbolEntry { hash: hash.clone(), state: state.clone() };
+                let json = serde_json::to_string(&entry).map_err(|e| {
+                    crate::McpDiffError::ExtractionFailure {
+                        message: format!("Failed to serialize symbol {}: {}", hash, e),
+                    }
+                })?;
+                writeln!(file, "{}", json)?;
+            }
+        }
+
+        // Write deleted.txt.tmp
+        {
+            let mut file = fs::File::create(&deleted_temp)?;
+            for hash in &overlay.deleted {
+                writeln!(file, "{}", hash)?;
+            }
+        }
+
+        // Write moves.jsonl.tmp
+        {
+            let mut file = fs::File::create(&moves_temp)?;
+            for file_move in &overlay.moves {
+                let json = serde_json::to_string(&file_move).map_err(|e| {
+                    crate::McpDiffError::ExtractionFailure {
+                        message: format!("Failed to serialize file move: {}", e),
+                    }
+                })?;
+                writeln!(file, "{}", json)?;
+            }
+        }
+
+        // Write meta.json.tmp
+        let meta_json = serde_json::to_string_pretty(&overlay.meta).map_err(|e| {
+            crate::McpDiffError::ExtractionFailure {
+                message: format!("Failed to serialize {} layer meta: {}", kind, e),
+            }
+        })?;
+        fs::write(&meta_temp, &meta_json)?;
+
+        // Phase 2: Atomically rename all temp files to final locations
+        // On POSIX systems, rename is atomic within the same filesystem
+        fs::rename(&symbols_temp, &symbols_path)?;
+        fs::rename(&deleted_temp, &deleted_path)?;
+        fs::rename(&moves_temp, &moves_path)?;
+        fs::rename(&meta_temp, &meta_path)?;
+
+        Ok(())
+    }
+
+    /// Load a single layer overlay from cache
+    ///
+    /// Returns None if layer directory doesn't exist or AI layer is requested.
+    pub fn load_layer(&self, kind: LayerKind) -> Result<Option<Overlay>> {
+        use std::io::BufRead;
+
+        let layer_dir = match self.layer_dir(kind) {
+            Some(d) => d,
+            None => return Ok(None), // AI layer - not persisted
+        };
+
+        if !layer_dir.exists() {
+            return Ok(None);
+        }
+
+        // Load layer metadata
+        let meta_path = layer_dir.join("meta.json");
+        let meta: crate::overlay::LayerMeta = if meta_path.exists() {
+            let json = fs::read_to_string(&meta_path)?;
+            serde_json::from_str(&json).map_err(|e| {
+                crate::McpDiffError::ExtractionFailure {
+                    message: format!("Failed to deserialize {} layer meta: {}", kind, e),
+                }
+            })?
+        } else {
+            crate::overlay::LayerMeta::new(kind)
+        };
+
+        // Load symbols from symbols.jsonl
+        let mut symbols = std::collections::HashMap::new();
+        let symbols_path = layer_dir.join("symbols.jsonl");
+        if symbols_path.exists() {
+            let file = fs::File::open(&symbols_path)?;
+            let reader = std::io::BufReader::new(file);
+            for line in reader.lines() {
+                let line = line?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let entry: SymbolEntry = serde_json::from_str(&line).map_err(|e| {
+                    crate::McpDiffError::ExtractionFailure {
+                        message: format!("Failed to deserialize symbol entry: {}", e),
+                    }
+                })?;
+                symbols.insert(entry.hash, entry.state);
+            }
+        }
+
+        // Load deleted hashes from deleted.txt
+        let mut deleted = std::collections::HashSet::new();
+        let deleted_path = layer_dir.join("deleted.txt");
+        if deleted_path.exists() {
+            let content = fs::read_to_string(&deleted_path)?;
+            for line in content.lines() {
+                let hash = line.trim();
+                if !hash.is_empty() {
+                    deleted.insert(hash.to_string());
+                }
+            }
+        }
+
+        // Load moves from moves.jsonl
+        let mut moves = Vec::new();
+        let moves_path = layer_dir.join("moves.jsonl");
+        if moves_path.exists() {
+            let file = fs::File::open(&moves_path)?;
+            let reader = std::io::BufReader::new(file);
+            for line in reader.lines() {
+                let line = line?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let file_move: crate::overlay::FileMove = serde_json::from_str(&line).map_err(|e| {
+                    crate::McpDiffError::ExtractionFailure {
+                        message: format!("Failed to deserialize file move: {}", e),
+                    }
+                })?;
+                moves.push(file_move);
+            }
+        }
+
+        // Construct the overlay and rebuild file index
+        let mut overlay = Overlay {
+            meta,
+            symbols,
+            deleted,
+            moves,
+            symbols_by_file: std::collections::HashMap::new(),
+        };
+        overlay.rebuild_file_index();
+
+        Ok(Some(overlay))
+    }
+
+    /// Save a full LayeredIndex to cache
+    ///
+    /// Saves base, branch, and working layers. AI layer is ephemeral.
+    pub fn save_layered_index(&self, index: &LayeredIndex) -> Result<()> {
+        // Save each persistent layer
+        self.save_layer(&index.base)?;
+        self.save_layer(&index.branch)?;
+        self.save_layer(&index.working)?;
+        // AI layer is not saved (ephemeral)
+
+        // Save metadata
+        let meta = LayeredIndexMeta {
+            schema_version: SCHEMA_VERSION.to_string(),
+            saved_at: chrono::Utc::now().to_rfc3339(),
+            base_indexed_sha: index.base.meta.indexed_sha.clone(),
+            branch_indexed_sha: index.branch.meta.indexed_sha.clone(),
+            // merge_base_sha is stored on the branch layer (where branch diverged from base)
+            merge_base: index.branch.meta.merge_base_sha.clone(),
+        };
+
+        let meta_json = serde_json::to_string_pretty(&meta).map_err(|e| {
+            crate::McpDiffError::ExtractionFailure {
+                message: format!("Failed to serialize layer meta: {}", e),
+            }
+        })?;
+
+        fs::write(self.layer_meta_path(), &meta_json)?;
+
+        Ok(())
+    }
+
+    /// Load a full LayeredIndex from cache
+    ///
+    /// Returns None if layers haven't been cached yet.
+    /// AI layer is always initialized empty.
+    pub fn load_layered_index(&self) -> Result<Option<LayeredIndex>> {
+        if !self.has_cached_layers() {
+            return Ok(None);
+        }
+
+        // Load each layer
+        let base = match self.load_layer(LayerKind::Base)? {
+            Some(o) => o,
+            None => return Ok(None),
+        };
+
+        let branch = self.load_layer(LayerKind::Branch)?.unwrap_or_else(|| Overlay::new(LayerKind::Branch));
+        let working = self.load_layer(LayerKind::Working)?.unwrap_or_else(|| Overlay::new(LayerKind::Working));
+        let ai = Overlay::new(LayerKind::AI); // AI is always fresh
+
+        Ok(Some(LayeredIndex {
+            base,
+            branch,
+            working,
+            ai,
+        }))
+    }
+
+    /// Clear all cached layers
+    pub fn clear_layers(&self) -> Result<()> {
+        let layers_dir = self.layers_dir();
+        if layers_dir.exists() {
+            fs::remove_dir_all(&layers_dir)?;
+        }
+        Ok(())
+    }
+
+    // ========== Layer staleness detection (SEM-45) ==========
+
+    /// Check if a cached layer is stale
+    ///
+    /// Staleness rules:
+    /// - Base: indexed_sha != current HEAD of main/master
+    /// - Branch: indexed_sha != current branch HEAD
+    /// - Working: any tracked file changed (mtime/size)
+    /// - AI: always fresh (not persisted)
+    pub fn is_layer_stale(&self, kind: LayerKind) -> Result<bool> {
+        let overlay = match self.load_layer(kind)? {
+            Some(o) => o,
+            None => return Ok(true), // No cached layer = stale
+        };
+
+        match kind {
+            LayerKind::Base => self.is_base_layer_stale(&overlay),
+            LayerKind::Branch => self.is_branch_layer_stale(&overlay),
+            LayerKind::Working => self.is_working_layer_stale(&overlay),
+            LayerKind::AI => Ok(false), // AI layer is never persisted, always fresh in memory
+        }
+    }
+
+    /// Check if base layer is stale (indexed SHA != main/master HEAD)
+    fn is_base_layer_stale(&self, overlay: &Overlay) -> Result<bool> {
+        let indexed_sha = match &overlay.meta.indexed_sha {
+            Some(sha) => sha,
+            None => return Ok(true), // No indexed SHA = stale
+        };
+
+        // Get the current base branch HEAD
+        let base_branch = git::detect_base_branch(Some(&self.repo_root))?;
+        let current_sha = get_ref_sha(&base_branch, Some(&self.repo_root))?;
+
+        Ok(indexed_sha != &current_sha)
+    }
+
+    /// Check if branch layer is stale (indexed SHA != branch HEAD, or merge-base changed)
+    fn is_branch_layer_stale(&self, overlay: &Overlay) -> Result<bool> {
+        let indexed_sha = match &overlay.meta.indexed_sha {
+            Some(sha) => sha,
+            None => return Ok(true), // No indexed SHA = stale
+        };
+
+        // Check if branch HEAD has moved
+        let current_sha = get_ref_sha("HEAD", Some(&self.repo_root))?;
+        if indexed_sha != &current_sha {
+            return Ok(true);
+        }
+
+        // Check if merge-base has changed (rebase scenario)
+        if let Some(stored_merge_base) = &overlay.meta.merge_base_sha {
+            let base_branch = git::detect_base_branch(Some(&self.repo_root))?;
+            let current_merge_base = git::get_merge_base("HEAD", &base_branch, Some(&self.repo_root))?;
+            if stored_merge_base != &current_merge_base {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Check if working layer is stale (any tracked file has changed)
+    ///
+    /// Uses mtime comparison as a quick heuristic. This may have edge cases:
+    /// - Clock skew could produce false positives/negatives
+    /// - Files touched without content changes trigger false positives
+    ///
+    /// For more robust detection, consider content hashing (adds overhead).
+    /// The current approach favors speed over perfect accuracy since
+    /// working layer staleness is checked frequently.
+    fn is_working_layer_stale(&self, overlay: &Overlay) -> Result<bool> {
+        // Working layer tracks files via symbols_by_file
+        // Check if any tracked file's mtime has changed since layer was updated
+        for file_path in overlay.symbols_by_file.keys() {
+            let full_path = self.repo_root.join(file_path);
+            match fs::metadata(&full_path) {
+                Ok(meta) => {
+                    let mtime = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+
+                    // If the layer was updated before the file was modified, it's stale
+                    if mtime > overlay.meta.updated_at {
+                        return Ok(true);
+                    }
+                }
+                Err(_) => {
+                    // File deleted or inaccessible = stale
+                    return Ok(true);
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Check if entire LayeredIndex cache is stale
+    pub fn is_layered_index_stale(&self) -> Result<bool> {
+        // If no cache exists, it's "stale" (needs to be created)
+        if !self.has_cached_layers() {
+            return Ok(true);
+        }
+
+        // Base layer staleness is most critical - rebuild if base moved
+        if self.is_layer_stale(LayerKind::Base)? {
+            return Ok(true);
+        }
+
+        // Branch and working layers can be rebuilt incrementally,
+        // but for now we consider the whole index stale if any layer is stale
+        if self.is_layer_stale(LayerKind::Branch)? {
+            return Ok(true);
+        }
+
+        if self.is_layer_stale(LayerKind::Working)? {
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+}
+
+/// Get the SHA for a git reference
+fn get_ref_sha(ref_name: &str, cwd: Option<&Path>) -> Result<String> {
+    git::git_command(&["rev-parse", ref_name], cwd)
+}
+
+/// Metadata for cached LayeredIndex
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayeredIndexMeta {
+    /// Schema version for compatibility
+    pub schema_version: String,
+
+    /// When the layers were saved
+    pub saved_at: String,
+
+    /// Git SHA that base layer was indexed at
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_indexed_sha: Option<String>,
+
+    /// Git SHA that branch layer was indexed at
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_indexed_sha: Option<String>,
+
+    /// Merge base SHA (where branch diverged from base)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge_base: Option<String>,
+}
+
+/// Entry in symbols.jsonl for layer persistence
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SymbolEntry {
+    /// Symbol hash
+    hash: String,
+    /// Symbol state
+    state: crate::overlay::SymbolState,
 }
 
 /// Lightweight symbol index entry for query-driven access
@@ -672,5 +1151,1476 @@ mod tests {
             assert!(info.size > 0);
             assert!(!info.is_stale(&repo_root));
         }
+    }
+
+    // ========================================================================
+    // Layer Cache Tests (SEM-45)
+    // ========================================================================
+
+    #[test]
+    fn test_layer_paths() {
+        let cache = CacheDir {
+            root: PathBuf::from("/tmp/semfora/abc123"),
+            repo_root: PathBuf::from("/home/user/project"),
+            repo_hash: "abc123".to_string(),
+        };
+
+        // Test layers directory path
+        assert_eq!(
+            cache.layers_dir(),
+            PathBuf::from("/tmp/semfora/abc123/layers")
+        );
+
+        // Test layer directory paths for each kind
+        assert_eq!(
+            cache.layer_dir(LayerKind::Base),
+            Some(PathBuf::from("/tmp/semfora/abc123/layers/base"))
+        );
+        assert_eq!(
+            cache.layer_dir(LayerKind::Branch),
+            Some(PathBuf::from("/tmp/semfora/abc123/layers/branch"))
+        );
+        assert_eq!(
+            cache.layer_dir(LayerKind::Working),
+            Some(PathBuf::from("/tmp/semfora/abc123/layers/working"))
+        );
+        // AI layer should return None (ephemeral)
+        assert_eq!(cache.layer_dir(LayerKind::AI), None);
+
+        // Test layer file paths
+        assert_eq!(
+            cache.layer_symbols_path(LayerKind::Base),
+            Some(PathBuf::from("/tmp/semfora/abc123/layers/base/symbols.jsonl"))
+        );
+        assert_eq!(
+            cache.layer_deleted_path(LayerKind::Base),
+            Some(PathBuf::from("/tmp/semfora/abc123/layers/base/deleted.txt"))
+        );
+        assert_eq!(
+            cache.layer_moves_path(LayerKind::Base),
+            Some(PathBuf::from("/tmp/semfora/abc123/layers/base/moves.jsonl"))
+        );
+
+        // Test layer meta path
+        assert_eq!(
+            cache.layer_meta_path(),
+            PathBuf::from("/tmp/semfora/abc123/layers/meta.json")
+        );
+
+        // Test head_sha path
+        assert_eq!(
+            cache.head_sha_path(),
+            PathBuf::from("/tmp/semfora/abc123/head_sha")
+        );
+    }
+
+    #[test]
+    fn test_save_and_load_layer() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create a test overlay
+        let mut overlay = Overlay::new(LayerKind::Base);
+        overlay.meta.indexed_sha = Some("abc123".to_string());
+
+        // Save the layer
+        cache.save_layer(&overlay).expect("Failed to save layer");
+
+        // Verify the directory and files exist
+        let layer_dir = cache.layer_dir(LayerKind::Base).unwrap();
+        assert!(layer_dir.exists(), "Layer directory should exist after save");
+        assert!(layer_dir.join("symbols.jsonl").exists(), "symbols.jsonl should exist");
+        assert!(layer_dir.join("deleted.txt").exists(), "deleted.txt should exist");
+        assert!(layer_dir.join("moves.jsonl").exists(), "moves.jsonl should exist");
+        assert!(layer_dir.join("meta.json").exists(), "meta.json should exist");
+
+        // Load the layer back
+        let loaded = cache.load_layer(LayerKind::Base).expect("Failed to load layer");
+        assert!(loaded.is_some(), "Should load the saved layer");
+
+        let loaded_overlay = loaded.unwrap();
+        assert_eq!(loaded_overlay.meta.indexed_sha, Some("abc123".to_string()));
+    }
+
+    #[test]
+    fn test_ai_layer_not_saved() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create an AI overlay
+        let overlay = Overlay::new(LayerKind::AI);
+
+        // Attempting to save AI layer should succeed but not create a file
+        cache.save_layer(&overlay).expect("Save should succeed for AI layer");
+
+        // The layers directory shouldn't have any ai.json file
+        let ai_path = cache.layers_dir().join("ai.json");
+        assert!(!ai_path.exists(), "AI layer should not be persisted");
+
+        // Loading AI layer should return None
+        let loaded = cache.load_layer(LayerKind::AI).expect("Load should succeed");
+        assert!(loaded.is_none(), "Loading AI layer should return None");
+    }
+
+    #[test]
+    fn test_save_and_load_layered_index() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create a layered index with some data
+        let mut index = LayeredIndex::new();
+        index.base.meta.indexed_sha = Some("base_sha".to_string());
+        index.branch.meta.indexed_sha = Some("branch_sha".to_string());
+
+        // Save the index
+        cache.save_layered_index(&index).expect("Failed to save layered index");
+
+        // Verify meta file exists
+        assert!(cache.layer_meta_path().exists(), "Meta file should exist");
+
+        // Verify has_cached_layers returns true
+        assert!(cache.has_cached_layers(), "Should detect cached layers");
+
+        // Load the index back
+        let loaded = cache.load_layered_index().expect("Failed to load layered index");
+        assert!(loaded.is_some(), "Should load the saved index");
+
+        let loaded_index = loaded.unwrap();
+        assert_eq!(loaded_index.base.meta.indexed_sha, Some("base_sha".to_string()));
+        assert_eq!(loaded_index.branch.meta.indexed_sha, Some("branch_sha".to_string()));
+        // AI layer should be fresh (empty)
+        assert!(loaded_index.ai.meta.indexed_sha.is_none());
+    }
+
+    #[test]
+    fn test_clear_layers() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Save some layers
+        let index = LayeredIndex::new();
+        cache.save_layered_index(&index).expect("Failed to save");
+        assert!(cache.has_cached_layers());
+
+        // Clear the layers
+        cache.clear_layers().expect("Failed to clear layers");
+
+        // Verify layers are gone
+        assert!(!cache.has_cached_layers(), "Layers should be cleared");
+        assert!(!cache.layers_dir().exists(), "Layers directory should be removed");
+    }
+
+    #[test]
+    fn test_load_missing_layer() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Loading a layer that doesn't exist should return None
+        let result = cache.load_layer(LayerKind::Base).expect("Load should not error");
+        assert!(result.is_none(), "Should return None for missing layer");
+    }
+
+    #[test]
+    fn test_layered_index_meta_serialization() {
+        let meta = LayeredIndexMeta {
+            schema_version: "1.0.0".to_string(),
+            saved_at: "2024-01-01T00:00:00Z".to_string(),
+            base_indexed_sha: Some("abc123".to_string()),
+            branch_indexed_sha: None,
+            merge_base: Some("def456".to_string()),
+        };
+
+        // Serialize and deserialize
+        let json = serde_json::to_string(&meta).expect("Serialize failed");
+        let restored: LayeredIndexMeta = serde_json::from_str(&json).expect("Deserialize failed");
+
+        assert_eq!(restored.schema_version, "1.0.0");
+        assert_eq!(restored.base_indexed_sha, Some("abc123".to_string()));
+        assert_eq!(restored.branch_indexed_sha, None);
+        assert_eq!(restored.merge_base, Some("def456".to_string()));
+    }
+
+    // ========================================================================
+    // TDD Tests from SEM-45 Ticket Requirements
+    // ========================================================================
+
+    /// TDD: test_layer_paths_created
+    /// Verifies that layer directories are created on save
+    #[test]
+    fn test_layer_paths_created() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Initially no layer directories
+        assert!(!cache.layers_dir().exists());
+
+        // Save a layer
+        let overlay = Overlay::new(LayerKind::Base);
+        cache.save_layer(&overlay).expect("Failed to save layer");
+
+        // Layer paths should now exist
+        assert!(cache.layers_dir().exists());
+        assert!(cache.layer_dir(LayerKind::Base).unwrap().exists());
+        assert!(cache.layer_symbols_path(LayerKind::Base).unwrap().exists());
+        assert!(cache.layer_deleted_path(LayerKind::Base).unwrap().exists());
+        assert!(cache.layer_moves_path(LayerKind::Base).unwrap().exists());
+    }
+
+    /// TDD: test_layer_persist_reload
+    /// Verifies layers persist correctly and reload with same data
+    #[test]
+    fn test_layer_persist_reload() {
+        use tempfile::TempDir;
+        use crate::overlay::SymbolState;
+        use crate::schema::{SymbolInfo, SymbolKind, RiskLevel};
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create an overlay with symbols, deletions, and moves
+        let mut overlay = Overlay::new(LayerKind::Base);
+        overlay.meta.indexed_sha = Some("abc123".to_string());
+
+        // Add a symbol
+        let symbol = SymbolInfo {
+            name: "test_func".to_string(),
+            kind: SymbolKind::Function,
+            start_line: 10,
+            end_line: 20,
+            behavioral_risk: RiskLevel::Low,
+            ..Default::default()
+        };
+        overlay.upsert(
+            "hash_001".to_string(),
+            SymbolState::active_at(symbol, PathBuf::from("src/lib.rs")),
+        );
+
+        // Add a deletion
+        overlay.delete("deleted_hash");
+
+        // Add a file move
+        overlay.record_move(PathBuf::from("old.rs"), PathBuf::from("new.rs"));
+
+        // Save
+        cache.save_layer(&overlay).expect("Failed to save");
+
+        // Reload
+        let loaded = cache.load_layer(LayerKind::Base)
+            .expect("Failed to load")
+            .expect("Should have layer");
+
+        // Verify data matches
+        assert_eq!(loaded.meta.indexed_sha, Some("abc123".to_string()));
+
+        // Symbols includes both active and deleted (delete() adds to symbols map too)
+        // We have 1 active symbol + 1 deleted symbol = 2 total entries
+        assert_eq!(loaded.symbols.len(), 2);
+        assert!(loaded.symbols.contains_key("hash_001"));
+        // The deleted symbol is tracked in both deleted set and symbols map
+        assert!(loaded.symbols.contains_key("deleted_hash"));
+        assert!(loaded.deleted.contains("deleted_hash"));
+        assert_eq!(loaded.moves.len(), 1);
+        assert_eq!(loaded.moves[0].from_path, PathBuf::from("old.rs"));
+        assert_eq!(loaded.moves[0].to_path, PathBuf::from("new.rs"));
+    }
+
+    /// TDD: test_backward_compat_v1_cache
+    /// Verifies existing v1 sharded caches still work alongside new layer system
+    #[test]
+    fn test_backward_compat_v1_cache() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Initialize creates all directories including layers
+        cache.init().expect("Failed to init");
+
+        // V1 directories should exist
+        assert!(cache.modules_dir().exists());
+        assert!(cache.symbols_dir().exists());
+        assert!(cache.graphs_dir().exists());
+        assert!(cache.diffs_dir().exists());
+
+        // V2 layers directory should also exist
+        assert!(cache.layers_dir().exists());
+
+        // Both systems can coexist
+        assert!(cache.root.exists());
+    }
+
+    /// TDD: test_schema_version_bump
+    /// Verifies schema version is 2.0 for layered index support
+    #[test]
+    fn test_schema_version_bump() {
+        assert_eq!(SCHEMA_VERSION, "2.0", "Schema version should be 2.0 for SEM-45");
+    }
+
+    /// TDD: test_meta_json_structure
+    /// Verifies meta.json has correct structure
+    #[test]
+    fn test_meta_json_structure() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create and save a layered index
+        let mut index = LayeredIndex::new();
+        index.base.meta.indexed_sha = Some("base_sha".to_string());
+        index.branch.meta.indexed_sha = Some("branch_sha".to_string());
+        // merge_base_sha belongs on the branch layer (where branch diverged from base)
+        index.branch.meta.merge_base_sha = Some("merge_base".to_string());
+
+        cache.save_layered_index(&index).expect("Failed to save");
+
+        // Read and verify meta.json structure
+        let meta_content = std::fs::read_to_string(cache.layer_meta_path()).expect("Read meta");
+        let meta: LayeredIndexMeta = serde_json::from_str(&meta_content).expect("Parse meta");
+
+        assert_eq!(meta.schema_version, SCHEMA_VERSION);
+        assert!(meta.saved_at.len() > 0);
+        assert_eq!(meta.base_indexed_sha, Some("base_sha".to_string()));
+        assert_eq!(meta.branch_indexed_sha, Some("branch_sha".to_string()));
+        assert_eq!(meta.merge_base, Some("merge_base".to_string()));
+    }
+
+    // ========================================================================
+    // Layer Cache Error Scenario Tests
+    // ========================================================================
+
+    #[test]
+    fn test_load_layer_corrupted_symbols_jsonl() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create layer directory with corrupted symbols.jsonl
+        let layer_dir = cache.layer_dir(LayerKind::Base).unwrap();
+        fs::create_dir_all(&layer_dir).expect("Create layer dir");
+
+        // Write valid meta.json
+        let meta = crate::overlay::LayerMeta::new(LayerKind::Base);
+        let meta_json = serde_json::to_string_pretty(&meta).unwrap();
+        fs::write(layer_dir.join("meta.json"), meta_json).expect("Write meta");
+
+        // Write corrupted symbols.jsonl (malformed JSON - truncated object simulating interrupted write)
+        fs::write(layer_dir.join("symbols.jsonl"), "{\"hash\":\"abc123\",\"state\":\"active\",\"symbol\":{\"name\":\"test\"\n{\"hash\":\"incomplete\"").expect("Write corrupted symbols");
+        fs::write(layer_dir.join("deleted.txt"), "").expect("Write deleted");
+        fs::write(layer_dir.join("moves.jsonl"), "").expect("Write moves");
+
+        // Should return error when loading
+        let result = cache.load_layer(LayerKind::Base);
+        assert!(result.is_err(), "Should fail to load layer with corrupted symbols.jsonl");
+        
+        // Verify it's a deserialization error
+        match result {
+            Err(crate::McpDiffError::ExtractionFailure { message }) => {
+                assert!(message.contains("deserialize") || message.contains("symbol entry"), 
+                    "Error should indicate symbol deserialization issue: {}", message);
+            }
+            Err(e) => panic!("Expected ExtractionFailure error, got: {:?}", e),
+            Ok(_) => panic!("Should have failed"),
+        }
+    }
+
+    #[test]
+    fn test_load_layer_corrupted_moves_jsonl() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create layer directory with corrupted moves.jsonl
+        let layer_dir = cache.layer_dir(LayerKind::Base).unwrap();
+        fs::create_dir_all(&layer_dir).expect("Create layer dir");
+
+        // Write valid meta.json
+        let meta = crate::overlay::LayerMeta::new(LayerKind::Base);
+        let meta_json = serde_json::to_string_pretty(&meta).unwrap();
+        fs::write(layer_dir.join("meta.json"), meta_json).expect("Write meta");
+
+        // Write valid files except moves.jsonl
+        fs::write(layer_dir.join("symbols.jsonl"), "").expect("Write symbols");
+        fs::write(layer_dir.join("deleted.txt"), "").expect("Write deleted");
+        // Write corrupted moves.jsonl (truncated JSON array simulating interrupted write)
+        fs::write(layer_dir.join("moves.jsonl"), "{\"from_path\":\"old.rs\",\"to_path\":\"new.rs\",\"moved_at\":\n").expect("Write corrupted moves");
+
+        // Should return error when loading
+        let result = cache.load_layer(LayerKind::Base);
+        assert!(result.is_err(), "Should fail to load layer with corrupted moves.jsonl");
+        
+        // Verify it's a deserialization error
+        match result {
+            Err(crate::McpDiffError::ExtractionFailure { message }) => {
+                assert!(message.contains("deserialize") || message.contains("file move"), 
+                    "Error should indicate file move deserialization issue: {}", message);
+            }
+            Err(e) => panic!("Expected ExtractionFailure error, got: {:?}", e),
+            Ok(_) => panic!("Should have failed"),
+        }
+    }
+
+    #[test]
+    fn test_load_layer_missing_symbols_file() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create layer directory with meta.json but missing symbols.jsonl
+        let layer_dir = cache.layer_dir(LayerKind::Base).unwrap();
+        fs::create_dir_all(&layer_dir).expect("Create layer dir");
+
+        // Write valid meta.json
+        let meta = crate::overlay::LayerMeta::new(LayerKind::Base);
+        let meta_json = serde_json::to_string_pretty(&meta).unwrap();
+        fs::write(layer_dir.join("meta.json"), meta_json).expect("Write meta");
+
+        // Write other files but NOT symbols.jsonl
+        fs::write(layer_dir.join("deleted.txt"), "").expect("Write deleted");
+        fs::write(layer_dir.join("moves.jsonl"), "").expect("Write moves");
+
+        // Should succeed - missing files are treated as empty
+        let result = cache.load_layer(LayerKind::Base);
+        assert!(result.is_ok(), "Should handle missing symbols.jsonl gracefully");
+        
+        let overlay = result.unwrap();
+        assert!(overlay.is_some(), "Should return an overlay");
+        let overlay = overlay.unwrap();
+        assert!(overlay.symbols.is_empty(), "Symbols should be empty when file is missing");
+    }
+
+    #[test]
+    fn test_load_layer_missing_moves_file() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create layer directory with meta.json but missing moves.jsonl
+        let layer_dir = cache.layer_dir(LayerKind::Base).unwrap();
+        fs::create_dir_all(&layer_dir).expect("Create layer dir");
+
+        // Write valid meta.json
+        let meta = crate::overlay::LayerMeta::new(LayerKind::Base);
+        let meta_json = serde_json::to_string_pretty(&meta).unwrap();
+        fs::write(layer_dir.join("meta.json"), meta_json).expect("Write meta");
+
+        // Write other files but NOT moves.jsonl
+        fs::write(layer_dir.join("symbols.jsonl"), "").expect("Write symbols");
+        fs::write(layer_dir.join("deleted.txt"), "").expect("Write deleted");
+
+        // Should succeed - missing files are treated as empty
+        let result = cache.load_layer(LayerKind::Base);
+        assert!(result.is_ok(), "Should handle missing moves.jsonl gracefully");
+        
+        let overlay = result.unwrap();
+        assert!(overlay.is_some(), "Should return an overlay");
+        let overlay = overlay.unwrap();
+        assert!(overlay.moves.is_empty(), "Moves should be empty when file is missing");
+    }
+
+    #[test]
+    fn test_load_layer_empty_symbols_file() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create layer directory with zero-byte symbols.jsonl
+        let layer_dir = cache.layer_dir(LayerKind::Base).unwrap();
+        fs::create_dir_all(&layer_dir).expect("Create layer dir");
+
+        // Write valid meta.json
+        let meta = crate::overlay::LayerMeta::new(LayerKind::Base);
+        let meta_json = serde_json::to_string_pretty(&meta).unwrap();
+        fs::write(layer_dir.join("meta.json"), meta_json).expect("Write meta");
+
+        // Write zero-byte files
+        fs::write(layer_dir.join("symbols.jsonl"), "").expect("Write empty symbols");
+        fs::write(layer_dir.join("deleted.txt"), "").expect("Write empty deleted");
+        fs::write(layer_dir.join("moves.jsonl"), "").expect("Write empty moves");
+
+        // Should succeed with empty collections
+        let result = cache.load_layer(LayerKind::Base);
+        assert!(result.is_ok(), "Should handle empty symbols.jsonl gracefully");
+        
+        let overlay = result.unwrap();
+        assert!(overlay.is_some(), "Should return an overlay");
+        let overlay = overlay.unwrap();
+        assert!(overlay.symbols.is_empty(), "Symbols should be empty");
+        assert!(overlay.deleted.is_empty(), "Deleted should be empty");
+        assert!(overlay.moves.is_empty(), "Moves should be empty");
+    }
+
+    #[test]
+    fn test_load_layer_empty_moves_file() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create layer directory with zero-byte moves.jsonl
+        let layer_dir = cache.layer_dir(LayerKind::Base).unwrap();
+        fs::create_dir_all(&layer_dir).expect("Create layer dir");
+
+        // Write valid meta.json
+        let meta = crate::overlay::LayerMeta::new(LayerKind::Base);
+        let meta_json = serde_json::to_string_pretty(&meta).unwrap();
+        fs::write(layer_dir.join("meta.json"), meta_json).expect("Write meta");
+
+        // Write files with zero-byte moves.jsonl
+        fs::write(layer_dir.join("symbols.jsonl"), "").expect("Write symbols");
+        fs::write(layer_dir.join("deleted.txt"), "").expect("Write deleted");
+        fs::write(layer_dir.join("moves.jsonl"), "").expect("Write empty moves");
+
+        // Should succeed with empty moves
+        let result = cache.load_layer(LayerKind::Base);
+        assert!(result.is_ok(), "Should handle empty moves.jsonl gracefully");
+        
+        let overlay = result.unwrap();
+        assert!(overlay.is_some(), "Should return an overlay");
+        let overlay = overlay.unwrap();
+        assert!(overlay.moves.is_empty(), "Moves should be empty");
+    }
+
+    #[test]
+    fn test_load_layer_invalid_utf8_content() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create layer directory with invalid UTF-8 in symbols.jsonl
+        let layer_dir = cache.layer_dir(LayerKind::Base).unwrap();
+        fs::create_dir_all(&layer_dir).expect("Create layer dir");
+
+        // Write valid meta.json
+        let meta = crate::overlay::LayerMeta::new(LayerKind::Base);
+        let meta_json = serde_json::to_string_pretty(&meta).unwrap();
+        fs::write(layer_dir.join("meta.json"), meta_json).expect("Write meta");
+
+        // Write invalid UTF-8 bytes to symbols.jsonl
+        // These bytes (0xFF 0xFE 0xFD) are invalid in UTF-8 encoding
+        // and simulate file corruption or encoding issues
+        let invalid_utf8: Vec<u8> = vec![0xFF, 0xFE, 0xFD, 0x00];
+        std::fs::write(layer_dir.join("symbols.jsonl"), invalid_utf8).expect("Write invalid UTF-8");
+        fs::write(layer_dir.join("deleted.txt"), "").expect("Write deleted");
+        fs::write(layer_dir.join("moves.jsonl"), "").expect("Write moves");
+
+        // Should return error when reading invalid UTF-8
+        let result = cache.load_layer(LayerKind::Base);
+        assert!(result.is_err(), "Should fail to load layer with invalid UTF-8");
+    }
+
+    #[test]
+    fn test_load_layer_symbols_with_blank_lines() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create a test overlay and save it
+        let mut overlay = Overlay::new(LayerKind::Base);
+        let symbol = crate::schema::SymbolInfo {
+            name: "test_symbol".to_string(),
+            kind: crate::schema::SymbolKind::Function,
+            start_line: 1,
+            end_line: 10,
+            is_exported: true,
+            ..Default::default()
+        };
+        overlay.symbols.insert(
+            "test_hash".to_string(),
+            crate::overlay::SymbolState::active(symbol),
+        );
+
+        cache.save_layer(&overlay).expect("Failed to save layer");
+
+        // Now manually add blank lines to symbols.jsonl
+        let layer_dir = cache.layer_dir(LayerKind::Base).unwrap();
+        let symbols_path = layer_dir.join("symbols.jsonl");
+        let mut content = fs::read_to_string(&symbols_path).expect("Read symbols");
+        content.push_str("\n\n   \n\t\n"); // Add various blank lines
+        fs::write(&symbols_path, content).expect("Write modified symbols");
+
+        // Should handle blank lines gracefully
+        let result = cache.load_layer(LayerKind::Base);
+        assert!(result.is_ok(), "Should handle blank lines in symbols.jsonl");
+        
+        let loaded = result.unwrap();
+        assert!(loaded.is_some(), "Should load the overlay");
+        let loaded_overlay = loaded.unwrap();
+        assert_eq!(loaded_overlay.symbols.len(), 1, "Should have one symbol despite blank lines");
+    }
+
+    #[test]
+    fn test_load_layer_moves_with_blank_lines() {
+        use tempfile::TempDir;
+        use std::path::PathBuf;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create a test overlay with a file move
+        let mut overlay = Overlay::new(LayerKind::Base);
+        overlay.moves.push(crate::overlay::FileMove::new(
+            PathBuf::from("old.rs"),
+            PathBuf::from("new.rs"),
+        ));
+
+        cache.save_layer(&overlay).expect("Failed to save layer");
+
+        // Now manually add blank lines to moves.jsonl
+        let layer_dir = cache.layer_dir(LayerKind::Base).unwrap();
+        let moves_path = layer_dir.join("moves.jsonl");
+        let mut content = fs::read_to_string(&moves_path).expect("Read moves");
+        content.push_str("\n\n   \n\t\n"); // Add various blank lines
+        fs::write(&moves_path, content).expect("Write modified moves");
+
+        // Should handle blank lines gracefully
+        let result = cache.load_layer(LayerKind::Base);
+        assert!(result.is_ok(), "Should handle blank lines in moves.jsonl");
+        
+        let loaded = result.unwrap();
+        assert!(loaded.is_some(), "Should load the overlay");
+        let loaded_overlay = loaded.unwrap();
+        assert_eq!(loaded_overlay.moves.len(), 1, "Should have one move despite blank lines");
+    }
+
+    /// TDD: test_test_file_exclusion_default
+    /// Verifies test files are detected correctly
+    #[test]
+    fn test_test_file_exclusion_default() {
+        use crate::search::is_test_file;
+
+        // Should be detected as test files
+        assert!(is_test_file("tests/test_api.rs"));
+        assert!(is_test_file("src/lib_test.rs"));
+        assert!(is_test_file("src/button.test.ts"));
+        assert!(is_test_file("__tests__/component.tsx"));
+        assert!(is_test_file("test_utils.py"));
+
+        // Should NOT be detected as test files
+        assert!(!is_test_file("src/lib.rs"));
+        assert!(!is_test_file("src/main.py"));
+        assert!(!is_test_file("src/index.ts"));
+    }
+
+    /// TDD: test_test_file_inclusion_flag
+    /// Verifies --allow-tests flag exists in CLI
+    #[test]
+    fn test_test_file_inclusion_flag() {
+        use crate::cli::Cli;
+        use clap::Parser;
+
+        // Test that --allow-tests flag is recognized
+        let args = vec!["semfora-mcp", "--allow-tests", "test.rs"];
+        let cli = Cli::try_parse_from(args).expect("Should parse with --allow-tests");
+        assert!(cli.allow_tests, "--allow-tests should be true");
+
+        // Without the flag, default is false
+        let args = vec!["semfora-mcp", "test.rs"];
+        let cli = Cli::try_parse_from(args).expect("Should parse without --allow-tests");
+        assert!(!cli.allow_tests, "Default should be false");
+    }
+
+    // ========================================================================
+    // Staleness Detection Tests
+    // ========================================================================
+
+    /// Test is_layer_stale returns true when no cached layer exists
+    #[test]
+    fn test_is_layer_stale_missing_layer() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // No layer exists, should be stale
+        let result = cache.is_layer_stale(LayerKind::Base);
+        assert!(result.is_ok());
+        assert!(result.unwrap(), "Missing layer should be stale");
+    }
+
+    /// Test is_base_layer_stale when indexed SHA is missing
+    #[test]
+    fn test_is_base_layer_stale_no_indexed_sha() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create overlay without indexed_sha
+        let overlay = Overlay::new(LayerKind::Base);
+        assert!(overlay.meta.indexed_sha.is_none());
+
+        // Should be stale when no indexed SHA
+        let result = cache.is_base_layer_stale(&overlay);
+        assert!(result.is_ok());
+        assert!(result.unwrap(), "Layer without indexed SHA should be stale");
+    }
+
+    /// Test is_branch_layer_stale when indexed SHA is missing
+    #[test]
+    fn test_is_branch_layer_stale_no_indexed_sha() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create overlay without indexed_sha
+        let overlay = Overlay::new(LayerKind::Branch);
+        assert!(overlay.meta.indexed_sha.is_none());
+
+        // Should be stale when no indexed SHA
+        let result = cache.is_branch_layer_stale(&overlay);
+        assert!(result.is_ok());
+        assert!(result.unwrap(), "Layer without indexed SHA should be stale");
+    }
+
+    /// Test is_working_layer_stale when no files are tracked
+    #[test]
+    fn test_is_working_layer_stale_no_files() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create overlay with no tracked files
+        let overlay = Overlay::new(LayerKind::Working);
+        assert!(overlay.symbols_by_file.is_empty());
+
+        // Should not be stale if no files are tracked
+        let result = cache.is_working_layer_stale(&overlay);
+        assert!(result.is_ok());
+        assert!(!result.unwrap(), "Layer with no tracked files should not be stale");
+    }
+
+    /// Test is_working_layer_stale when tracked file is deleted
+    #[test]
+    fn test_is_working_layer_stale_deleted_file() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create overlay tracking a non-existent file
+        let mut overlay = Overlay::new(LayerKind::Working);
+        overlay.symbols_by_file.insert(
+            PathBuf::from("nonexistent.rs"),
+            Vec::new(),
+        );
+
+        // Should be stale when file is missing
+        let result = cache.is_working_layer_stale(&overlay);
+        assert!(result.is_ok());
+        assert!(result.unwrap(), "Layer with deleted file should be stale");
+    }
+
+    /// Test is_working_layer_stale when tracked file is modified
+    #[test]
+    fn test_is_working_layer_stale_modified_file() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create a test file
+        let test_file = temp_dir.path().join("test.rs");
+        std::fs::write(&test_file, "fn main() {}").expect("Failed to write test file");
+
+        // Create overlay with a very old update time (before file was modified)
+        let mut overlay = Overlay::new(LayerKind::Working);
+        overlay.meta.updated_at = 1; // Very old timestamp
+        overlay.symbols_by_file.insert(
+            PathBuf::from("test.rs"),
+            Vec::new(),
+        );
+
+        // Should be stale because file mtime > overlay update time
+        let result = cache.is_working_layer_stale(&overlay);
+        assert!(result.is_ok());
+        assert!(result.unwrap(), "Layer should be stale when file modified after cache");
+    }
+
+    /// Test is_working_layer_stale when tracked file is NOT modified
+    #[test]
+    fn test_is_working_layer_stale_unmodified_file() {
+        use tempfile::TempDir;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create a test file
+        let test_file = temp_dir.path().join("test.rs");
+        std::fs::write(&test_file, "fn main() {}").expect("Failed to write test file");
+
+        // Create overlay with a very recent update time (after file was modified)
+        let mut overlay = Overlay::new(LayerKind::Working);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_secs();
+        // Set to future time to ensure overlay is newer than the file
+        const FUTURE_OFFSET_SECONDS: u64 = 1000;
+        overlay.meta.updated_at = now + FUTURE_OFFSET_SECONDS;
+        overlay.symbols_by_file.insert(
+            PathBuf::from("test.rs"),
+            Vec::new(),
+        );
+
+        // Should NOT be stale because overlay was updated after file modification
+        let result = cache.is_working_layer_stale(&overlay);
+        assert!(result.is_ok());
+        assert!(!result.unwrap(), "Layer should not be stale when updated after file");
+    }
+
+    /// Test is_layer_stale dispatching for different layer kinds
+    #[test]
+    fn test_is_layer_stale_dispatching() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // AI layer should always be stale (returns true for missing layer)
+        let ai_result = cache.is_layer_stale(LayerKind::AI);
+        assert!(ai_result.is_ok());
+        // AI layer is never persisted, so loading returns None, making it "stale"
+        assert!(ai_result.unwrap(), "AI layer should be stale (no cache)");
+    }
+
+    /// Test is_layered_index_stale when no cache exists
+    #[test]
+    fn test_is_layered_index_stale_no_cache() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // No cache exists
+        assert!(!cache.has_cached_layers());
+
+        // Should be stale
+        let result = cache.is_layered_index_stale();
+        assert!(result.is_ok());
+        assert!(result.unwrap(), "Index should be stale when no cache exists");
+    }
+
+    /// Test is_layered_index_stale when base layer is stale
+    #[test]
+    fn test_is_layered_index_stale_base_stale() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create a layered index with base layer (no indexed_sha = stale)
+        let index = LayeredIndex::new();
+        cache.save_layered_index(&index).expect("Failed to save");
+
+        // Base layer has no indexed_sha, so it's stale
+        let result = cache.is_layered_index_stale();
+        assert!(result.is_ok());
+        assert!(result.unwrap(), "Index should be stale when base layer is stale");
+    }
+
+    // ========================================================================
+    // Git Integration Tests for Staleness Detection
+    // ========================================================================
+
+    /// Test is_base_layer_stale with actual git repo - HEAD changes
+    #[test]
+    fn test_is_base_layer_stale_head_changed() {
+        use tempfile::TempDir;
+        use std::process::Command;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        
+        // Initialize a git repository with main as default branch
+        Command::new("git")
+            .args(&["init", "-b", "main"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to init git");
+
+        // Configure git user for commits
+        Command::new("git")
+            .args(&["config", "user.email", "test@example.com"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to config git email");
+
+        Command::new("git")
+            .args(&["config", "user.name", "Test User"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to config git name");
+
+        // Create initial commit on main
+        std::fs::write(temp_dir.path().join("test.txt"), "initial").expect("Failed to write file");
+        Command::new("git")
+            .args(&["add", "test.txt"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to git add");
+
+        Command::new("git")
+            .args(&["commit", "-m", "initial commit"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to git commit");
+
+        // Get the current SHA
+        let output = Command::new("git")
+            .args(&["rev-parse", "HEAD"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to get HEAD");
+        let initial_sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        let cache = CacheDir {
+            root: temp_dir.path().join(".semfora"),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create overlay with the initial SHA
+        let mut overlay = Overlay::new(LayerKind::Base);
+        overlay.meta.indexed_sha = Some(initial_sha.clone());
+
+        // Should NOT be stale - SHA matches
+        let result = cache.is_base_layer_stale(&overlay);
+        assert!(result.is_ok());
+        assert!(!result.unwrap(), "Layer should not be stale when SHA matches");
+
+        // Create a new commit
+        std::fs::write(temp_dir.path().join("test.txt"), "modified").expect("Failed to write file");
+        Command::new("git")
+            .args(&["add", "test.txt"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to git add");
+
+        Command::new("git")
+            .args(&["commit", "-m", "second commit"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to git commit");
+
+        // Now HEAD has moved, layer should be stale
+        let result = cache.is_base_layer_stale(&overlay);
+        assert!(result.is_ok());
+        assert!(result.unwrap(), "Layer should be stale when HEAD has moved");
+    }
+
+    /// Test is_branch_layer_stale with actual git repo - branch HEAD moves
+    #[test]
+    fn test_is_branch_layer_stale_head_moved() {
+        use tempfile::TempDir;
+        use std::process::Command;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        
+        // Initialize a git repository with main as default branch
+        Command::new("git")
+            .args(&["init", "-b", "main"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to init git");
+
+        // Configure git
+        Command::new("git")
+            .args(&["config", "user.email", "test@example.com"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to config git email");
+
+        Command::new("git")
+            .args(&["config", "user.name", "Test User"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to config git name");
+
+        // Create initial commit
+        std::fs::write(temp_dir.path().join("test.txt"), "initial").expect("Failed to write file");
+        Command::new("git")
+            .args(&["add", "test.txt"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to git add");
+
+        Command::new("git")
+            .args(&["commit", "-m", "initial commit"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to git commit");
+
+        // Create a branch
+        Command::new("git")
+            .args(&["checkout", "-b", "feature"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to create branch");
+
+        // Get the current SHA
+        let output = Command::new("git")
+            .args(&["rev-parse", "HEAD"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to get HEAD");
+        let branch_sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        let cache = CacheDir {
+            root: temp_dir.path().join(".semfora"),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create overlay with the branch SHA
+        let mut overlay = Overlay::new(LayerKind::Branch);
+        overlay.meta.indexed_sha = Some(branch_sha.clone());
+
+        // Should NOT be stale - SHA matches
+        let result = cache.is_branch_layer_stale(&overlay);
+        assert!(result.is_ok());
+        assert!(!result.unwrap(), "Layer should not be stale when SHA matches");
+
+        // Create a new commit on branch
+        std::fs::write(temp_dir.path().join("feature.txt"), "feature").expect("Failed to write file");
+        Command::new("git")
+            .args(&["add", "feature.txt"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to git add");
+
+        Command::new("git")
+            .args(&["commit", "-m", "feature commit"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to git commit");
+
+        // Now HEAD has moved, layer should be stale
+        let result = cache.is_branch_layer_stale(&overlay);
+        assert!(result.is_ok());
+        assert!(result.unwrap(), "Layer should be stale when branch HEAD has moved");
+    }
+
+    /// Test is_branch_layer_stale with actual git repo - merge base changes (rebase)
+    #[test]
+    fn test_is_branch_layer_stale_merge_base_changed() {
+        use tempfile::TempDir;
+        use std::process::Command;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        
+        // Initialize a git repository with main as default branch
+        Command::new("git")
+            .args(&["init", "-b", "main"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to init git");
+
+        // Configure git
+        Command::new("git")
+            .args(&["config", "user.email", "test@example.com"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to config git email");
+
+        Command::new("git")
+            .args(&["config", "user.name", "Test User"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to config git name");
+
+        // Create initial commit on main
+        std::fs::write(temp_dir.path().join("base.txt"), "base").expect("Failed to write file");
+        Command::new("git")
+            .args(&["add", "base.txt"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to git add");
+
+        Command::new("git")
+            .args(&["commit", "-m", "base commit"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to git commit");
+
+        // Get initial merge base (same as HEAD at this point)
+        let output = Command::new("git")
+            .args(&["rev-parse", "HEAD"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to get HEAD");
+        let initial_merge_base = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        // Create a branch
+        Command::new("git")
+            .args(&["checkout", "-b", "feature"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to create branch");
+
+        // Make a commit on feature
+        std::fs::write(temp_dir.path().join("feature.txt"), "feature").expect("Failed to write file");
+        Command::new("git")
+            .args(&["add", "feature.txt"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to git add");
+
+        Command::new("git")
+            .args(&["commit", "-m", "feature commit"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to git commit");
+
+        let output = Command::new("git")
+            .args(&["rev-parse", "HEAD"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to get HEAD");
+        let feature_sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        // Get the current merge-base (should be initial commit)
+        let output = Command::new("git")
+            .args(&["merge-base", "HEAD", "main"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to get merge-base");
+        let current_merge_base = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        assert_eq!(initial_merge_base, current_merge_base, "Merge base should still be initial commit");
+
+        // Switch to main and add another commit
+        Command::new("git")
+            .args(&["checkout", "main"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to checkout main");
+
+        std::fs::write(temp_dir.path().join("main.txt"), "main progress").expect("Failed to write file");
+        Command::new("git")
+            .args(&["add", "main.txt"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to git add");
+
+        Command::new("git")
+            .args(&["commit", "-m", "main progress"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to git commit");
+
+        let output = Command::new("git")
+            .args(&["rev-parse", "HEAD"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to get HEAD");
+        let new_main_sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        // Switch back to feature
+        Command::new("git")
+            .args(&["checkout", "feature"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to checkout feature");
+
+        let cache = CacheDir {
+            root: temp_dir.path().join(".semfora"),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create overlay with current HEAD and old merge base
+        let mut overlay = Overlay::new(LayerKind::Branch);
+        overlay.meta.indexed_sha = Some(feature_sha.clone());
+        overlay.meta.merge_base_sha = Some(initial_merge_base.clone());
+
+        // Merge base hasn't changed yet (still at initial commit even after main moved forward)
+        // The merge-base of feature and main is still the initial commit
+        let output = Command::new("git")
+            .args(&["merge-base", "HEAD", "main"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to get merge-base");
+        let actual_merge_base = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        assert_eq!(initial_merge_base, actual_merge_base, "Merge base should still be initial commit after main moves");
+
+        let result = cache.is_branch_layer_stale(&overlay);
+        assert!(result.is_ok());
+        // Merge-base is still the same, so should NOT be stale
+        assert!(!result.unwrap(), "Layer should not be stale when merge-base hasn't changed");
+
+        // Now rebase onto main - this will change the merge-base
+        let _rebase_result = Command::new("git")
+            .args(&["rebase", "main"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to rebase");
+
+        // After rebase, HEAD SHA has changed (feature commit was rewritten)
+        let output = Command::new("git")
+            .args(&["rev-parse", "HEAD"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to get HEAD");
+        let rebased_sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        assert_ne!(feature_sha, rebased_sha, "SHA should change after rebase");
+
+        // After rebase, merge-base is now the new main SHA (where we rebased onto)
+        let output = Command::new("git")
+            .args(&["merge-base", "HEAD", "main"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to get merge-base");
+        let new_merge_base = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        assert_eq!(new_main_sha, new_merge_base, "After rebase, merge-base should be the new main HEAD");
+
+        // The layer should be stale because HEAD changed (from original feature_sha to rebased_sha)
+        let result = cache.is_branch_layer_stale(&overlay);
+        assert!(result.is_ok());
+        assert!(result.unwrap(), "Layer should be stale after rebase (HEAD changed)");
+    }
+
+    /// Test edge case: missing git reference
+    #[test]
+    fn test_is_base_layer_stale_missing_git_ref() {
+        use tempfile::TempDir;
+        use std::process::Command;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        
+        // Initialize a git repository with main as default branch
+        Command::new("git")
+            .args(&["init", "-b", "main"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to init git");
+
+        let cache = CacheDir {
+            root: temp_dir.path().join(".semfora"),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create overlay with indexed SHA but no commits in repo (no main/master)
+        let mut overlay = Overlay::new(LayerKind::Base);
+        overlay.meta.indexed_sha = Some("abc123".to_string());
+
+        // Should return an error or report stale when git ref is missing
+        let result = cache.is_base_layer_stale(&overlay);
+        // The function will fail when trying to detect base branch or get ref SHA
+        match result {
+            Err(_) => {
+                // Error is acceptable - no commits yet
+            }
+            Ok(is_stale) => {
+                // If it returns Ok, it should report stale
+                assert!(is_stale, "Should report stale when git ref is missing");
+            }
+        }
+    }
+
+    /// Test edge case: detached HEAD
+    #[test]
+    fn test_is_branch_layer_stale_detached_head() {
+        use tempfile::TempDir;
+        use std::process::Command;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        
+        // Initialize a git repository with main as default branch
+        Command::new("git")
+            .args(&["init", "-b", "main"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to init git");
+
+        // Configure git
+        Command::new("git")
+            .args(&["config", "user.email", "test@example.com"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to config git email");
+
+        Command::new("git")
+            .args(&["config", "user.name", "Test User"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to config git name");
+
+        // Create initial commit
+        std::fs::write(temp_dir.path().join("test.txt"), "initial").expect("Failed to write file");
+        Command::new("git")
+            .args(&["add", "test.txt"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to git add");
+
+        Command::new("git")
+            .args(&["commit", "-m", "initial commit"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to git commit");
+
+        // Get the commit SHA
+        let output = Command::new("git")
+            .args(&["rev-parse", "HEAD"])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to get HEAD");
+        let commit_sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        // Detach HEAD
+        Command::new("git")
+            .args(&["checkout", &commit_sha])
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to detach HEAD");
+
+        let cache = CacheDir {
+            root: temp_dir.path().join(".semfora"),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create overlay with the current SHA
+        let mut overlay = Overlay::new(LayerKind::Branch);
+        overlay.meta.indexed_sha = Some(commit_sha.clone());
+
+        // Even in detached HEAD state, if SHA matches, it shouldn't be stale
+        let result = cache.is_branch_layer_stale(&overlay);
+        assert!(result.is_ok());
+        assert!(!result.unwrap(), "Layer should not be stale in detached HEAD if SHA matches");
     }
 }

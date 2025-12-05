@@ -81,7 +81,7 @@ pub use git::{
 // Re-export cache module types
 pub use cache::{
     get_cache_base_dir, list_cached_repos, prune_old_caches, CacheDir, CacheMeta,
-    IndexingStatus, SourceFileInfo, SymbolIndexEntry,
+    IndexingStatus, LayeredIndexMeta, SourceFileInfo, SymbolIndexEntry,
 };
 
 // Re-export shard module types
@@ -100,4 +100,4 @@ pub use overlay::{
 };
 
 // Re-export search types
-pub use search::{lang_from_extension, SearchHints};
+pub use search::{is_test_file, lang_from_extension, SearchHints};

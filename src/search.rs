@@ -195,6 +195,102 @@ pub fn lang_from_extension(path: &str) -> Option<String> {
     Some(lang.to_string())
 }
 
+/// Check if a file path appears to be a test file
+///
+/// Detects common test file patterns across multiple languages:
+/// - Rust: `*_test.rs`, `tests/**/*.rs`
+/// - TypeScript/JavaScript: `*.test.ts`, `*.spec.ts`, `__tests__/**`
+/// - Python: `test_*.py`, `*_test.py`, `tests/**/*.py`
+/// - Go: `*_test.go`
+/// - Java: `*Test.java`, `*Tests.java`
+///
+/// # Example
+///
+/// ```
+/// use semfora_mcp::search::is_test_file;
+///
+/// assert!(is_test_file("src/lib_test.rs"));
+/// assert!(is_test_file("tests/integration.rs"));
+/// assert!(is_test_file("src/button.test.ts"));
+/// assert!(is_test_file("test_utils.py"));
+/// assert!(!is_test_file("src/lib.rs"));
+/// ```
+pub fn is_test_file(path: &str) -> bool {
+    let path_lower = path.to_lowercase();
+    let normalized_path = path_lower.replace('\\', "/");
+    let file_name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    // Directory-based patterns (always test files)
+    if normalized_path.contains("/tests/")
+        || normalized_path.contains("/__tests__/")
+        || normalized_path.contains("/test/")
+        || normalized_path.starts_with("tests/")
+        || normalized_path.starts_with("__tests__/")
+        || normalized_path.starts_with("test/")
+    {
+        return true;
+    }
+
+    // File name patterns by extension
+    if let Some(ext) = std::path::Path::new(path).extension().and_then(|e| e.to_str()) {
+        match ext.to_lowercase().as_str() {
+            // Rust: *_test.rs
+            "rs" => {
+                return file_name.ends_with("_test.rs")
+                    || file_name.starts_with("test_");
+            }
+            // TypeScript/JavaScript: *.test.ts, *.spec.ts, *.test.js, *.spec.js
+            "ts" | "tsx" | "js" | "jsx" | "mts" | "mjs" => {
+                return file_name.contains(".test.")
+                    || file_name.contains(".spec.")
+                    || file_name.starts_with("test_")
+                    || file_name.starts_with("test.");
+            }
+            // Python: test_*.py, *_test.py
+            "py" => {
+                return file_name.starts_with("test_")
+                    || file_name.ends_with("_test.py")
+                    || file_name == "conftest.py";
+            }
+            // Go: *_test.go
+            "go" => {
+                return file_name.ends_with("_test.go");
+            }
+            // Java/Kotlin: *Test.java, *Tests.java, *Test.kt
+            // Use original (non-lowercased) name for case-sensitive Java conventions
+            "java" | "kt" | "kts" => {
+                let original_name = std::path::Path::new(path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
+                return original_name.ends_with("Test.java")
+                    || original_name.ends_with("Tests.java")
+                    || original_name.ends_with("Test.kt")
+                    || original_name.ends_with("Tests.kt")
+                    || original_name.ends_with("Test.kts")
+                    || original_name.ends_with("Tests.kts")
+                    || file_name.starts_with("test_")
+                    || file_name.starts_with("test.");
+            }
+            // C/C++: test_*.c, *_test.cpp, *_test.c, *_test.cc, *_test.cxx
+            "c" | "cpp" | "cc" | "cxx" => {
+                return file_name.starts_with("test_")
+                    || file_name.ends_with("_test.c")
+                    || file_name.ends_with("_test.cpp")
+                    || file_name.ends_with("_test.cc")
+                    || file_name.ends_with("_test.cxx");
+            }
+            _ => {}
+        }
+    }
+
+    false
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -306,5 +402,103 @@ mod tests {
         assert_eq!(lang_from_extension("foo.ts"), Some("typescript".to_string()));
         assert_eq!(lang_from_extension("foo.tsx"), Some("typescript".to_string()));
         assert_eq!(lang_from_extension("foo.unknown"), None);
+    }
+
+    // ========================================================================
+    // Test file detection tests
+    // ========================================================================
+
+    #[test]
+    fn test_is_test_file_rust() {
+        assert!(is_test_file("src/lib_test.rs"));
+        assert!(is_test_file("src/test_utils.rs"));
+        assert!(is_test_file("tests/integration.rs"));
+        assert!(!is_test_file("src/lib.rs"));
+        assert!(!is_test_file("src/main.rs"));
+    }
+
+    #[test]
+    fn test_is_test_file_typescript() {
+        assert!(is_test_file("src/button.test.ts"));
+        assert!(is_test_file("src/button.spec.ts"));
+        assert!(is_test_file("src/button.test.tsx"));
+        assert!(is_test_file("__tests__/button.ts"));
+        assert!(!is_test_file("src/button.ts"));
+        assert!(!is_test_file("src/components/Button.tsx"));
+    }
+
+    #[test]
+    fn test_is_test_file_javascript() {
+        assert!(is_test_file("src/utils.test.js"));
+        assert!(is_test_file("src/utils.spec.js"));
+        assert!(is_test_file("__tests__/utils.js"));
+        assert!(!is_test_file("src/utils.js"));
+    }
+
+    #[test]
+    fn test_is_test_file_python() {
+        assert!(is_test_file("test_utils.py"));
+        assert!(is_test_file("utils_test.py"));
+        assert!(is_test_file("tests/test_api.py"));
+        assert!(is_test_file("conftest.py"));
+        assert!(!is_test_file("src/utils.py"));
+        assert!(!is_test_file("main.py"));
+    }
+
+    #[test]
+    fn test_is_test_file_go() {
+        assert!(is_test_file("main_test.go"));
+        assert!(is_test_file("handler_test.go"));
+        assert!(!is_test_file("main.go"));
+        assert!(!is_test_file("handler.go"));
+    }
+
+    #[test]
+    fn test_is_test_file_java() {
+        assert!(is_test_file("UserServiceTest.java"));
+        assert!(is_test_file("UserServiceTests.java"));
+        assert!(is_test_file("test/UserService.java"));
+        assert!(is_test_file("test_utils.java"));
+        assert!(!is_test_file("UserService.java"));
+        // False positive checks - these should NOT be detected as tests
+        assert!(!is_test_file("contest.java"));
+        assert!(!is_test_file("attest.java"));
+        assert!(!is_test_file("latest.java"));
+        assert!(!is_test_file("testable.java"));
+        assert!(!is_test_file("testimony.java"));
+    }
+
+    #[test]
+    fn test_is_test_file_directory_patterns() {
+        // tests/ directory
+        assert!(is_test_file("tests/foo.rs"));
+        assert!(is_test_file("project/tests/bar.py"));
+        // __tests__/ directory (Jest convention)
+        assert!(is_test_file("__tests__/component.tsx"));
+        assert!(is_test_file("src/__tests__/utils.js"));
+        // test/ directory
+        assert!(is_test_file("test/unit.java"));
+    }
+
+    #[test]
+    fn test_is_test_file_non_test_files() {
+        assert!(!is_test_file("src/lib.rs"));
+        assert!(!is_test_file("src/main.py"));
+        assert!(!is_test_file("src/index.ts"));
+        assert!(!is_test_file("README.md"));
+        assert!(!is_test_file("Cargo.toml"));
+    }
+
+    #[test]
+    fn test_is_test_file_cpp_false_positives() {
+        // These should NOT be detected as test files
+        assert!(!is_test_file("my_test.backup.cpp"));
+        assert!(!is_test_file("old_test.2.c"));
+        assert!(!is_test_file("latest.cpp"));
+        assert!(!is_test_file("contest.c"));
+        // But these SHOULD be detected
+        assert!(is_test_file("my_test.cpp"));
+        assert!(is_test_file("test_main.c"));
+        assert!(is_test_file("parser_test.cc"));
     }
 }
