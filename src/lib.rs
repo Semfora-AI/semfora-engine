@@ -104,6 +104,4 @@ pub use overlay::{
 pub use search::{is_test_file, lang_from_extension, SearchHints};
 
 // Re-export ripgrep types (Phase 2.5 - SEM-46)
-pub use ripgrep::{
-    BlockLine, MergedBlock, RipgrepSearcher, SearchMatch, SearchOptions, SearchStats,
-};
+pub use ripgrep::{BlockLine, MergedBlock, RipgrepSearcher, SearchMatch, SearchOptions};

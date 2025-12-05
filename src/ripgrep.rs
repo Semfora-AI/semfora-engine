@@ -138,9 +138,6 @@ pub struct SearchOptions {
     /// The search pattern (regex)
     pub pattern: String,
 
-    /// Specific files or directories to search (empty = search all)
-    pub paths: Vec<PathBuf>,
-
     /// Whether to respect .gitignore files
     pub respect_gitignore: bool,
 
@@ -149,12 +146,6 @@ pub struct SearchOptions {
 
     /// Merge threshold: merge adjacent blocks within N lines
     pub merge_threshold: usize,
-
-    /// Number of context lines before each match
-    pub context_before: usize,
-
-    /// Number of context lines after each match
-    pub context_after: usize,
 
     /// Case-insensitive search
     pub case_insensitive: bool,
@@ -168,21 +159,12 @@ impl SearchOptions {
     pub fn new(pattern: impl Into<String>) -> Self {
         Self {
             pattern: pattern.into(),
-            paths: Vec::new(),
             respect_gitignore: true,
             limit: None,
             merge_threshold: 3, // Default: merge blocks within 3 lines
-            context_before: 0,
-            context_after: 0,
             case_insensitive: false,
             file_types: Vec::new(),
         }
-    }
-
-    /// Set specific files to search
-    pub fn with_paths(mut self, paths: Vec<PathBuf>) -> Self {
-        self.paths = paths;
-        self
     }
 
     /// Set whether to respect .gitignore
@@ -200,18 +182,6 @@ impl SearchOptions {
     /// Set merge threshold for adjacent blocks
     pub fn with_merge_threshold(mut self, threshold: usize) -> Self {
         self.merge_threshold = threshold;
-        self
-    }
-
-    /// Set context lines before matches
-    pub fn with_context_before(mut self, lines: usize) -> Self {
-        self.context_before = lines;
-        self
-    }
-
-    /// Set context lines after matches
-    pub fn with_context_after(mut self, lines: usize) -> Self {
-        self.context_after = lines;
         self
     }
 
@@ -234,25 +204,6 @@ impl Default for SearchOptions {
     }
 }
 
-/// Search statistics
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SearchStats {
-    /// Number of files searched
-    pub files_searched: usize,
-
-    /// Number of files with matches
-    pub files_matched: usize,
-
-    /// Total number of matches found
-    pub total_matches: usize,
-
-    /// Number of merged blocks (if merging enabled)
-    pub merged_blocks: usize,
-
-    /// Search duration in milliseconds
-    pub duration_ms: u64,
-}
-
 // ============================================================================
 // RipgrepSearcher
 // ============================================================================
@@ -260,43 +211,19 @@ pub struct SearchStats {
 /// Ripgrep-based file searcher
 ///
 /// Provides search functionality with .gitignore support and block merging.
-pub struct RipgrepSearcher {
-    /// Default context lines before matches
-    pub default_context_before: usize,
-
-    /// Default context lines after matches
-    pub default_context_after: usize,
-}
-
-impl Default for RipgrepSearcher {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+#[derive(Debug, Clone, Default)]
+pub struct RipgrepSearcher;
 
 impl RipgrepSearcher {
     /// Create a new ripgrep searcher
     pub fn new() -> Self {
-        Self {
-            default_context_before: 0,
-            default_context_after: 0,
-        }
-    }
-
-    /// Create a searcher with default context lines
-    pub fn with_context(before: usize, after: usize) -> Self {
-        Self {
-            default_context_before: before,
-            default_context_after: after,
-        }
+        Self
     }
 
     /// Search for a pattern in the given directory
     ///
     /// Returns a list of matches, respecting .gitignore and other options.
     pub fn search(&self, root: &Path, options: &SearchOptions) -> Result<Vec<SearchMatch>> {
-        let _start = std::time::Instant::now();
-
         // Build regex matcher
         let matcher = self.build_matcher(options)?;
 
@@ -426,15 +353,10 @@ impl RipgrepSearcher {
         builder.git_global(options.respect_gitignore);
         builder.git_exclude(options.respect_gitignore);
 
-        // Add additional paths if specified
-        for path in &options.paths {
-            builder.add(path);
-        }
-
-        // Follow symlinks
+        // Do not follow symlinks
         builder.follow_links(false);
 
-        // Skip hidden files unless explicitly searching them
+        // Include hidden files in search (hidden=true means "process hidden files")
         builder.hidden(true);
 
         Ok(builder.build())
