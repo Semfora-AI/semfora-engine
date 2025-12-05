@@ -1707,7 +1707,9 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards")
             .as_secs();
-        overlay.meta.updated_at = now + 1000; // Set to future time
+        // Set to future time to ensure overlay is newer than the file
+        const FUTURE_OFFSET_SECONDS: u64 = 1000;
+        overlay.meta.updated_at = now + FUTURE_OFFSET_SECONDS;
         overlay.symbols_by_file.insert(
             PathBuf::from("test.rs"),
             Vec::new(),
@@ -2165,12 +2167,18 @@ mod tests {
         let mut overlay = Overlay::new(LayerKind::Base);
         overlay.meta.indexed_sha = Some("abc123".to_string());
 
-        // Should return an error because there's no main/master branch
+        // Should return an error or report stale when git ref is missing
         let result = cache.is_base_layer_stale(&overlay);
-        // The function should handle the error gracefully
-        // It will fail when trying to detect base branch
-        assert!(result.is_err() || (result.is_ok() && result.unwrap()), 
-                "Should error or report stale when git ref is missing");
+        // The function will fail when trying to detect base branch or get ref SHA
+        match result {
+            Err(_) => {
+                // Error is acceptable - no commits yet
+            }
+            Ok(is_stale) => {
+                // If it returns Ok, it should report stale
+                assert!(is_stale, "Should report stale when git ref is missing");
+            }
+        }
     }
 
     /// Test edge case: detached HEAD
