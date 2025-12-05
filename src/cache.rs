@@ -11,6 +11,8 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
+use crate::git;
+use crate::overlay::{LayerKind, LayeredIndex, Overlay};
 use crate::schema::{fnv1a_hash, SCHEMA_VERSION};
 
 /// Metadata for cached files to detect staleness
@@ -192,6 +194,7 @@ impl CacheDir {
         fs::create_dir_all(self.symbols_dir())?;
         fs::create_dir_all(self.graphs_dir())?;
         fs::create_dir_all(self.diffs_dir())?;
+        fs::create_dir_all(self.layers_dir())?;
 
         Ok(())
     }
@@ -256,6 +259,33 @@ impl CacheDir {
     /// Path to a specific diff file
     pub fn diff_path(&self, commit_sha: &str) -> PathBuf {
         self.diffs_dir().join(format!("commit_{}.toon", commit_sha))
+    }
+
+    // ========== Layer paths (SEM-45) ==========
+
+    /// Path to layers directory
+    pub fn layers_dir(&self) -> PathBuf {
+        self.root.join("layers")
+    }
+
+    /// Path to a specific layer file
+    ///
+    /// AI layer is not persisted - returns None for LayerKind::AI
+    pub fn layer_path(&self, kind: LayerKind) -> Option<PathBuf> {
+        match kind {
+            LayerKind::AI => None, // AI layer is ephemeral
+            _ => Some(self.layers_dir().join(format!("{}.json", kind.as_str()))),
+        }
+    }
+
+    /// Path to layered index metadata file
+    pub fn layer_meta_path(&self) -> PathBuf {
+        self.layers_dir().join("meta.json")
+    }
+
+    /// Check if cached layers exist
+    pub fn has_cached_layers(&self) -> bool {
+        self.layers_dir().exists() && self.layer_path(LayerKind::Base).map(|p| p.exists()).unwrap_or(false)
     }
 
     // ========== Utility methods ==========
@@ -448,6 +478,275 @@ impl CacheDir {
 
         Ok(results)
     }
+
+    // ========== Layer persistence (SEM-45) ==========
+
+    /// Save a single layer overlay to cache
+    ///
+    /// Uses atomic write (temp file + rename) for crash safety.
+    /// AI layer is not persisted and returns Ok(()) immediately.
+    pub fn save_layer(&self, overlay: &Overlay) -> Result<()> {
+        let kind = match overlay.meta.kind {
+            Some(k) => k,
+            None => return Err(crate::McpDiffError::ExtractionFailure {
+                message: "Cannot save overlay with unknown layer kind".to_string(),
+            }),
+        };
+
+        let path = match self.layer_path(kind) {
+            Some(p) => p,
+            None => return Ok(()), // AI layer - skip
+        };
+
+        // Ensure layers directory exists
+        fs::create_dir_all(self.layers_dir())?;
+
+        // Atomic write: write to temp file, then rename
+        let temp_path = path.with_extension("json.tmp");
+        let json = serde_json::to_string_pretty(overlay).map_err(|e| {
+            crate::McpDiffError::ExtractionFailure {
+                message: format!("Failed to serialize {} layer: {}", kind, e),
+            }
+        })?;
+
+        fs::write(&temp_path, &json)?;
+        fs::rename(&temp_path, &path)?;
+
+        Ok(())
+    }
+
+    /// Load a single layer overlay from cache
+    ///
+    /// Returns None if layer file doesn't exist or AI layer is requested.
+    pub fn load_layer(&self, kind: LayerKind) -> Result<Option<Overlay>> {
+        let path = match self.layer_path(kind) {
+            Some(p) => p,
+            None => return Ok(None), // AI layer - not persisted
+        };
+
+        if !path.exists() {
+            return Ok(None);
+        }
+
+        let json = fs::read_to_string(&path)?;
+        let overlay: Overlay = serde_json::from_str(&json).map_err(|e| {
+            crate::McpDiffError::ExtractionFailure {
+                message: format!("Failed to deserialize {} layer: {}", kind, e),
+            }
+        })?;
+
+        Ok(Some(overlay))
+    }
+
+    /// Save a full LayeredIndex to cache
+    ///
+    /// Saves base, branch, and working layers. AI layer is ephemeral.
+    pub fn save_layered_index(&self, index: &LayeredIndex) -> Result<()> {
+        // Save each persistent layer
+        self.save_layer(&index.base)?;
+        self.save_layer(&index.branch)?;
+        self.save_layer(&index.working)?;
+        // AI layer is not saved (ephemeral)
+
+        // Save metadata
+        let meta = LayeredIndexMeta {
+            schema_version: SCHEMA_VERSION.to_string(),
+            saved_at: chrono::Utc::now().to_rfc3339(),
+            base_indexed_sha: index.base.meta.indexed_sha.clone(),
+            branch_indexed_sha: index.branch.meta.indexed_sha.clone(),
+            merge_base: index.base.meta.merge_base_sha.clone(),
+        };
+
+        let meta_json = serde_json::to_string_pretty(&meta).map_err(|e| {
+            crate::McpDiffError::ExtractionFailure {
+                message: format!("Failed to serialize layer meta: {}", e),
+            }
+        })?;
+
+        fs::write(self.layer_meta_path(), &meta_json)?;
+
+        Ok(())
+    }
+
+    /// Load a full LayeredIndex from cache
+    ///
+    /// Returns None if layers haven't been cached yet.
+    /// AI layer is always initialized empty.
+    pub fn load_layered_index(&self) -> Result<Option<LayeredIndex>> {
+        if !self.has_cached_layers() {
+            return Ok(None);
+        }
+
+        // Load each layer
+        let base = match self.load_layer(LayerKind::Base)? {
+            Some(o) => o,
+            None => return Ok(None),
+        };
+
+        let branch = self.load_layer(LayerKind::Branch)?.unwrap_or_else(|| Overlay::new(LayerKind::Branch));
+        let working = self.load_layer(LayerKind::Working)?.unwrap_or_else(|| Overlay::new(LayerKind::Working));
+        let ai = Overlay::new(LayerKind::AI); // AI is always fresh
+
+        Ok(Some(LayeredIndex {
+            base,
+            branch,
+            working,
+            ai,
+        }))
+    }
+
+    /// Clear all cached layers
+    pub fn clear_layers(&self) -> Result<()> {
+        let layers_dir = self.layers_dir();
+        if layers_dir.exists() {
+            fs::remove_dir_all(&layers_dir)?;
+        }
+        Ok(())
+    }
+
+    // ========== Layer staleness detection (SEM-45) ==========
+
+    /// Check if a cached layer is stale
+    ///
+    /// Staleness rules:
+    /// - Base: indexed_sha != current HEAD of main/master
+    /// - Branch: indexed_sha != current branch HEAD
+    /// - Working: any tracked file changed (mtime/size)
+    /// - AI: always fresh (not persisted)
+    pub fn is_layer_stale(&self, kind: LayerKind) -> Result<bool> {
+        let overlay = match self.load_layer(kind)? {
+            Some(o) => o,
+            None => return Ok(true), // No cached layer = stale
+        };
+
+        match kind {
+            LayerKind::Base => self.is_base_layer_stale(&overlay),
+            LayerKind::Branch => self.is_branch_layer_stale(&overlay),
+            LayerKind::Working => self.is_working_layer_stale(&overlay),
+            LayerKind::AI => Ok(false), // AI layer is never persisted, always fresh in memory
+        }
+    }
+
+    /// Check if base layer is stale (indexed SHA != main/master HEAD)
+    fn is_base_layer_stale(&self, overlay: &Overlay) -> Result<bool> {
+        let indexed_sha = match &overlay.meta.indexed_sha {
+            Some(sha) => sha,
+            None => return Ok(true), // No indexed SHA = stale
+        };
+
+        // Get the current base branch HEAD
+        let base_branch = git::detect_base_branch(Some(&self.repo_root))?;
+        let current_sha = get_ref_sha(&base_branch, Some(&self.repo_root))?;
+
+        Ok(indexed_sha != &current_sha)
+    }
+
+    /// Check if branch layer is stale (indexed SHA != branch HEAD, or merge-base changed)
+    fn is_branch_layer_stale(&self, overlay: &Overlay) -> Result<bool> {
+        let indexed_sha = match &overlay.meta.indexed_sha {
+            Some(sha) => sha,
+            None => return Ok(true), // No indexed SHA = stale
+        };
+
+        // Check if branch HEAD has moved
+        let current_sha = get_ref_sha("HEAD", Some(&self.repo_root))?;
+        if indexed_sha != &current_sha {
+            return Ok(true);
+        }
+
+        // Check if merge-base has changed (rebase scenario)
+        if let Some(stored_merge_base) = &overlay.meta.merge_base_sha {
+            let base_branch = git::detect_base_branch(Some(&self.repo_root))?;
+            let current_merge_base = git::get_merge_base("HEAD", &base_branch, Some(&self.repo_root))?;
+            if stored_merge_base != &current_merge_base {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Check if working layer is stale (any tracked file has changed)
+    fn is_working_layer_stale(&self, overlay: &Overlay) -> Result<bool> {
+        // Working layer tracks files via symbols_by_file
+        // Check if any tracked file's mtime/size has changed
+        for file_path in overlay.symbols_by_file.keys() {
+            let full_path = self.repo_root.join(file_path);
+            match fs::metadata(&full_path) {
+                Ok(meta) => {
+                    let mtime = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+
+                    // If the layer was updated before the file was modified, it's stale
+                    if mtime > overlay.meta.updated_at {
+                        return Ok(true);
+                    }
+                }
+                Err(_) => {
+                    // File deleted or inaccessible = stale
+                    return Ok(true);
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Check if entire LayeredIndex cache is stale
+    pub fn is_layered_index_stale(&self) -> Result<bool> {
+        // If no cache exists, it's "stale" (needs to be created)
+        if !self.has_cached_layers() {
+            return Ok(true);
+        }
+
+        // Base layer staleness is most critical - rebuild if base moved
+        if self.is_layer_stale(LayerKind::Base)? {
+            return Ok(true);
+        }
+
+        // Branch and working layers can be rebuilt incrementally,
+        // but for now we consider the whole index stale if any layer is stale
+        if self.is_layer_stale(LayerKind::Branch)? {
+            return Ok(true);
+        }
+
+        if self.is_layer_stale(LayerKind::Working)? {
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+}
+
+/// Get the SHA for a git reference
+fn get_ref_sha(ref_name: &str, cwd: Option<&Path>) -> Result<String> {
+    git::git_command(&["rev-parse", ref_name], cwd)
+}
+
+/// Metadata for cached LayeredIndex
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayeredIndexMeta {
+    /// Schema version for compatibility
+    pub schema_version: String,
+
+    /// When the layers were saved
+    pub saved_at: String,
+
+    /// Git SHA that base layer was indexed at
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_indexed_sha: Option<String>,
+
+    /// Git SHA that branch layer was indexed at
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_indexed_sha: Option<String>,
+
+    /// Merge base SHA (where branch diverged from base)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge_base: Option<String>,
 }
 
 /// Lightweight symbol index entry for query-driven access
@@ -672,5 +971,198 @@ mod tests {
             assert!(info.size > 0);
             assert!(!info.is_stale(&repo_root));
         }
+    }
+
+    // ========================================================================
+    // Layer Cache Tests (SEM-45)
+    // ========================================================================
+
+    #[test]
+    fn test_layer_paths() {
+        let cache = CacheDir {
+            root: PathBuf::from("/tmp/semfora/abc123"),
+            repo_root: PathBuf::from("/home/user/project"),
+            repo_hash: "abc123".to_string(),
+        };
+
+        // Test layers directory path
+        assert_eq!(
+            cache.layers_dir(),
+            PathBuf::from("/tmp/semfora/abc123/layers")
+        );
+
+        // Test layer paths for each kind
+        assert_eq!(
+            cache.layer_path(LayerKind::Base),
+            Some(PathBuf::from("/tmp/semfora/abc123/layers/base.json"))
+        );
+        assert_eq!(
+            cache.layer_path(LayerKind::Branch),
+            Some(PathBuf::from("/tmp/semfora/abc123/layers/branch.json"))
+        );
+        assert_eq!(
+            cache.layer_path(LayerKind::Working),
+            Some(PathBuf::from("/tmp/semfora/abc123/layers/working.json"))
+        );
+        // AI layer should return None (ephemeral)
+        assert_eq!(cache.layer_path(LayerKind::AI), None);
+
+        // Test layer meta path
+        assert_eq!(
+            cache.layer_meta_path(),
+            PathBuf::from("/tmp/semfora/abc123/layers/meta.json")
+        );
+    }
+
+    #[test]
+    fn test_save_and_load_layer() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create a test overlay
+        let mut overlay = Overlay::new(LayerKind::Base);
+        overlay.meta.indexed_sha = Some("abc123".to_string());
+
+        // Save the layer
+        cache.save_layer(&overlay).expect("Failed to save layer");
+
+        // Verify the file exists
+        let path = cache.layer_path(LayerKind::Base).unwrap();
+        assert!(path.exists(), "Layer file should exist after save");
+
+        // Load the layer back
+        let loaded = cache.load_layer(LayerKind::Base).expect("Failed to load layer");
+        assert!(loaded.is_some(), "Should load the saved layer");
+
+        let loaded_overlay = loaded.unwrap();
+        assert_eq!(loaded_overlay.meta.indexed_sha, Some("abc123".to_string()));
+    }
+
+    #[test]
+    fn test_ai_layer_not_saved() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create an AI overlay
+        let overlay = Overlay::new(LayerKind::AI);
+
+        // Attempting to save AI layer should succeed but not create a file
+        cache.save_layer(&overlay).expect("Save should succeed for AI layer");
+
+        // The layers directory shouldn't have any ai.json file
+        let ai_path = cache.layers_dir().join("ai.json");
+        assert!(!ai_path.exists(), "AI layer should not be persisted");
+
+        // Loading AI layer should return None
+        let loaded = cache.load_layer(LayerKind::AI).expect("Load should succeed");
+        assert!(loaded.is_none(), "Loading AI layer should return None");
+    }
+
+    #[test]
+    fn test_save_and_load_layered_index() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create a layered index with some data
+        let mut index = LayeredIndex::new();
+        index.base.meta.indexed_sha = Some("base_sha".to_string());
+        index.branch.meta.indexed_sha = Some("branch_sha".to_string());
+
+        // Save the index
+        cache.save_layered_index(&index).expect("Failed to save layered index");
+
+        // Verify meta file exists
+        assert!(cache.layer_meta_path().exists(), "Meta file should exist");
+
+        // Verify has_cached_layers returns true
+        assert!(cache.has_cached_layers(), "Should detect cached layers");
+
+        // Load the index back
+        let loaded = cache.load_layered_index().expect("Failed to load layered index");
+        assert!(loaded.is_some(), "Should load the saved index");
+
+        let loaded_index = loaded.unwrap();
+        assert_eq!(loaded_index.base.meta.indexed_sha, Some("base_sha".to_string()));
+        assert_eq!(loaded_index.branch.meta.indexed_sha, Some("branch_sha".to_string()));
+        // AI layer should be fresh (empty)
+        assert!(loaded_index.ai.meta.indexed_sha.is_none());
+    }
+
+    #[test]
+    fn test_clear_layers() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Save some layers
+        let index = LayeredIndex::new();
+        cache.save_layered_index(&index).expect("Failed to save");
+        assert!(cache.has_cached_layers());
+
+        // Clear the layers
+        cache.clear_layers().expect("Failed to clear layers");
+
+        // Verify layers are gone
+        assert!(!cache.has_cached_layers(), "Layers should be cleared");
+        assert!(!cache.layers_dir().exists(), "Layers directory should be removed");
+    }
+
+    #[test]
+    fn test_load_missing_layer() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Loading a layer that doesn't exist should return None
+        let result = cache.load_layer(LayerKind::Base).expect("Load should not error");
+        assert!(result.is_none(), "Should return None for missing layer");
+    }
+
+    #[test]
+    fn test_layered_index_meta_serialization() {
+        let meta = LayeredIndexMeta {
+            schema_version: "1.0.0".to_string(),
+            saved_at: "2024-01-01T00:00:00Z".to_string(),
+            base_indexed_sha: Some("abc123".to_string()),
+            branch_indexed_sha: None,
+            merge_base: Some("def456".to_string()),
+        };
+
+        // Serialize and deserialize
+        let json = serde_json::to_string(&meta).expect("Serialize failed");
+        let restored: LayeredIndexMeta = serde_json::from_str(&json).expect("Deserialize failed");
+
+        assert_eq!(restored.schema_version, "1.0.0");
+        assert_eq!(restored.base_indexed_sha, Some("abc123".to_string()));
+        assert_eq!(restored.branch_indexed_sha, None);
+        assert_eq!(restored.merge_base, Some("def456".to_string()));
     }
 }
