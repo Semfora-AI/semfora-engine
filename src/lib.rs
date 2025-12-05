@@ -49,6 +49,7 @@ pub mod git;
 pub mod lang;
 pub mod mcp_server;
 pub mod overlay;
+pub mod ripgrep;
 pub mod risk;
 pub mod schema;
 pub mod search;
@@ -101,3 +102,8 @@ pub use overlay::{
 
 // Re-export search types
 pub use search::{is_test_file, lang_from_extension, SearchHints};
+
+// Re-export ripgrep types (Phase 2.5 - SEM-46)
+pub use ripgrep::{
+    BlockLine, MergedBlock, RipgrepSearcher, SearchMatch, SearchOptions, SearchStats,
+};
