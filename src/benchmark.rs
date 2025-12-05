@@ -7,7 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::error::Result;
-use crate::{encode_toon, extract, generate_repo_overview, Lang, SemanticSummary};
+use crate::{encode_toon, extract, generate_repo_overview, Lang};
 
 /// Approximate token count from text
 /// Uses the ~4 chars per token heuristic (accurate within 10-20% for code)
@@ -166,32 +166,66 @@ impl RepoTokenMetrics {
 
         output.push_str("RAW SOURCE ANALYSIS:\n");
         output.push_str(&format!("  Files analyzed:     {}\n", self.files.len()));
-        output.push_str(&format!("  Total source:       {} bytes\n", self.total_source_bytes));
-        output.push_str(&format!("  Est. source tokens: {} tokens\n", self.total_source_tokens));
+        output.push_str(&format!(
+            "  Total source:       {} bytes\n",
+            self.total_source_bytes
+        ));
+        output.push_str(&format!(
+            "  Est. source tokens: {} tokens\n",
+            self.total_source_tokens
+        ));
         output.push('\n');
 
         output.push_str("SEMANTIC SUMMARY ANALYSIS:\n");
-        output.push_str(&format!("  Total TOON:         {} bytes\n", self.total_toon_bytes));
-        output.push_str(&format!("  Est. TOON tokens:   {} tokens\n", self.total_toon_tokens));
-        output.push_str(&format!("  Overview tokens:    {} tokens\n", self.overview_tokens));
+        output.push_str(&format!(
+            "  Total TOON:         {} bytes\n",
+            self.total_toon_bytes
+        ));
+        output.push_str(&format!(
+            "  Est. TOON tokens:   {} tokens\n",
+            self.total_toon_tokens
+        ));
+        output.push_str(&format!(
+            "  Overview tokens:    {} tokens\n",
+            self.overview_tokens
+        ));
         output.push('\n');
 
         output.push_str("COMPRESSION:\n");
-        output.push_str(&format!("  Byte compression:   {:.1}%\n", self.avg_compression * 100.0));
-        output.push_str(&format!("  Token savings:      {:.1}%\n", self.avg_token_savings * 100.0));
+        output.push_str(&format!(
+            "  Byte compression:   {:.1}%\n",
+            self.avg_compression * 100.0
+        ));
+        output.push_str(&format!(
+            "  Token savings:      {:.1}%\n",
+            self.avg_token_savings * 100.0
+        ));
         output.push('\n');
 
         output.push_str("WORKFLOW COMPARISON (estimated):\n");
-        output.push_str(&format!("  Re-read factor:     {}x (typical exploration)\n", self.estimated_reread_factor));
-        output.push_str(&format!("  Raw file workflow:  {} tokens\n", self.estimated_raw_workflow_tokens));
-        output.push_str(&format!("  Semantic workflow:  {} tokens\n", self.estimated_semantic_workflow_tokens));
+        output.push_str(&format!(
+            "  Re-read factor:     {}x (typical exploration)\n",
+            self.estimated_reread_factor
+        ));
+        output.push_str(&format!(
+            "  Raw file workflow:  {} tokens\n",
+            self.estimated_raw_workflow_tokens
+        ));
+        output.push_str(&format!(
+            "  Semantic workflow:  {} tokens\n",
+            self.estimated_semantic_workflow_tokens
+        ));
 
         let efficiency = if self.estimated_semantic_workflow_tokens > 0 {
-            self.estimated_raw_workflow_tokens as f64 / self.estimated_semantic_workflow_tokens as f64
+            self.estimated_raw_workflow_tokens as f64
+                / self.estimated_semantic_workflow_tokens as f64
         } else {
             0.0
         };
-        output.push_str(&format!("  Efficiency gain:    {:.1}x fewer tokens\n", efficiency));
+        output.push_str(&format!(
+            "  Efficiency gain:    {:.1}x fewer tokens\n",
+            efficiency
+        ));
         output.push('\n');
 
         // Top 5 largest token savings
@@ -292,10 +326,7 @@ fn collect_files_recursive(dir: &Path, max_depth: usize, depth: usize, files: &m
         let path = entry.path();
 
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if name.starts_with('.')
-                || name == "node_modules"
-                || name == "target"
-                || name == "dist"
+            if name.starts_with('.') || name == "node_modules" || name == "target" || name == "dist"
             {
                 continue;
             }
@@ -329,8 +360,8 @@ pub struct TaskBenchmark {
 
 #[derive(Debug, Clone)]
 pub struct SemanticQuery {
-    pub query_type: String,  // "repo_overview", "module", "symbol", "call_graph"
-    pub target: String,      // module name, symbol hash, etc.
+    pub query_type: String, // "repo_overview", "module", "symbol", "call_graph"
+    pub target: String,     // module name, symbol hash, etc.
     pub tokens: usize,
 }
 
@@ -339,7 +370,7 @@ pub struct RawFileRead {
     pub file: String,
     pub bytes: usize,
     pub tokens: usize,
-    pub reason: String,  // "exploration", "edit", "context"
+    pub reason: String, // "exploration", "edit", "context"
 }
 
 impl TaskBenchmark {
@@ -395,20 +426,32 @@ impl TaskBenchmark {
 
         output.push_str("SEMANTIC PATH:\n");
         for q in &self.semantic_queries {
-            output.push_str(&format!("  {} ({}) → {} tokens\n", q.query_type, q.target, q.tokens));
+            output.push_str(&format!(
+                "  {} ({}) → {} tokens\n",
+                q.query_type, q.target, q.tokens
+            ));
         }
         for r in &self.files_read_for_edit {
-            output.push_str(&format!("  Read {} ({}) → {} tokens\n", r.file, r.reason, r.tokens));
+            output.push_str(&format!(
+                "  Read {} ({}) → {} tokens\n",
+                r.file, r.reason, r.tokens
+            ));
         }
         output.push_str(&format!("  TOTAL: {} tokens\n\n", semantic_total));
 
         output.push_str("ESTIMATED RAW PATH:\n");
         for r in &self.estimated_raw_reads {
-            output.push_str(&format!("  Read {} ({}) → {} tokens\n", r.file, r.reason, r.tokens));
+            output.push_str(&format!(
+                "  Read {} ({}) → {} tokens\n",
+                r.file, r.reason, r.tokens
+            ));
         }
         output.push_str(&format!("  + 2x re-reads during exploration\n"));
         for r in &self.files_read_for_edit {
-            output.push_str(&format!("  Read {} ({}) → {} tokens\n", r.file, r.reason, r.tokens));
+            output.push_str(&format!(
+                "  Read {} ({}) → {} tokens\n",
+                r.file, r.reason, r.tokens
+            ));
         }
         output.push_str(&format!("  TOTAL: {} tokens\n\n", raw_total));
 
@@ -418,7 +461,11 @@ impl TaskBenchmark {
             0.0
         };
 
-        output.push_str(&format!("SAVINGS: {:.1}% ({} tokens saved)\n", savings, raw_total - semantic_total));
+        output.push_str(&format!(
+            "SAVINGS: {:.1}% ({} tokens saved)\n",
+            savings,
+            raw_total - semantic_total
+        ));
 
         output
     }
@@ -434,13 +481,13 @@ mod tests {
         let mut task = TaskBenchmark::new("Add get_call_graph MCP tool");
 
         // Semantic queries we made (approximate token counts from actual output)
-        task.add_semantic_query("repo_overview", ".", &"a".repeat(900));      // ~237 tokens
-        task.add_semantic_query("module", "mcp_server", &"a".repeat(3800));   // ~1000 tokens
-        task.add_semantic_query("module", "cache", &"a".repeat(2280));        // ~600 tokens
+        task.add_semantic_query("repo_overview", ".", &"a".repeat(900)); // ~237 tokens
+        task.add_semantic_query("module", "mcp_server", &"a".repeat(3800)); // ~1000 tokens
+        task.add_semantic_query("module", "cache", &"a".repeat(2280)); // ~600 tokens
         task.add_semantic_query("symbol", "4135d4e7f42a3501", &"a".repeat(1520)); // ~400 tokens
 
         // Files we actually read for editing
-        task.add_raw_read("src/cache.rs", &"a".repeat(52100), "edit");        // ~13k tokens
+        task.add_raw_read("src/cache.rs", &"a".repeat(52100), "edit"); // ~13k tokens
         task.add_raw_read("src/mcp_server/mod.rs", &"a".repeat(91200), "edit"); // ~24k tokens
 
         // What raw exploration would have looked like
@@ -459,7 +506,10 @@ mod tests {
         let semantic_tokens: usize = task.semantic_queries.iter().map(|q| q.tokens).sum();
         let raw_tokens: usize = task.estimated_raw_reads.iter().map(|r| r.tokens).sum();
 
-        assert!(semantic_tokens < raw_tokens, "Semantic should use fewer tokens than raw exploration");
+        assert!(
+            semantic_tokens < raw_tokens,
+            "Semantic should use fewer tokens than raw exploration"
+        );
     }
 
     #[test]
