@@ -217,6 +217,7 @@ pub fn lang_from_extension(path: &str) -> Option<String> {
 /// ```
 pub fn is_test_file(path: &str) -> bool {
     let path_lower = path.to_lowercase();
+    let normalized_path = path_lower.replace('\\', "/");
     let file_name = std::path::Path::new(path)
         .file_name()
         .and_then(|n| n.to_str())
@@ -224,12 +225,12 @@ pub fn is_test_file(path: &str) -> bool {
         .to_lowercase();
 
     // Directory-based patterns (always test files)
-    if path_lower.contains("/tests/")
-        || path_lower.contains("/__tests__/")
-        || path_lower.contains("/test/")
-        || path_lower.starts_with("tests/")
-        || path_lower.starts_with("__tests__/")
-        || path_lower.starts_with("test/")
+    if normalized_path.contains("/tests/")
+        || normalized_path.contains("/__tests__/")
+        || normalized_path.contains("/test/")
+        || normalized_path.starts_with("tests/")
+        || normalized_path.starts_with("__tests__/")
+        || normalized_path.starts_with("test/")
     {
         return true;
     }
