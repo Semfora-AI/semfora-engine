@@ -1504,6 +1504,337 @@ mod tests {
         assert_eq!(meta.merge_base, Some("merge_base".to_string()));
     }
 
+    // ========================================================================
+    // Layer Cache Error Scenario Tests
+    // ========================================================================
+
+    #[test]
+    fn test_load_layer_corrupted_symbols_jsonl() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create layer directory with corrupted symbols.jsonl
+        let layer_dir = cache.layer_dir(LayerKind::Base).unwrap();
+        fs::create_dir_all(&layer_dir).expect("Create layer dir");
+
+        // Write valid meta.json
+        let meta = crate::overlay::LayerMeta::new(LayerKind::Base);
+        let meta_json = serde_json::to_string_pretty(&meta).unwrap();
+        fs::write(layer_dir.join("meta.json"), meta_json).expect("Write meta");
+
+        // Write corrupted symbols.jsonl (malformed JSON)
+        fs::write(layer_dir.join("symbols.jsonl"), "{ invalid json }\n{\"hash\":\"incomplete\"").expect("Write corrupted symbols");
+        fs::write(layer_dir.join("deleted.txt"), "").expect("Write deleted");
+        fs::write(layer_dir.join("moves.jsonl"), "").expect("Write moves");
+
+        // Should return error when loading
+        let result = cache.load_layer(LayerKind::Base);
+        assert!(result.is_err(), "Should fail to load layer with corrupted symbols.jsonl");
+        
+        if let Err(e) = result {
+            let err_msg = format!("{:?}", e);
+            assert!(err_msg.contains("deserialize") || err_msg.contains("JSON"), 
+                "Error should indicate JSON deserialization issue: {}", err_msg);
+        }
+    }
+
+    #[test]
+    fn test_load_layer_corrupted_moves_jsonl() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create layer directory with corrupted moves.jsonl
+        let layer_dir = cache.layer_dir(LayerKind::Base).unwrap();
+        fs::create_dir_all(&layer_dir).expect("Create layer dir");
+
+        // Write valid meta.json
+        let meta = crate::overlay::LayerMeta::new(LayerKind::Base);
+        let meta_json = serde_json::to_string_pretty(&meta).unwrap();
+        fs::write(layer_dir.join("meta.json"), meta_json).expect("Write meta");
+
+        // Write valid files except moves.jsonl
+        fs::write(layer_dir.join("symbols.jsonl"), "").expect("Write symbols");
+        fs::write(layer_dir.join("deleted.txt"), "").expect("Write deleted");
+        // Write corrupted moves.jsonl (malformed JSON)
+        fs::write(layer_dir.join("moves.jsonl"), "not valid json at all\n").expect("Write corrupted moves");
+
+        // Should return error when loading
+        let result = cache.load_layer(LayerKind::Base);
+        assert!(result.is_err(), "Should fail to load layer with corrupted moves.jsonl");
+        
+        if let Err(e) = result {
+            let err_msg = format!("{:?}", e);
+            assert!(err_msg.contains("deserialize") || err_msg.contains("JSON") || err_msg.contains("file move"), 
+                "Error should indicate JSON deserialization issue: {}", err_msg);
+        }
+    }
+
+    #[test]
+    fn test_load_layer_missing_symbols_file() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create layer directory with meta.json but missing symbols.jsonl
+        let layer_dir = cache.layer_dir(LayerKind::Base).unwrap();
+        fs::create_dir_all(&layer_dir).expect("Create layer dir");
+
+        // Write valid meta.json
+        let meta = crate::overlay::LayerMeta::new(LayerKind::Base);
+        let meta_json = serde_json::to_string_pretty(&meta).unwrap();
+        fs::write(layer_dir.join("meta.json"), meta_json).expect("Write meta");
+
+        // Write other files but NOT symbols.jsonl
+        fs::write(layer_dir.join("deleted.txt"), "").expect("Write deleted");
+        fs::write(layer_dir.join("moves.jsonl"), "").expect("Write moves");
+
+        // Should succeed - missing files are treated as empty
+        let result = cache.load_layer(LayerKind::Base);
+        assert!(result.is_ok(), "Should handle missing symbols.jsonl gracefully");
+        
+        let overlay = result.unwrap();
+        assert!(overlay.is_some(), "Should return an overlay");
+        let overlay = overlay.unwrap();
+        assert!(overlay.symbols.is_empty(), "Symbols should be empty when file is missing");
+    }
+
+    #[test]
+    fn test_load_layer_missing_moves_file() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create layer directory with meta.json but missing moves.jsonl
+        let layer_dir = cache.layer_dir(LayerKind::Base).unwrap();
+        fs::create_dir_all(&layer_dir).expect("Create layer dir");
+
+        // Write valid meta.json
+        let meta = crate::overlay::LayerMeta::new(LayerKind::Base);
+        let meta_json = serde_json::to_string_pretty(&meta).unwrap();
+        fs::write(layer_dir.join("meta.json"), meta_json).expect("Write meta");
+
+        // Write other files but NOT moves.jsonl
+        fs::write(layer_dir.join("symbols.jsonl"), "").expect("Write symbols");
+        fs::write(layer_dir.join("deleted.txt"), "").expect("Write deleted");
+
+        // Should succeed - missing files are treated as empty
+        let result = cache.load_layer(LayerKind::Base);
+        assert!(result.is_ok(), "Should handle missing moves.jsonl gracefully");
+        
+        let overlay = result.unwrap();
+        assert!(overlay.is_some(), "Should return an overlay");
+        let overlay = overlay.unwrap();
+        assert!(overlay.moves.is_empty(), "Moves should be empty when file is missing");
+    }
+
+    #[test]
+    fn test_load_layer_empty_symbols_file() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create layer directory with zero-byte symbols.jsonl
+        let layer_dir = cache.layer_dir(LayerKind::Base).unwrap();
+        fs::create_dir_all(&layer_dir).expect("Create layer dir");
+
+        // Write valid meta.json
+        let meta = crate::overlay::LayerMeta::new(LayerKind::Base);
+        let meta_json = serde_json::to_string_pretty(&meta).unwrap();
+        fs::write(layer_dir.join("meta.json"), meta_json).expect("Write meta");
+
+        // Write zero-byte files
+        fs::write(layer_dir.join("symbols.jsonl"), "").expect("Write empty symbols");
+        fs::write(layer_dir.join("deleted.txt"), "").expect("Write empty deleted");
+        fs::write(layer_dir.join("moves.jsonl"), "").expect("Write empty moves");
+
+        // Should succeed with empty collections
+        let result = cache.load_layer(LayerKind::Base);
+        assert!(result.is_ok(), "Should handle empty symbols.jsonl gracefully");
+        
+        let overlay = result.unwrap();
+        assert!(overlay.is_some(), "Should return an overlay");
+        let overlay = overlay.unwrap();
+        assert!(overlay.symbols.is_empty(), "Symbols should be empty");
+        assert!(overlay.deleted.is_empty(), "Deleted should be empty");
+        assert!(overlay.moves.is_empty(), "Moves should be empty");
+    }
+
+    #[test]
+    fn test_load_layer_empty_moves_file() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create layer directory with zero-byte moves.jsonl
+        let layer_dir = cache.layer_dir(LayerKind::Base).unwrap();
+        fs::create_dir_all(&layer_dir).expect("Create layer dir");
+
+        // Write valid meta.json
+        let meta = crate::overlay::LayerMeta::new(LayerKind::Base);
+        let meta_json = serde_json::to_string_pretty(&meta).unwrap();
+        fs::write(layer_dir.join("meta.json"), meta_json).expect("Write meta");
+
+        // Write files with zero-byte moves.jsonl
+        fs::write(layer_dir.join("symbols.jsonl"), "").expect("Write symbols");
+        fs::write(layer_dir.join("deleted.txt"), "").expect("Write deleted");
+        fs::write(layer_dir.join("moves.jsonl"), "").expect("Write empty moves");
+
+        // Should succeed with empty moves
+        let result = cache.load_layer(LayerKind::Base);
+        assert!(result.is_ok(), "Should handle empty moves.jsonl gracefully");
+        
+        let overlay = result.unwrap();
+        assert!(overlay.is_some(), "Should return an overlay");
+        let overlay = overlay.unwrap();
+        assert!(overlay.moves.is_empty(), "Moves should be empty");
+    }
+
+    #[test]
+    fn test_load_layer_invalid_utf8_content() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create layer directory with invalid UTF-8 in symbols.jsonl
+        let layer_dir = cache.layer_dir(LayerKind::Base).unwrap();
+        fs::create_dir_all(&layer_dir).expect("Create layer dir");
+
+        // Write valid meta.json
+        let meta = crate::overlay::LayerMeta::new(LayerKind::Base);
+        let meta_json = serde_json::to_string_pretty(&meta).unwrap();
+        fs::write(layer_dir.join("meta.json"), meta_json).expect("Write meta");
+
+        // Write invalid UTF-8 bytes to symbols.jsonl
+        let invalid_utf8: Vec<u8> = vec![0xFF, 0xFE, 0xFD, 0x00];
+        std::fs::write(layer_dir.join("symbols.jsonl"), invalid_utf8).expect("Write invalid UTF-8");
+        fs::write(layer_dir.join("deleted.txt"), "").expect("Write deleted");
+        fs::write(layer_dir.join("moves.jsonl"), "").expect("Write moves");
+
+        // Should return error when reading invalid UTF-8
+        let result = cache.load_layer(LayerKind::Base);
+        assert!(result.is_err(), "Should fail to load layer with invalid UTF-8");
+    }
+
+    #[test]
+    fn test_load_layer_symbols_with_blank_lines() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create a test overlay and save it
+        let mut overlay = Overlay::new(LayerKind::Base);
+        let symbol = crate::schema::SymbolInfo {
+            name: "test_symbol".to_string(),
+            kind: crate::schema::SymbolKind::Function,
+            start_line: 1,
+            end_line: 10,
+            is_exported: true,
+            ..Default::default()
+        };
+        overlay.symbols.insert(
+            "test_hash".to_string(),
+            crate::overlay::SymbolState::active(symbol),
+        );
+
+        cache.save_layer(&overlay).expect("Failed to save layer");
+
+        // Now manually add blank lines to symbols.jsonl
+        let layer_dir = cache.layer_dir(LayerKind::Base).unwrap();
+        let symbols_path = layer_dir.join("symbols.jsonl");
+        let mut content = fs::read_to_string(&symbols_path).expect("Read symbols");
+        content.push_str("\n\n   \n\t\n"); // Add various blank lines
+        fs::write(&symbols_path, content).expect("Write modified symbols");
+
+        // Should handle blank lines gracefully
+        let result = cache.load_layer(LayerKind::Base);
+        assert!(result.is_ok(), "Should handle blank lines in symbols.jsonl");
+        
+        let loaded = result.unwrap();
+        assert!(loaded.is_some(), "Should load the overlay");
+        let loaded_overlay = loaded.unwrap();
+        assert_eq!(loaded_overlay.symbols.len(), 1, "Should have one symbol despite blank lines");
+    }
+
+    #[test]
+    fn test_load_layer_moves_with_blank_lines() {
+        use tempfile::TempDir;
+        use std::path::PathBuf;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = CacheDir {
+            root: temp_dir.path().to_path_buf(),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Create a test overlay with a file move
+        let mut overlay = Overlay::new(LayerKind::Base);
+        overlay.moves.push(crate::overlay::FileMove::new(
+            PathBuf::from("old.rs"),
+            PathBuf::from("new.rs"),
+        ));
+
+        cache.save_layer(&overlay).expect("Failed to save layer");
+
+        // Now manually add blank lines to moves.jsonl
+        let layer_dir = cache.layer_dir(LayerKind::Base).unwrap();
+        let moves_path = layer_dir.join("moves.jsonl");
+        let mut content = fs::read_to_string(&moves_path).expect("Read moves");
+        content.push_str("\n\n   \n\t\n"); // Add various blank lines
+        fs::write(&moves_path, content).expect("Write modified moves");
+
+        // Should handle blank lines gracefully
+        let result = cache.load_layer(LayerKind::Base);
+        assert!(result.is_ok(), "Should handle blank lines in moves.jsonl");
+        
+        let loaded = result.unwrap();
+        assert!(loaded.is_some(), "Should load the overlay");
+        let loaded_overlay = loaded.unwrap();
+        assert_eq!(loaded_overlay.moves.len(), 1, "Should have one move despite blank lines");
+    }
+
     /// TDD: test_test_file_exclusion_default
     /// Verifies test files are detected correctly
     #[test]
