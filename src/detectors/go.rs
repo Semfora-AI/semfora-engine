@@ -4,29 +4,38 @@
 //! - Primary symbol detection with improved heuristics
 //! - Import statements (dependencies)
 //! - Type declarations and functions
+//! - State changes (variable declarations)
+//! - Control flow (if, for, switch, select)
+//! - Function calls
 
 use tree_sitter::{Node, Tree};
 
-use crate::detectors::common::{get_node_text, visit_all};
+use crate::detectors::common::get_node_text;
+use crate::detectors::generic::extract_with_grammar;
+use crate::detectors::grammar::GO_GRAMMAR;
 use crate::error::Result;
 use crate::schema::{RiskLevel, SemanticSummary, SymbolInfo, SymbolKind};
 
 /// Extract semantic information from a Go source file
 pub fn extract(summary: &mut SemanticSummary, source: &str, tree: &Tree) -> Result<()> {
+    // Use the generic extractor for most semantic extraction
+    // This handles: imports, state_changes, control_flow, calls, and risk calculation
+    extract_with_grammar(summary, source, tree, &GO_GRAMMAR)?;
+
+    // Go has a unique type declaration structure: type_declaration > type_spec > (struct_type | interface_type)
+    // The generic extractor won't find these, so we do Go-specific symbol extraction
+    // that merges with what the generic extractor already found
     let root = tree.root_node();
-
-    // Find primary symbol with improved heuristics
-    find_primary_symbol(summary, &root, source);
-
-    // Extract imports
-    extract_imports(summary, &root, source);
+    find_go_type_symbols(summary, &root, source);
 
     Ok(())
 }
 
 // ============================================================================
-// Symbol Detection with Improved Heuristics
+// Go-Specific Type Declaration Handling
 // ============================================================================
+// Go's type declarations have a unique structure: type_declaration > type_spec > (struct_type | interface_type)
+// The generic extractor handles functions/methods, but not these nested type declarations.
 
 /// Candidate symbol for ranking
 #[derive(Debug)]
@@ -39,29 +48,31 @@ struct SymbolCandidate {
     score: i32,
 }
 
-/// Find all symbols in a Go file and populate both primary and symbols vec
+/// Find Go-specific type symbols (structs and interfaces)
+///
+/// This function extracts type declarations that the generic extractor can't handle
+/// due to Go's unique AST structure where types are nested inside type_declaration nodes.
 ///
 /// Go convention: exported names start with uppercase
-/// Priority order:
-/// 1. Exported structs/interfaces matching filename
-/// 2. Other exported types
-/// 3. Exported functions matching filename
-/// 4. Main function (for main packages)
-/// 5. Other exported functions
-fn find_primary_symbol(summary: &mut SemanticSummary, root: &Node, source: &str) {
+fn find_go_type_symbols(summary: &mut SemanticSummary, root: &Node, source: &str) {
     let mut candidates: Vec<SymbolCandidate> = Vec::new();
-
-    // Extract filename stem for matching
     let filename_stem = extract_filename_stem(&summary.file);
 
-    collect_symbol_candidates(root, source, &filename_stem, &mut candidates);
+    // Only collect type declarations (structs, interfaces)
+    collect_type_candidates(root, source, &filename_stem, &mut candidates);
 
     // Sort by score (highest first)
     candidates.sort_by(|a, b| b.score.cmp(&a.score));
 
-    // Convert ALL exported candidates to SymbolInfo and add to summary.symbols
+    // Add type candidates to summary.symbols (functions/methods already added by generic extractor)
     for candidate in &candidates {
         if candidate.is_exported || candidate.score > 0 {
+            // Check if this symbol already exists (to avoid duplicates)
+            let already_exists = summary.symbols.iter().any(|s| s.name == candidate.name);
+            if already_exists {
+                continue;
+            }
+
             let symbol_info = SymbolInfo {
                 name: candidate.name.clone(),
                 kind: candidate.kind,
@@ -82,13 +93,20 @@ fn find_primary_symbol(summary: &mut SemanticSummary, root: &Node, source: &str)
         }
     }
 
-    // Use the best candidate for primary symbol (backward compatibility)
-    if let Some(best) = candidates.first() {
-        summary.symbol = Some(best.name.clone());
-        summary.symbol_kind = Some(best.kind);
-        summary.start_line = Some(best.start_line);
-        summary.end_line = Some(best.end_line);
-        summary.public_surface_changed = best.is_exported;
+    // If we found type candidates with higher scores than current primary, update it
+    if let Some(best_type) = candidates.first() {
+        let current_primary_score = summary.symbol.as_ref()
+            .map(|name| calculate_symbol_score(name, &summary.symbol_kind.unwrap_or(SymbolKind::Function),
+                summary.public_surface_changed, &filename_stem))
+            .unwrap_or(0);
+
+        if best_type.score > current_primary_score {
+            summary.symbol = Some(best_type.name.clone());
+            summary.symbol_kind = Some(best_type.kind);
+            summary.start_line = Some(best_type.start_line);
+            summary.end_line = Some(best_type.end_line);
+            summary.public_surface_changed = best_type.is_exported;
+        }
     }
 }
 
@@ -101,8 +119,9 @@ fn extract_filename_stem(file_path: &str) -> String {
         .to_lowercase()
 }
 
-/// Collect all symbol candidates from the AST
-fn collect_symbol_candidates(
+/// Collect only type declarations (structs, interfaces) from the AST
+/// Functions and methods are handled by the generic extractor
+fn collect_type_candidates(
     root: &Node,
     source: &str,
     filename_stem: &str,
@@ -111,65 +130,30 @@ fn collect_symbol_candidates(
     let mut cursor = root.walk();
 
     for child in root.children(&mut cursor) {
-        match child.kind() {
-            "function_declaration" => {
-                if let Some(name_node) = child.child_by_field_name("name") {
-                    let name = get_node_text(&name_node, source);
-                    let is_exported = name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
-                    let score = calculate_symbol_score(&name, &SymbolKind::Function, is_exported, filename_stem);
+        if child.kind() == "type_declaration" {
+            // Look for struct or interface type specs inside the type_declaration
+            let mut inner_cursor = child.walk();
+            for inner in child.children(&mut inner_cursor) {
+                if inner.kind() == "type_spec" {
+                    if let Some(name_node) = inner.child_by_field_name("name") {
+                        let name = get_node_text(&name_node, source);
+                        let is_exported = name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
 
-                    candidates.push(SymbolCandidate {
-                        name,
-                        kind: SymbolKind::Function,
-                        is_exported,
-                        start_line: child.start_position().row + 1,
-                        end_line: child.end_position().row + 1,
-                        score,
-                    });
-                }
-            }
-            "method_declaration" => {
-                if let Some(name_node) = child.child_by_field_name("name") {
-                    let name = get_node_text(&name_node, source);
-                    let is_exported = name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
-                    let score = calculate_symbol_score(&name, &SymbolKind::Method, is_exported, filename_stem);
+                        // Determine if it's a struct or interface
+                        let kind = determine_type_kind(&inner);
+                        let score = calculate_symbol_score(&name, &kind, is_exported, filename_stem);
 
-                    candidates.push(SymbolCandidate {
-                        name,
-                        kind: SymbolKind::Method,
-                        is_exported,
-                        start_line: child.start_position().row + 1,
-                        end_line: child.end_position().row + 1,
-                        score,
-                    });
-                }
-            }
-            "type_declaration" => {
-                // Look for struct or interface type specs
-                let mut inner_cursor = child.walk();
-                for inner in child.children(&mut inner_cursor) {
-                    if inner.kind() == "type_spec" {
-                        if let Some(name_node) = inner.child_by_field_name("name") {
-                            let name = get_node_text(&name_node, source);
-                            let is_exported = name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
-
-                            // Determine if it's a struct or interface
-                            let kind = determine_type_kind(&inner);
-                            let score = calculate_symbol_score(&name, &kind, is_exported, filename_stem);
-
-                            candidates.push(SymbolCandidate {
-                                name,
-                                kind,
-                                is_exported,
-                                start_line: child.start_position().row + 1,
-                                end_line: child.end_position().row + 1,
-                                score,
-                            });
-                        }
+                        candidates.push(SymbolCandidate {
+                            name,
+                            kind,
+                            is_exported,
+                            start_line: child.start_position().row + 1,
+                            end_line: child.end_position().row + 1,
+                            score,
+                        });
                     }
                 }
             }
-            _ => {}
         }
     }
 }
@@ -230,26 +214,6 @@ fn calculate_symbol_score(
     }
 
     score
-}
-
-// ============================================================================
-// Import Extraction
-// ============================================================================
-
-/// Extract import statements as dependencies
-pub fn extract_imports(summary: &mut SemanticSummary, root: &Node, source: &str) {
-    visit_all(root, |node| {
-        if node.kind() == "import_spec" {
-            if let Some(path) = node.child_by_field_name("path") {
-                let import_path = get_node_text(&path, source);
-                // Get the last segment of the import path
-                let clean = import_path.trim_matches('"');
-                if let Some(last) = clean.split('/').last() {
-                    summary.added_dependencies.push(last.to_string());
-                }
-            }
-        }
-    });
 }
 
 #[cfg(test)]

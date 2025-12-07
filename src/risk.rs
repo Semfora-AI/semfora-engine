@@ -105,10 +105,12 @@ mod tests {
                 ControlFlowChange {
                     kind: ControlFlowKind::If,
                     location: Location::default(),
+                    nesting_depth: 0,
                 },
                 ControlFlowChange {
                     kind: ControlFlowKind::For,
                     location: Location::default(),
+                    nesting_depth: 0,
                 },
             ],
             insertions: vec!["network call introduced".to_string()],

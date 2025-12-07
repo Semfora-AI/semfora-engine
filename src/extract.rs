@@ -39,30 +39,44 @@ pub fn extract(file_path: &Path, source: &str, tree: &Tree, lang: Lang) -> Resul
     };
 
     // Dispatch to language family extractor
-    match lang.family() {
-        crate::lang::LangFamily::JavaScript => {
-            crate::detectors::javascript::extract(&mut summary, source, tree, lang)?;
-        }
-        crate::lang::LangFamily::Rust => {
-            crate::detectors::rust::extract(&mut summary, source, tree)?;
-        }
-        crate::lang::LangFamily::Python => {
-            crate::detectors::python::extract(&mut summary, source, tree)?;
-        }
-        crate::lang::LangFamily::Go => {
-            crate::detectors::go::extract(&mut summary, source, tree)?;
-        }
-        crate::lang::LangFamily::Java => {
-            crate::detectors::java::extract(&mut summary, source, tree)?;
-        }
-        crate::lang::LangFamily::CFamily => {
-            crate::detectors::c_family::extract(&mut summary, source, tree)?;
-        }
-        crate::lang::LangFamily::Markup => {
-            crate::detectors::markup::extract(&mut summary, source, tree)?;
-        }
-        crate::lang::LangFamily::Config => {
-            crate::detectors::config::extract(&mut summary, source, tree, lang)?;
+    // Vue SFCs need special handling - extract script section first
+    if lang.is_vue_sfc() {
+        crate::detectors::javascript::extract_vue_sfc(&mut summary, source)?;
+    } else {
+        match lang.family() {
+            crate::lang::LangFamily::JavaScript => {
+                crate::detectors::javascript::extract(&mut summary, source, tree, lang)?;
+            }
+            crate::lang::LangFamily::Rust => {
+                crate::detectors::rust::extract(&mut summary, source, tree)?;
+            }
+            crate::lang::LangFamily::Python => {
+                crate::detectors::python::extract(&mut summary, source, tree)?;
+            }
+            crate::lang::LangFamily::Go => {
+                crate::detectors::go::extract(&mut summary, source, tree)?;
+            }
+            crate::lang::LangFamily::Java => {
+                crate::detectors::java::extract(&mut summary, source, tree)?;
+            }
+            crate::lang::LangFamily::Kotlin => {
+                crate::detectors::kotlin::extract(&mut summary, source, tree)?;
+            }
+            crate::lang::LangFamily::CFamily => {
+                crate::detectors::c_family::extract(&mut summary, source, tree)?;
+            }
+            crate::lang::LangFamily::Markup => {
+                crate::detectors::markup::extract(&mut summary, source, tree, lang)?;
+            }
+            crate::lang::LangFamily::Config => {
+                crate::detectors::config::extract(&mut summary, source, tree, lang)?;
+            }
+            crate::lang::LangFamily::Shell => {
+                crate::detectors::shell::extract(&mut summary, source, tree)?;
+            }
+            crate::lang::LangFamily::Gradle => {
+                crate::detectors::gradle::extract(&mut summary, source, tree)?;
+            }
         }
     }
 

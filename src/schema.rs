@@ -1145,6 +1145,7 @@ mod tests {
             control_flow_changes: vec![ControlFlowChange {
                 kind: ControlFlowKind::If,
                 location: Location::default(),
+                nesting_depth: 0,
             }],
             behavioral_risk: RiskLevel::Medium,
             ..Default::default()

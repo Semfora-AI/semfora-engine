@@ -15,7 +15,7 @@ path = "src/mcp_server/bin.rs"
 
 [dependencies]
 # Core parsing
-tree-sitter = "0.24"
+tree-sitter = "0.25"
 
 # Language grammars - Programming languages
 tree-sitter-typescript = "0.23"
@@ -34,6 +34,15 @@ tree-sitter-json = "0.24"
 tree-sitter-yaml = "0.6"
 tree-sitter-toml-ng = "0.6"
 tree-sitter-md = "0.3"
+
+# Additional language grammars
+tree-sitter-kotlin-ng = "1.1"
+tree-sitter-bash = "0.23"
+tree-sitter-scss = "1.0"
+tree-sitter-hcl = "1.1"
+tree-sitter-xml = "0.7"
+tree-sitter-groovy = "0.1"
+# Note: protobuf crate conflicts with tree-sitter 0.24, skipped for now
 
 # CLI & Error handling
 clap = { version = "4.5", features = ["derive"] }

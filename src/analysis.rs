@@ -741,12 +741,22 @@ mod tests {
     #[test]
     fn test_complexity_score() {
         let mut sym = SymbolComplexity::default();
-        sym.cyclomatic = 1;
+        sym.cognitive = 1;
         assert_eq!(sym.rating(), "simple");
 
-        sym.cyclomatic = 10;
-        sym.fan_out = 15;
-        sym.state_mutations = 5;
+        sym.cognitive = 5;
+        assert_eq!(sym.rating(), "simple");
+
+        sym.cognitive = 6;
+        assert_eq!(sym.rating(), "moderate");
+
+        sym.cognitive = 10;
+        assert_eq!(sym.rating(), "moderate");
+
+        sym.cognitive = 11;
+        assert_eq!(sym.rating(), "complex");
+
+        sym.cognitive = 21;
         assert_eq!(sym.rating(), "very complex");
     }
 

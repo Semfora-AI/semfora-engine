@@ -1,78 +1,72 @@
-//! JavaScript/TypeScript/JSX/TSX language detector
+//! Core JavaScript/TypeScript semantic extraction
 //!
-//! Extracts semantic information from JavaScript family files including:
-//! - Primary symbol detection with improved heuristics (exports prioritized)
-//! - Import statements (dependencies and local imports)
-//! - State hooks (useState, useReducer)
-//! - JSX elements and component detection
-//! - Control flow patterns
-//! - Function calls with context (awaited, in try block)
+//! This module provides the foundation for JS/TS analysis that is shared
+//! across all frameworks. Framework-specific logic should go in the
+//! `frameworks/` submodules.
 
-use tree_sitter::{Node, Tree};
+use tree_sitter::Node;
 
-use crate::detectors::common::{get_node_text, push_unique_insertion, visit_all, visit_with_nesting_depth};
+use crate::detectors::common::{get_node_text, visit_all, visit_with_nesting_depth};
 use crate::error::Result;
 use crate::lang::Lang;
 use crate::schema::{
     Argument, Call, ControlFlowChange, ControlFlowKind, Location, Prop, RiskLevel,
-    SemanticSummary, StateChange, SymbolInfo, SymbolKind,
+    SemanticSummary, SymbolInfo, SymbolKind,
 };
 use crate::toon::is_meaningful_call;
 
-/// Extract semantic information from a JavaScript/TypeScript file
-pub fn extract(summary: &mut SemanticSummary, source: &str, tree: &Tree, lang: Lang) -> Result<()> {
-    let root = tree.root_node();
+// =============================================================================
+// Main Entry Point
+// =============================================================================
 
-    // Find primary symbol with improved heuristics
-    find_primary_symbol(summary, &root, source);
+/// Core extraction for JavaScript/TypeScript
+///
+/// This extracts framework-agnostic semantic information:
+/// - Symbols (functions, classes, exports)
+/// - Imports/dependencies
+/// - Control flow patterns
+/// - Function calls
+pub fn extract_core(
+    summary: &mut SemanticSummary,
+    root: &Node,
+    source: &str,
+    lang: Lang,
+) -> Result<()> {
+    // Extract symbols (functions, classes, exports)
+    find_primary_symbol(summary, root, source, lang);
 
     // Extract imports
-    extract_imports(summary, &root, source);
-
-    // Extract state hooks (useState, useReducer)
-    extract_state_hooks(summary, &root, source);
-
-    // Extract JSX elements for insertion rules
-    if lang.supports_jsx() {
-        extract_jsx_insertions(summary, &root, source);
-    }
+    extract_imports(summary, root, source);
 
     // Extract control flow
-    extract_control_flow(summary, &root);
+    extract_control_flow(summary, root);
 
-    // Extract function calls with context
-    extract_calls(summary, &root, source);
-
-    // Generate semantic insertions based on file context
-    generate_insertions(summary, source);
+    // Extract function calls
+    extract_calls(summary, root, source);
 
     Ok(())
 }
 
-// ============================================================================
-// Symbol Detection with Improved Heuristics
-// ============================================================================
+// =============================================================================
+// Symbol Detection
+// =============================================================================
 
 /// Candidate symbol for ranking
 #[derive(Debug)]
-struct SymbolCandidate {
-    name: String,
-    kind: SymbolKind,
-    is_exported: bool,
-    is_default_export: bool,
-    returns_jsx: bool,
-    start_line: usize,
-    end_line: usize,
-    arguments: Vec<Argument>,
-    props: Vec<Prop>,
-    score: i32,
+pub struct SymbolCandidate {
+    pub name: String,
+    pub kind: SymbolKind,
+    pub is_exported: bool,
+    pub is_default_export: bool,
+    pub returns_jsx: bool,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub arguments: Vec<Argument>,
+    pub props: Vec<Prop>,
+    pub score: i32,
 }
 
 /// Find all symbols and populate both the primary symbol and symbols vec
-///
-/// This function now captures ALL exported symbols in summary.symbols,
-/// solving the "single symbol per file" limitation for files like monster.ts
-/// that have many exports.
 ///
 /// Priority order for primary symbol:
 /// 1. Default exported components (function returning JSX)
@@ -80,19 +74,17 @@ struct SymbolCandidate {
 /// 3. Default exported functions/classes
 /// 4. Named exported functions/classes
 /// 5. Non-exported functions/classes (file-local)
-fn find_primary_symbol(summary: &mut SemanticSummary, root: &Node, source: &str) {
+fn find_primary_symbol(summary: &mut SemanticSummary, root: &Node, source: &str, lang: Lang) {
     let mut candidates: Vec<SymbolCandidate> = Vec::new();
     let filename_stem = extract_filename_stem(&summary.file);
 
-    collect_symbol_candidates(root, source, &filename_stem, &mut candidates);
+    collect_symbol_candidates(root, source, &filename_stem, lang, &mut candidates);
 
     // Sort by score (highest first)
     candidates.sort_by(|a, b| b.score.cmp(&a.score));
 
     // Convert ALL exported candidates to SymbolInfo and add to summary.symbols
-    // This is the key fix: we now capture every symbol, not just the best one
     for candidate in &candidates {
-        // Include exported symbols (the main use case) and significant non-exported ones
         if candidate.is_exported || candidate.score > 0 {
             let kind = if candidate.returns_jsx {
                 SymbolKind::Component
@@ -107,7 +99,7 @@ fn find_primary_symbol(summary: &mut SemanticSummary, root: &Node, source: &str)
                 end_line: candidate.end_line,
                 is_exported: candidate.is_exported,
                 is_default_export: candidate.is_default_export,
-                hash: None, // Will be populated during shard generation
+                hash: None,
                 arguments: candidate.arguments.clone(),
                 props: candidate.props.clone(),
                 return_type: if candidate.returns_jsx {
@@ -115,10 +107,10 @@ fn find_primary_symbol(summary: &mut SemanticSummary, root: &Node, source: &str)
                 } else {
                     None
                 },
-                calls: Vec::new(),       // Will be populated per-symbol later
-                control_flow: Vec::new(), // Will be populated per-symbol later
+                calls: Vec::new(),
+                control_flow: Vec::new(),
                 state_changes: Vec::new(),
-                behavioral_risk: RiskLevel::Low, // Will be calculated later
+                behavioral_risk: RiskLevel::Low,
             };
 
             summary.symbols.push(symbol_info);
@@ -146,7 +138,7 @@ fn find_primary_symbol(summary: &mut SemanticSummary, root: &Node, source: &str)
 }
 
 /// Extract filename stem
-fn extract_filename_stem(file_path: &str) -> String {
+pub fn extract_filename_stem(file_path: &str) -> String {
     std::path::Path::new(file_path)
         .file_stem()
         .and_then(|s| s.to_str())
@@ -159,6 +151,7 @@ fn collect_symbol_candidates(
     root: &Node,
     source: &str,
     filename_stem: &str,
+    lang: Lang,
     candidates: &mut Vec<SymbolCandidate>,
 ) {
     let mut cursor = root.walk();
@@ -171,7 +164,7 @@ fn collect_symbol_candidates(
                 // Check for declaration inside export
                 if let Some(decl) = child.child_by_field_name("declaration") {
                     if let Some(mut candidate) =
-                        extract_candidate_from_declaration(&decl, source, filename_stem)
+                        extract_candidate_from_declaration(&decl, source, filename_stem, lang)
                     {
                         candidate.is_exported = true;
                         candidate.is_default_export = is_default;
@@ -184,8 +177,6 @@ fn collect_symbol_candidates(
                     let mut inner_cursor = child.walk();
                     for inner in child.children(&mut inner_cursor) {
                         if inner.kind() == "export_clause" {
-                            // Handle: export { Foo, Bar } from './module'
-                            // or: export { Foo, Bar }
                             extract_reexports(&inner, source, filename_stem, candidates);
                             found_export_clause = true;
                         }
@@ -199,7 +190,7 @@ fn collect_symbol_candidates(
                                 || inner.kind() == "class_declaration"
                             {
                                 if let Some(mut candidate) =
-                                    extract_candidate_from_declaration(&inner, source, filename_stem)
+                                    extract_candidate_from_declaration(&inner, source, filename_stem, lang)
                                 {
                                     candidate.is_exported = true;
                                     candidate.is_default_export = is_default;
@@ -223,7 +214,7 @@ fn collect_symbol_candidates(
                             if inner.kind() == "identifier" && is_default {
                                 let name = get_node_text(&inner, source);
                                 candidates.push(SymbolCandidate {
-                                    name,
+                                    name: name.clone(),
                                     kind: SymbolKind::Function,
                                     is_exported: true,
                                     is_default_export: true,
@@ -233,7 +224,7 @@ fn collect_symbol_candidates(
                                     arguments: Vec::new(),
                                     props: Vec::new(),
                                     score: calculate_symbol_score(&SymbolCandidate {
-                                        name: get_node_text(&inner, source),
+                                        name,
                                         kind: SymbolKind::Function,
                                         is_exported: true,
                                         is_default_export: true,
@@ -253,7 +244,7 @@ fn collect_symbol_candidates(
             }
             "function_declaration" | "class_declaration" | "lexical_declaration" => {
                 if let Some(mut candidate) =
-                    extract_candidate_from_declaration(&child, source, filename_stem)
+                    extract_candidate_from_declaration(&child, source, filename_stem, lang)
                 {
                     candidate.score = calculate_symbol_score(&candidate, filename_stem);
                     candidates.push(candidate);
@@ -271,7 +262,6 @@ fn has_default_keyword(node: &Node, source: &str) -> bool {
 }
 
 /// Extract re-exported symbols from export clause
-/// Handles: export { Foo, Bar } from './module'
 fn extract_reexports(
     node: &Node,
     source: &str,
@@ -281,7 +271,6 @@ fn extract_reexports(
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "export_specifier" {
-            // Get the exported name (could be aliased: export { Foo as Bar })
             let name = if let Some(alias) = child.child_by_field_name("alias") {
                 get_node_text(&alias, source)
             } else if let Some(name_node) = child.child_by_field_name("name") {
@@ -292,7 +281,7 @@ fn extract_reexports(
 
             let mut candidate = SymbolCandidate {
                 name,
-                kind: SymbolKind::Function, // Default, could be component
+                kind: SymbolKind::Function,
                 is_exported: true,
                 is_default_export: false,
                 returns_jsx: false,
@@ -310,7 +299,7 @@ fn extract_reexports(
 
 /// Extract symbol from default export of call expression
 /// Handles: export default memo(Component) or export default forwardRef(...)
-fn extract_default_export_call(
+pub fn extract_default_export_call(
     node: &Node,
     source: &str,
     filename_stem: &str,
@@ -326,8 +315,6 @@ fn extract_default_export_call(
 
         if is_component_wrapper {
             // Try to extract the component name from the arguments
-            // e.g., memo(MyComponent) -> "MyComponent"
-            // e.g., forwardRef((props, ref) => ...) -> use filename
             if let Some(args) = node.child_by_field_name("arguments") {
                 let mut args_cursor = args.walk();
                 for arg in args.children(&mut args_cursor) {
@@ -367,7 +354,7 @@ fn extract_default_export_call(
 }
 
 /// Convert string to PascalCase for component naming
-fn to_pascal_case(s: &str) -> String {
+pub fn to_pascal_case(s: &str) -> String {
     s.split(|c: char| c == '-' || c == '_' || c == '.')
         .filter(|s| !s.is_empty())
         .map(|word| {
@@ -385,6 +372,7 @@ fn extract_candidate_from_declaration(
     node: &Node,
     source: &str,
     _filename_stem: &str,
+    lang: Lang,
 ) -> Option<SymbolCandidate> {
     match node.kind() {
         "function_declaration" => {
@@ -403,7 +391,7 @@ fn extract_candidate_from_declaration(
                 kind: SymbolKind::Function,
                 is_exported: false,
                 is_default_export: false,
-                returns_jsx: returns_jsx(node),
+                returns_jsx: lang.supports_jsx() && returns_jsx(node),
                 start_line: node.start_position().row + 1,
                 end_line: node.end_position().row + 1,
                 arguments,
@@ -429,7 +417,6 @@ fn extract_candidate_from_declaration(
             })
         }
         "lexical_declaration" => {
-            // Look for arrow function or React component pattern assigned to const
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
                 if child.kind() == "variable_declarator" {
@@ -457,7 +444,7 @@ fn extract_candidate_from_declaration(
                             kind: SymbolKind::Function,
                             is_exported: false,
                             is_default_export: false,
-                            returns_jsx: returns_jsx(&value_node),
+                            returns_jsx: lang.supports_jsx() && returns_jsx(&value_node),
                             start_line: node.start_position().row + 1,
                             end_line: node.end_position().row + 1,
                             arguments,
@@ -467,17 +454,12 @@ fn extract_candidate_from_declaration(
                     }
 
                     // Handle React component patterns: forwardRef, memo, styled, etc.
-                    // e.g., const Button = React.forwardRef(...)
-                    // e.g., const Button = memo(...)
-                    // e.g., const Button = styled.div`...`
                     if value_node.kind() == "call_expression" {
                         let name = get_node_text(&name_node, source);
 
-                        // Check if this is a React component wrapper pattern
                         if let Some(func_node) = value_node.child_by_field_name("function") {
                             let func_text = get_node_text(&func_node, source);
 
-                            // Check for forwardRef, memo, or styled patterns
                             let is_component_wrapper = func_text == "forwardRef"
                                 || func_text == "memo"
                                 || func_text.ends_with(".forwardRef")
@@ -485,7 +467,6 @@ fn extract_candidate_from_declaration(
                                 || func_text.starts_with("styled.");
 
                             if is_component_wrapper {
-                                // Check if the argument returns JSX
                                 let args_node = value_node.child_by_field_name("arguments");
                                 let returns_jsx_content = args_node
                                     .map(|args| {
@@ -567,7 +548,7 @@ fn calculate_symbol_score(candidate: &SymbolCandidate, filename_stem: &str) -> i
 }
 
 /// Check if a function returns JSX
-fn returns_jsx(node: &Node) -> bool {
+pub fn returns_jsx(node: &Node) -> bool {
     contains_node_kind(node, "jsx_element")
         || contains_node_kind(node, "jsx_self_closing_element")
         || contains_node_kind(node, "jsx_fragment")
@@ -588,7 +569,7 @@ fn contains_node_kind(node: &Node, kind: &str) -> bool {
 }
 
 /// Extract function parameters
-fn extract_parameters(
+pub fn extract_parameters(
     params: &Node,
     source: &str,
     arguments: &mut Vec<Argument>,
@@ -640,7 +621,7 @@ fn extract_parameters(
 }
 
 /// Extract destructured props from object pattern
-fn extract_object_pattern_as_props(pattern: &Node, source: &str, props: &mut Vec<Prop>) {
+pub fn extract_object_pattern_as_props(pattern: &Node, source: &str, props: &mut Vec<Prop>) {
     let mut cursor = pattern.walk();
     for child in pattern.children(&mut cursor) {
         if child.kind() == "shorthand_property_identifier_pattern" {
@@ -672,9 +653,9 @@ fn extract_object_pattern_as_props(pattern: &Node, source: &str, props: &mut Vec
     }
 }
 
-// ============================================================================
+// =============================================================================
 // Import Extraction
-// ============================================================================
+// =============================================================================
 
 /// Extract imports as dependencies
 pub fn extract_imports(summary: &mut SemanticSummary, root: &Node, source: &str) {
@@ -699,7 +680,7 @@ pub fn extract_imports(summary: &mut SemanticSummary, root: &Node, source: &str)
 }
 
 /// Check if an import path is local (starts with . or ..)
-fn is_local_import(module: &str) -> bool {
+pub fn is_local_import(module: &str) -> bool {
     module.starts_with('.') || module.starts_with("..")
 }
 
@@ -712,36 +693,31 @@ fn normalize_import_path(module: &str) -> String {
 fn extract_import_names(import: &Node, source: &str, module: &str, deps: &mut Vec<String>) {
     let mut cursor = import.walk();
     for child in import.children(&mut cursor) {
-        match child.kind() {
-            "import_clause" => {
-                let mut inner_cursor = child.walk();
-                for inner in child.children(&mut inner_cursor) {
-                    match inner.kind() {
-                        "identifier" => {
-                            // Default import
-                            deps.push(get_node_text(&inner, source));
-                        }
-                        "named_imports" => {
-                            let mut named_cursor = inner.walk();
-                            for named in inner.children(&mut named_cursor) {
-                                if named.kind() == "import_specifier" {
-                                    if let Some(name_node) = named.child_by_field_name("name") {
-                                        deps.push(get_node_text(&name_node, source));
-                                    }
+        if child.kind() == "import_clause" {
+            let mut inner_cursor = child.walk();
+            for inner in child.children(&mut inner_cursor) {
+                match inner.kind() {
+                    "identifier" => {
+                        deps.push(get_node_text(&inner, source));
+                    }
+                    "named_imports" => {
+                        let mut named_cursor = inner.walk();
+                        for named in inner.children(&mut named_cursor) {
+                            if named.kind() == "import_specifier" {
+                                if let Some(name_node) = named.child_by_field_name("name") {
+                                    deps.push(get_node_text(&name_node, source));
                                 }
                             }
                         }
-                        "namespace_import" => {
-                            // import * as name
-                            if let Some(name_node) = inner.child_by_field_name("name") {
-                                deps.push(get_node_text(&name_node, source));
-                            }
-                        }
-                        _ => {}
                     }
+                    "namespace_import" => {
+                        if let Some(name_node) = inner.child_by_field_name("name") {
+                            deps.push(get_node_text(&name_node, source));
+                        }
+                    }
+                    _ => {}
                 }
             }
-            _ => {}
         }
     }
 
@@ -753,149 +729,9 @@ fn extract_import_names(import: &Node, source: &str, module: &str, deps: &mut Ve
     }
 }
 
-// ============================================================================
-// State Hooks Extraction
-// ============================================================================
-
-/// Extract React state hooks
-pub fn extract_state_hooks(summary: &mut SemanticSummary, root: &Node, source: &str) {
-    visit_all(root, |node| {
-        if node.kind() == "call_expression" {
-            if let Some(func) = node.child_by_field_name("function") {
-                let func_name = get_node_text(&func, source);
-                if func_name == "useState" || func_name == "useReducer" {
-                    if let Some(parent) = node.parent() {
-                        if parent.kind() == "variable_declarator" {
-                            if let Some(name_node) = parent.child_by_field_name("name") {
-                                if name_node.kind() == "array_pattern" {
-                                    let mut cursor = name_node.walk();
-                                    for child in name_node.children(&mut cursor) {
-                                        if child.kind() == "identifier" {
-                                            let state_name = get_node_text(&child, source);
-
-                                            let mut init = "undefined".to_string();
-                                            if let Some(args) = node.child_by_field_name("arguments")
-                                            {
-                                                let mut arg_cursor = args.walk();
-                                                for arg in args.children(&mut arg_cursor) {
-                                                    if arg.kind() != "(" && arg.kind() != ")" {
-                                                        init = get_node_text(&arg, source);
-                                                        break;
-                                                    }
-                                                }
-                                            }
-
-                                            summary.state_changes.push(StateChange {
-                                                name: state_name.clone(),
-                                                state_type: infer_type(&init),
-                                                initializer: init,
-                                            });
-
-                                            summary.insertions.push(format!(
-                                                "local {} state via {}",
-                                                state_name, func_name
-                                            ));
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    });
-}
-
-/// Infer type from initializer
-fn infer_type(init: &str) -> String {
-    let trimmed = init.trim();
-    if trimmed.starts_with('"') || trimmed.starts_with('\'') || trimmed.starts_with('`') {
-        "string".to_string()
-    } else if trimmed.parse::<i64>().is_ok() || trimmed.parse::<f64>().is_ok() {
-        "number".to_string()
-    } else if trimmed == "true" || trimmed == "false" {
-        "boolean".to_string()
-    } else if trimmed.starts_with('[') {
-        "array".to_string()
-    } else if trimmed.starts_with('{') {
-        "object".to_string()
-    } else if trimmed == "null" {
-        "null".to_string()
-    } else {
-        "_".to_string()
-    }
-}
-
-// ============================================================================
-// JSX Extraction
-// ============================================================================
-
-/// Extract JSX insertions for semantic context
-pub fn extract_jsx_insertions(summary: &mut SemanticSummary, root: &Node, source: &str) {
-    let mut jsx_tags: Vec<String> = Vec::new();
-    let mut has_conditional_render = false;
-
-    visit_all(root, |node| {
-        if node.kind() == "jsx_element" || node.kind() == "jsx_self_closing_element" {
-            if let Some(opening) = node.child(0) {
-                let tag_node = if opening.kind() == "jsx_opening_element" {
-                    opening.child_by_field_name("name")
-                } else if node.kind() == "jsx_self_closing_element" {
-                    node.child_by_field_name("name")
-                } else {
-                    None
-                };
-
-                if let Some(tag) = tag_node {
-                    jsx_tags.push(get_node_text(&tag, source));
-                }
-            }
-        }
-
-        if node.kind() == "jsx_expression" {
-            let expr_text = get_node_text(node, source);
-            if expr_text.contains("&&") {
-                has_conditional_render = true;
-            }
-        }
-    });
-
-    // Header detection
-    if jsx_tags.iter().any(|t| t == "header") {
-        if jsx_tags.iter().any(|t| t == "nav") {
-            summary
-                .insertions
-                .push("header container with nav".to_string());
-        } else {
-            summary.insertions.push("header container".to_string());
-        }
-    }
-
-    // Route links count
-    let link_count = jsx_tags
-        .iter()
-        .filter(|t| *t == "Link" || *t == "a")
-        .count();
-    if link_count >= 3 {
-        summary
-            .insertions
-            .push(format!("{} route links", link_count));
-    }
-
-    // Dropdown detection
-    if jsx_tags.iter().any(|t| t == "button")
-        && jsx_tags.iter().any(|t| t == "div" || t == "menu")
-        && has_conditional_render
-    {
-        summary.insertions.push("dropdown menu".to_string());
-    }
-}
-
-// ============================================================================
+// =============================================================================
 // Control Flow Extraction
-// ============================================================================
+// =============================================================================
 
 /// JavaScript control flow node kinds for nesting depth tracking
 const JS_CONTROL_FLOW_KINDS: &[&str] = &[
@@ -920,7 +756,6 @@ pub fn extract_control_flow(summary: &mut SemanticSummary, root: &Node) {
         };
 
         if let Some(k) = kind {
-            // Nesting depth is the depth we entered at, not after
             let nesting = if depth > 0 { depth - 1 } else { 0 };
             summary.control_flow_changes.push(ControlFlowChange {
                 kind: k,
@@ -931,9 +766,9 @@ pub fn extract_control_flow(summary: &mut SemanticSummary, root: &Node) {
     }, JS_CONTROL_FLOW_KINDS);
 }
 
-// ============================================================================
+// =============================================================================
 // Call Extraction
-// ============================================================================
+// =============================================================================
 
 /// Extract function calls with context
 pub fn extract_calls(summary: &mut SemanticSummary, root: &Node, source: &str) {
@@ -1028,66 +863,6 @@ fn is_trivial_call(name: &str) -> bool {
     )
 }
 
-// ============================================================================
-// Insertion Generation
-// ============================================================================
-
-/// Generate semantic insertions based on file context
-fn generate_insertions(summary: &mut SemanticSummary, source: &str) {
-    let file_lower = summary.file.to_lowercase();
-
-    // Next.js patterns
-    if file_lower.contains("/api/") && file_lower.ends_with("route.ts") {
-        if let Some(ref sym) = summary.symbol {
-            let method = sym.to_uppercase();
-            if matches!(method.as_str(), "GET" | "POST" | "PUT" | "DELETE" | "PATCH") {
-                summary
-                    .insertions
-                    .push(format!("Next.js API route ({})", method));
-            }
-        }
-    }
-
-    if file_lower.ends_with("layout.tsx") || file_lower.ends_with("layout.jsx") {
-        if summary.symbol_kind == Some(SymbolKind::Component) {
-            summary
-                .insertions
-                .push("Next.js layout component".to_string());
-        }
-    }
-
-    if file_lower.ends_with("page.tsx") || file_lower.ends_with("page.jsx") {
-        if summary.symbol_kind == Some(SymbolKind::Component) {
-            summary.insertions.push("Next.js page component".to_string());
-        }
-    }
-
-    // Network data fetching
-    if source.contains("fetch(") || source.contains("axios") {
-        push_unique_insertion(
-            &mut summary.insertions,
-            "network data fetching".to_string(),
-            "network",
-        );
-    }
-
-    // Config files
-    if file_lower.contains("next.config") {
-        push_unique_insertion(
-            &mut summary.insertions,
-            "Next.js configuration".to_string(),
-            "Next.js config",
-        );
-    }
-    if file_lower.contains("tailwind.config") {
-        push_unique_insertion(
-            &mut summary.insertions,
-            "Tailwind CSS configuration".to_string(),
-            "Tailwind",
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1108,11 +883,9 @@ mod tests {
     }
 
     #[test]
-    fn test_infer_type() {
-        assert_eq!(infer_type("\"hello\""), "string");
-        assert_eq!(infer_type("42"), "number");
-        assert_eq!(infer_type("true"), "boolean");
-        assert_eq!(infer_type("[]"), "array");
-        assert_eq!(infer_type("{}"), "object");
+    fn test_to_pascal_case() {
+        assert_eq!(to_pascal_case("my-component"), "MyComponent");
+        assert_eq!(to_pascal_case("user_profile"), "UserProfile");
+        assert_eq!(to_pascal_case("button"), "Button");
     }
 }
