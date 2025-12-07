@@ -30,6 +30,10 @@ pub struct CacheMeta {
     /// Indexing status (for progressive indexing)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub indexing_status: Option<IndexingStatus>,
+
+    /// Git SHA this index was created at (for incremental indexing)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indexed_sha: Option<String>,
 }
 
 /// Information about a source file for staleness detection
@@ -137,6 +141,7 @@ impl CacheMeta {
             generated_at: chrono::Utc::now().to_rfc3339(),
             source_files,
             indexing_status: None,
+            indexed_sha: None,
         }
     }
 
@@ -303,6 +308,22 @@ impl CacheDir {
         self.root.join("head_sha")
     }
 
+    /// Get the indexed SHA (last commit that was indexed)
+    pub fn get_indexed_sha(&self) -> Option<String> {
+        let path = self.head_sha_path();
+        fs::read_to_string(path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Set the indexed SHA (save after successful indexing)
+    pub fn set_indexed_sha(&self, sha: &str) -> Result<()> {
+        let path = self.head_sha_path();
+        fs::write(&path, sha)?;
+        Ok(())
+    }
+
     /// Check if cached layers exist
     pub fn has_cached_layers(&self) -> bool {
         self.layers_dir().exists()
@@ -371,6 +392,162 @@ impl CacheDir {
             fs::remove_dir_all(&self.root)?;
         }
         Ok(())
+    }
+
+    // ========== Static Analysis API ==========
+
+    /// Load the call graph from cache
+    ///
+    /// Returns a HashMap where keys are symbol hashes and values are lists of
+    /// called symbol names/hashes.
+    pub fn load_call_graph(&self) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        let path = self.call_graph_path();
+        if !path.exists() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let content = fs::read_to_string(&path)?;
+        let mut graph = std::collections::HashMap::new();
+
+        // Parse TOON format call graph
+        // Format: caller_hash: [callee1, callee2, ...]
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with("_type:") || line.starts_with("schema_version:") || line.starts_with("edges:") {
+                continue;
+            }
+
+            // Parse "hash: [call1, call2, ...]" format
+            if let Some(colon_pos) = line.find(':') {
+                let hash = line[..colon_pos].trim().to_string();
+                let rest = line[colon_pos + 1..].trim();
+
+                // Parse the array part
+                if rest.starts_with('[') && rest.ends_with(']') {
+                    let inner = &rest[1..rest.len() - 1];
+                    let calls: Vec<String> = inner
+                        .split(',')
+                        .map(|s| s.trim().trim_matches('"').to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+
+                    if !calls.is_empty() {
+                        graph.insert(hash, calls);
+                    }
+                }
+            }
+        }
+
+        Ok(graph)
+    }
+
+    /// Load all SemanticSummaries for a module
+    ///
+    /// Parses the module's TOON shard and reconstructs SemanticSummary objects.
+    pub fn load_module_summaries(&self, module_name: &str) -> Result<Vec<crate::schema::SemanticSummary>> {
+        let path = self.module_path(module_name);
+        if !path.exists() {
+            return Err(crate::McpDiffError::FileNotFound {
+                path: path.display().to_string(),
+            });
+        }
+
+        let content = fs::read_to_string(&path)?;
+        let mut summaries = Vec::new();
+        let mut current_summary: Option<crate::schema::SemanticSummary> = None;
+
+        // Parse TOON format - each symbol starts with "--- hash ---" or contains symbol_id
+        for line in content.lines() {
+            let line = line.trim();
+
+            // New symbol section
+            if line.starts_with("--- ") && line.ends_with(" ---") {
+                // Save previous summary if exists
+                if let Some(summary) = current_summary.take() {
+                    summaries.push(summary);
+                }
+                current_summary = Some(crate::schema::SemanticSummary::default());
+                continue;
+            }
+
+            // Skip header lines
+            if line.starts_with("_type:") || line.starts_with("schema_version:") || line.starts_with("module:") {
+                continue;
+            }
+
+            // Parse key: value pairs into current summary
+            if let Some(ref mut summary) = current_summary {
+                if let Some(colon_pos) = line.find(':') {
+                    let key = line[..colon_pos].trim();
+                    let value = line[colon_pos + 1..].trim();
+
+                    match key {
+                        "file" => summary.file = value.trim_matches('"').to_string(),
+                        "language" => summary.language = value.trim_matches('"').to_string(),
+                        "symbol" => summary.symbol = Some(value.trim_matches('"').to_string()),
+                        "symbol_id" => {
+                            summary.symbol_id = Some(crate::schema::SymbolId {
+                                hash: value.trim_matches('"').to_string(),
+                                ..Default::default()
+                            });
+                        }
+                        "symbol_kind" => {
+                            summary.symbol_kind = Some(crate::schema::SymbolKind::from_str(value.trim_matches('"')));
+                        }
+                        "lines" => {
+                            // Parse "start-end" format
+                            let parts: Vec<&str> = value.trim_matches('"').split('-').collect();
+                            if parts.len() == 2 {
+                                summary.start_line = parts[0].parse().ok();
+                                summary.end_line = parts[1].parse().ok();
+                            }
+                        }
+                        "behavioral_risk" => {
+                            summary.behavioral_risk = match value.trim_matches('"') {
+                                "high" => crate::schema::RiskLevel::High,
+                                "medium" => crate::schema::RiskLevel::Medium,
+                                _ => crate::schema::RiskLevel::Low,
+                            };
+                        }
+                        "control_flow" => {
+                            // Parse control flow array
+                            if value.starts_with('[') && value.ends_with(']') {
+                                let inner = &value[1..value.len() - 1];
+                                for kind_str in inner.split(',') {
+                                    let kind = kind_str.trim().trim_matches('"');
+                                    if !kind.is_empty() {
+                                        summary.control_flow_changes.push(crate::schema::ControlFlowChange {
+                                            kind: crate::schema::ControlFlowKind::from_str(kind),
+                                            ..Default::default()
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        "added_dependencies" => {
+                            // Parse dependencies array
+                            if value.starts_with('[') && value.ends_with(']') {
+                                let inner = &value[1..value.len() - 1];
+                                for dep in inner.split(',') {
+                                    let dep = dep.trim().trim_matches('"');
+                                    if !dep.is_empty() {
+                                        summary.added_dependencies.push(dep.to_string());
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Don't forget the last summary
+        if let Some(summary) = current_summary {
+            summaries.push(summary);
+        }
+
+        Ok(summaries)
     }
 
     // ========== Query-Driven API (v1) ==========
@@ -509,6 +686,247 @@ impl CacheDir {
         }
 
         Ok(results)
+    }
+
+    /// Load all symbol index entries (for static analysis)
+    ///
+    /// Returns all entries from the symbol index without filtering.
+    /// Use this for batch analysis operations.
+    pub fn load_all_symbol_entries(&self) -> Result<Vec<SymbolIndexEntry>> {
+        use std::io::BufRead;
+
+        let index_path = self.symbol_index_path();
+        if !index_path.exists() {
+            return Err(crate::McpDiffError::FileNotFound {
+                path: index_path.display().to_string(),
+            });
+        }
+
+        let file = fs::File::open(&index_path)?;
+        let reader = std::io::BufReader::new(file);
+        let mut results = Vec::new();
+
+        for line in reader.lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            let entry: SymbolIndexEntry = match serde_json::from_str(&line) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            results.push(entry);
+        }
+
+        Ok(results)
+    }
+
+    // ========== Ripgrep Fallback Search (SEM-55) ==========
+
+    /// Search using ripgrep as fallback when no semantic index exists.
+    ///
+    /// This enables search functionality without waiting for indexing.
+    /// Results include file path, line number, and matching content.
+    ///
+    /// # Arguments
+    /// * `query` - Search pattern (regex supported)
+    /// * `file_types` - Optional file type filters (e.g., ["rs", "ts"])
+    /// * `limit` - Maximum number of results
+    ///
+    /// # Returns
+    /// Vector of `RipgrepSearchResult` entries, or error if search fails
+    pub fn search_with_ripgrep(
+        &self,
+        query: &str,
+        file_types: Option<Vec<String>>,
+        limit: usize,
+    ) -> Result<Vec<RipgrepSearchResult>> {
+        use crate::ripgrep::{RipgrepSearcher, SearchOptions};
+
+        let searcher = RipgrepSearcher::new();
+        let mut options = SearchOptions::new(query)
+            .with_limit(limit)
+            .case_insensitive();
+
+        if let Some(types) = file_types {
+            options = options.with_file_types(types);
+        }
+
+        let matches = searcher.search(&self.repo_root, &options)?;
+
+        Ok(matches
+            .into_iter()
+            .map(|m| RipgrepSearchResult {
+                file: m.file.strip_prefix(&self.repo_root)
+                    .unwrap_or(&m.file)
+                    .to_string_lossy()
+                    .to_string(),
+                line: m.line,
+                column: m.column,
+                content: m.content,
+            })
+            .collect())
+    }
+
+    /// Search symbols with automatic ripgrep fallback when no index exists.
+    ///
+    /// This is the primary entry point for search that provides graceful degradation:
+    /// - If semantic index exists: use fast indexed search
+    /// - If no index: fall back to ripgrep text search
+    ///
+    /// The `fallback_used` field in the result indicates which method was used.
+    pub fn search_symbols_with_fallback(
+        &self,
+        query: &str,
+        module_filter: Option<&str>,
+        kind_filter: Option<&str>,
+        risk_filter: Option<&str>,
+        limit: usize,
+    ) -> Result<SearchWithFallbackResult> {
+        // Try indexed search first
+        if self.has_symbol_index() {
+            match self.search_symbols(query, module_filter, kind_filter, risk_filter, limit) {
+                Ok(results) => {
+                    return Ok(SearchWithFallbackResult {
+                        indexed_results: Some(results),
+                        ripgrep_results: None,
+                        fallback_used: false,
+                    });
+                }
+                Err(e) => {
+                    // Log error and fall through to ripgrep
+                    tracing::warn!("Index search failed, falling back to ripgrep: {}", e);
+                }
+            }
+        }
+
+        // Fall back to ripgrep
+        // Note: ripgrep doesn't support module/kind/risk filters, so we search broadly
+        let file_types = Self::infer_file_types_from_kind(kind_filter);
+        let ripgrep_results = self.search_with_ripgrep(query, file_types, limit)?;
+
+        Ok(SearchWithFallbackResult {
+            indexed_results: None,
+            ripgrep_results: Some(ripgrep_results),
+            fallback_used: true,
+        })
+    }
+
+    /// Infer file type filters from symbol kind
+    fn infer_file_types_from_kind(kind: Option<&str>) -> Option<Vec<String>> {
+        match kind {
+            Some("component") => Some(vec!["tsx".to_string(), "jsx".to_string(), "vue".to_string(), "svelte".to_string()]),
+            Some("fn") | Some("function") => None, // Functions exist in all languages
+            Some("struct") | Some("trait") | Some("enum") => Some(vec!["rs".to_string()]),
+            Some("class") => Some(vec!["py".to_string(), "ts".to_string(), "tsx".to_string(), "java".to_string()]),
+            Some("interface") => Some(vec!["ts".to_string(), "tsx".to_string(), "java".to_string()]),
+            _ => None,
+        }
+    }
+
+    /// Search only uncommitted files (working overlay mode).
+    ///
+    /// This searches uncommitted changes (staged + unstaged + untracked) in real-time using ripgrep,
+    /// bypassing the semantic index entirely. Useful for finding recent changes before
+    /// the index is regenerated.
+    ///
+    /// # Arguments
+    /// * `query` - Search pattern (regex supported)
+    /// * `file_types` - Optional file type filters
+    /// * `limit` - Maximum number of results
+    ///
+    /// # Returns
+    /// `RipgrepSearchResult` entries from uncommitted files only
+    pub fn search_working_overlay(
+        &self,
+        query: &str,
+        file_types: Option<Vec<String>>,
+        limit: usize,
+    ) -> Result<Vec<RipgrepSearchResult>> {
+        use crate::git::get_uncommitted_changes;
+        use crate::ripgrep::{RipgrepSearcher, SearchOptions};
+
+        let mut search_files: Vec<String> = Vec::new();
+
+        // Get modified/staged files (tracked files with changes)
+        if let Ok(changed_files) = get_uncommitted_changes("HEAD", Some(&self.repo_root)) {
+            for f in changed_files {
+                if f.change_type != crate::git::ChangeType::Deleted {
+                    search_files.push(f.path);
+                }
+            }
+        }
+
+        // Also get untracked files using git status --porcelain
+        if let Ok(output) = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&self.repo_root)
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                if line.len() < 3 {
+                    continue;
+                }
+                let status = &line[0..2];
+                let file_path = line[3..].to_string();
+                // ?? = untracked, A = staged new file, M = modified, etc.
+                // Skip deleted files (D in first or second position)
+                if !status.contains('D') {
+                    // Avoid duplicates
+                    if !search_files.contains(&file_path) {
+                        search_files.push(file_path);
+                    }
+                }
+            }
+        }
+
+        if search_files.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Search only in these specific files using ripgrep
+        let searcher = RipgrepSearcher::new();
+        let mut options = SearchOptions::new(query)
+            .with_limit(limit * 2)  // Get more results since we'll filter
+            .case_insensitive();
+
+        if let Some(types) = file_types {
+            options = options.with_file_types(types);
+        }
+
+        // Ripgrep can search specific files via --file-list or by specifying paths
+        // We'll search the repo but filter results to only include our changed files
+        let matches = searcher.search(&self.repo_root, &options)?;
+
+        // Filter to only results from uncommitted files
+        let uncommitted_set: std::collections::HashSet<&str> =
+            search_files.iter().map(|s| s.as_str()).collect();
+
+        Ok(matches
+            .into_iter()
+            .filter_map(|m| {
+                let rel_path = m.file.strip_prefix(&self.repo_root)
+                    .unwrap_or(&m.file)
+                    .to_string_lossy()
+                    .to_string();
+
+                // Only include if this file is in our uncommitted set
+                if uncommitted_set.contains(rel_path.as_str()) {
+                    Some(RipgrepSearchResult {
+                        file: rel_path,
+                        line: m.line,
+                        column: m.column,
+                        content: m.content,
+                    })
+                } else {
+                    None
+                }
+            })
+            .take(limit)
+            .collect())
     }
 
     // ========== Layer persistence (SEM-45) ==========
@@ -959,6 +1377,50 @@ pub struct SymbolIndexEntry {
     /// Risk level (high, medium, low)
     #[serde(rename = "r")]
     pub risk: String,
+
+    /// Cognitive complexity (SonarSource metric)
+    #[serde(rename = "cc", default, skip_serializing_if = "is_zero_usize")]
+    pub cognitive_complexity: usize,
+
+    /// Maximum nesting depth
+    #[serde(rename = "nest", default, skip_serializing_if = "is_zero_usize")]
+    pub max_nesting: usize,
+}
+
+fn is_zero_usize(v: &usize) -> bool {
+    *v == 0
+}
+
+/// Result from a ripgrep fallback search
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RipgrepSearchResult {
+    /// File path (relative to repo root)
+    pub file: String,
+
+    /// Line number (1-indexed)
+    pub line: u64,
+
+    /// Column number (1-indexed)
+    pub column: u64,
+
+    /// Content of the matching line
+    pub content: String,
+}
+
+/// Result from search_symbols_with_fallback
+///
+/// Contains either indexed results or ripgrep results, along with
+/// a flag indicating which method was used.
+#[derive(Debug, Clone)]
+pub struct SearchWithFallbackResult {
+    /// Results from semantic index (if available)
+    pub indexed_results: Option<Vec<SymbolIndexEntry>>,
+
+    /// Results from ripgrep fallback (if index unavailable)
+    pub ripgrep_results: Option<Vec<RipgrepSearchResult>>,
+
+    /// Whether ripgrep fallback was used
+    pub fallback_used: bool,
 }
 
 /// Get the base cache directory (XDG-compliant)
@@ -2622,5 +3084,248 @@ mod tests {
         let result = cache.is_branch_layer_stale(&overlay);
         assert!(result.is_ok());
         assert!(!result.unwrap(), "Layer should not be stale in detached HEAD if SHA matches");
+    }
+
+    // ========================================================================
+    // Ripgrep Fallback Tests (SEM-55)
+    // ========================================================================
+
+    #[test]
+    fn test_fallback_when_no_index() {
+        use tempfile::TempDir;
+
+        // Create a temp directory with some Rust files but NO .semfora index
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+
+        // Create a simple Rust file
+        fs::write(
+            temp_dir.path().join("main.rs"),
+            "fn main() {\n    println!(\"Hello, world!\");\n}\n",
+        ).unwrap();
+
+        fs::write(
+            temp_dir.path().join("lib.rs"),
+            "pub fn greet(name: &str) -> String {\n    format!(\"Hello, {}!\", name)\n}\n",
+        ).unwrap();
+
+        // Create a CacheDir pointing to this repo (no index exists)
+        let cache = CacheDir {
+            root: temp_dir.path().join(".semfora"),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Verify no symbol index exists
+        assert!(!cache.has_symbol_index(), "Should not have symbol index");
+
+        // Test search_symbols_with_fallback - should use ripgrep
+        let result = cache.search_symbols_with_fallback("fn main", None, None, None, 20);
+        assert!(result.is_ok(), "Fallback search should succeed");
+
+        let result = result.unwrap();
+        assert!(result.fallback_used, "Should use fallback (ripgrep)");
+        assert!(result.indexed_results.is_none(), "Should not have indexed results");
+        assert!(result.ripgrep_results.is_some(), "Should have ripgrep results");
+
+        let ripgrep_results = result.ripgrep_results.unwrap();
+        assert!(!ripgrep_results.is_empty(), "Should find matches with ripgrep");
+
+        // Verify we found the main function
+        let found_main = ripgrep_results.iter().any(|r| r.content.contains("fn main"));
+        assert!(found_main, "Should find 'fn main' in ripgrep results");
+    }
+
+    #[test]
+    fn test_fallback_with_query_syntax() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+
+        // Create files with specific patterns
+        fs::write(
+            temp_dir.path().join("test.rs"),
+            r#"
+            fn validate_email(email: &str) -> bool {
+                email.contains('@')
+            }
+
+            fn validate_password(password: &str) -> bool {
+                password.len() >= 8
+            }
+
+            struct UserValidator {
+                strict: bool,
+            }
+            "#,
+        ).unwrap();
+
+        let cache = CacheDir {
+            root: temp_dir.path().join(".semfora"),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Test regex pattern search
+        let result = cache.search_symbols_with_fallback(
+            r"fn validate_\w+",  // Regex pattern
+            None,
+            None,
+            None,
+            20,
+        );
+        assert!(result.is_ok());
+
+        let result = result.unwrap();
+        assert!(result.fallback_used);
+
+        let results = result.ripgrep_results.unwrap();
+        // Should find both validate_email and validate_password
+        let found_email = results.iter().any(|r| r.content.contains("validate_email"));
+        let found_password = results.iter().any(|r| r.content.contains("validate_password"));
+        assert!(found_email, "Should find validate_email with regex");
+        assert!(found_password, "Should find validate_password with regex");
+    }
+
+    #[test]
+    fn test_search_with_ripgrep_direct() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+
+        // Create test files
+        fs::write(
+            temp_dir.path().join("api.rs"),
+            "// API module\nfn handle_request() {}\n",
+        ).unwrap();
+
+        fs::write(
+            temp_dir.path().join("utils.rs"),
+            "// Utility functions\nfn helper() {}\n",
+        ).unwrap();
+
+        fs::write(
+            temp_dir.path().join("config.yaml"),
+            "# Configuration\napi_key: secret\n",
+        ).unwrap();
+
+        let cache = CacheDir {
+            root: temp_dir.path().join(".semfora"),
+            repo_root: temp_dir.path().to_path_buf(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Test direct ripgrep search
+        let result = cache.search_with_ripgrep("API", None, 20);
+        assert!(result.is_ok());
+
+        let results = result.unwrap();
+        // Should find API in both api.rs (comment) and potentially config.yaml
+        assert!(!results.is_empty(), "Should find API references");
+
+        // Test with file type filter - only .rs files
+        let result_rs_only = cache.search_with_ripgrep(
+            "API",
+            Some(vec!["rs".to_string()]),
+            20,
+        );
+        assert!(result_rs_only.is_ok());
+
+        let rs_results = result_rs_only.unwrap();
+        for r in &rs_results {
+            assert!(r.file.ends_with(".rs"), "Should only return .rs files");
+        }
+    }
+
+    #[test]
+    fn test_kind_to_file_type_inference() {
+        // Test that we infer correct file types from symbol kinds
+
+        // Component kind should search React/Vue/Svelte files
+        let component_types = CacheDir::infer_file_types_from_kind(Some("component"));
+        assert!(component_types.is_some());
+        let types = component_types.unwrap();
+        assert!(types.contains(&"tsx".to_string()));
+        assert!(types.contains(&"jsx".to_string()));
+
+        // Rust-specific kinds
+        let struct_types = CacheDir::infer_file_types_from_kind(Some("struct"));
+        assert!(struct_types.is_some());
+        assert!(struct_types.unwrap().contains(&"rs".to_string()));
+
+        // Generic function kind should search all files
+        let fn_types = CacheDir::infer_file_types_from_kind(Some("fn"));
+        assert!(fn_types.is_none(), "Function kind should search all files");
+
+        // Unknown kind should search all files
+        let unknown_types = CacheDir::infer_file_types_from_kind(None);
+        assert!(unknown_types.is_none());
+    }
+
+    #[test]
+    fn test_working_overlay_searches_modified_only() {
+        // Test that working overlay mode only searches uncommitted files.
+        // This test creates a mock scenario where we verify the method signature
+        // and behavior pattern. Full integration requires a git repo with uncommitted changes.
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let repo_root = temp_dir.path().to_path_buf();
+
+        // Initialize git repo
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&repo_root)
+            .output()
+            .expect("git init");
+
+        // Create a committed file
+        let committed_file = repo_root.join("committed.rs");
+        std::fs::write(&committed_file, "fn committed_function() {}\n").unwrap();
+
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&repo_root)
+            .output()
+            .expect("git add");
+
+        std::process::Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(&repo_root)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@test.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@test.com")
+            .output()
+            .expect("git commit");
+
+        // Create an uncommitted file with a searchable term
+        let uncommitted_file = repo_root.join("uncommitted.rs");
+        std::fs::write(&uncommitted_file, "fn SEARCHABLE_uncommitted() {}\n").unwrap();
+
+        // Create cache dir
+        let cache = CacheDir {
+            root: temp_dir.path().join(".semfora"),
+            repo_root: repo_root.clone(),
+            repo_hash: "test_hash".to_string(),
+        };
+
+        // Search working overlay for a term that only exists in uncommitted file
+        let results = cache.search_working_overlay("SEARCHABLE", None, 20).unwrap();
+
+        // Should find results only in uncommitted file
+        assert!(!results.is_empty(), "Should find results in uncommitted file");
+        for r in &results {
+            assert!(
+                r.file == "uncommitted.rs" || r.file.ends_with("uncommitted.rs"),
+                "Results should only be from uncommitted files, got: {}",
+                r.file
+            );
+        }
+
+        // Search for term only in committed file - should return empty
+        let committed_results = cache.search_working_overlay("committed_function", None, 20).unwrap();
+        assert!(
+            committed_results.is_empty(),
+            "Should NOT find results in committed files when using working overlay"
+        );
     }
 }

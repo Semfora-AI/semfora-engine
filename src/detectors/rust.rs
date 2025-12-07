@@ -306,9 +306,20 @@ pub fn extract_state(summary: &mut SemanticSummary, root: &Node, source: &str) {
 // Control Flow Extraction
 // ============================================================================
 
-/// Extract control flow patterns
+/// Rust control flow node kinds for nesting depth tracking
+const RUST_CONTROL_FLOW_KINDS: &[&str] = &[
+    "if_expression",
+    "for_expression",
+    "while_expression",
+    "match_expression",
+    "loop_expression",
+];
+
+/// Extract control flow patterns with nesting depth for cognitive complexity
 pub fn extract_control_flow(summary: &mut SemanticSummary, root: &Node) {
-    visit_all(root, |node| {
+    use super::common::visit_with_nesting_depth;
+
+    visit_with_nesting_depth(root, |node, depth| {
         let kind = match node.kind() {
             "if_expression" => Some(ControlFlowKind::If),
             "for_expression" => Some(ControlFlowKind::For),
@@ -319,15 +330,19 @@ pub fn extract_control_flow(summary: &mut SemanticSummary, root: &Node) {
         };
 
         if let Some(k) = kind {
+            // Nesting depth is the depth we entered at, not after
+            // So a top-level if has depth 0, nested if has depth 1, etc.
+            let nesting = if depth > 0 { depth - 1 } else { 0 };
             summary.control_flow_changes.push(ControlFlowChange {
                 kind: k,
                 location: Location::new(
                     node.start_position().row + 1,
                     node.start_position().column,
                 ),
+                nesting_depth: nesting,
             });
         }
-    });
+    }, RUST_CONTROL_FLOW_KINDS);
 }
 
 #[cfg(test)]

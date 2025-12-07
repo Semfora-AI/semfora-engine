@@ -16,6 +16,8 @@ use semfora_mcp::{
     generate_repo_overview, Cli, Lang, McpDiffError, OutputFormat, SemanticSummary, TokenAnalyzer,
     CacheDir, ShardWriter, get_cache_base_dir, list_cached_repos, prune_old_caches,
     analyze_repo_tokens, is_test_file,
+    // Drift detection for incremental indexing (SEM-47)
+    count_tracked_files, DriftDetector, UpdateStrategy, LayerKind,
 };
 
 fn main() -> ExitCode {
@@ -80,6 +82,11 @@ fn run() -> semfora_mcp::Result<String> {
 
     if cli.get_overview {
         return run_get_overview(&cli);
+    }
+
+    // Handle static analysis
+    if cli.analyze {
+        return run_static_analysis(&cli);
     }
 
     let mode = cli.operation_mode()?;
@@ -301,28 +308,93 @@ fn run_shard(cli: &Cli, dir_path: &Path, max_depth: usize) -> semfora_mcp::Resul
 
     // Create shard writer
     let mut shard_writer = ShardWriter::new(dir_path)?;
+    let cache = CacheDir::for_repo(dir_path)?;
 
     eprintln!("Cache location: {}", shard_writer.cache_path().display());
 
-    // Collect all supported files
-    let files = collect_files(dir_path, max_depth, cli);
+    // Check for incremental mode (SEM-47 drift detection)
+    let mut update_strategy = UpdateStrategy::FullRebuild;
+    let mut current_sha: Option<String> = None;
 
-    if files.is_empty() {
+    if cli.incremental && is_git_repo(Some(dir_path)) {
+        // Get current HEAD SHA
+        current_sha = semfora_mcp::git::git_command(&["rev-parse", "HEAD"], Some(dir_path)).ok();
+
+        if let Some(ref sha) = current_sha {
+            let indexed_sha = cache.get_indexed_sha();
+
+            if let Some(ref idx_sha) = indexed_sha {
+                if idx_sha == sha {
+                    // Same SHA = fresh, no update needed
+                    eprintln!("Index is fresh (SHA: {})", &sha[..8]);
+                    return Ok(format!(
+                        "═══════════════════════════════════════════════════════\n\
+                         INDEX IS FRESH\n\
+                         ═══════════════════════════════════════════════════════\n\n\
+                         directory: {}\n\
+                         indexed_sha: {}\n\
+                         status: No changes detected, index is up to date.\n",
+                        dir_path.display(), sha
+                    ));
+                }
+
+                // Different SHA - use drift detection
+                let file_count = count_tracked_files(dir_path).unwrap_or(0);
+                let detector = DriftDetector::with_file_count(dir_path.to_path_buf(), file_count);
+                let drift = detector.check_drift(LayerKind::Base, Some(idx_sha), None)?;
+                update_strategy = drift.strategy(file_count);
+
+                eprintln!(
+                    "Incremental mode: {} ({} files changed, {:.1}% drift)",
+                    update_strategy.description(),
+                    drift.changed_files.len(),
+                    drift.drift_percentage
+                );
+            } else {
+                eprintln!("No previous index found, performing full rebuild");
+            }
+        }
+    } else if cli.incremental {
+        eprintln!("Warning: --incremental requires a git repository, performing full rebuild");
+    }
+
+    // Collect files to analyze based on update strategy
+    let files_to_analyze: Vec<PathBuf> = match &update_strategy {
+        UpdateStrategy::Fresh => {
+            // Should not reach here (returned early above)
+            Vec::new()
+        }
+        UpdateStrategy::Incremental(changed_files) => {
+            // Only analyze changed files
+            eprintln!("Incremental update: analyzing {} changed files", changed_files.len());
+            changed_files
+                .iter()
+                .map(|p| dir_path.join(p))
+                .filter(|p| p.exists())
+                .collect()
+        }
+        UpdateStrategy::Rebase | UpdateStrategy::FullRebuild => {
+            // Analyze all files
+            collect_files(dir_path, max_depth, cli)
+        }
+    };
+
+    if files_to_analyze.is_empty() && !matches!(update_strategy, UpdateStrategy::Fresh) {
         return Ok(format!(
             "directory: {}\nfiles_found: 0\nNo files to shard.\n",
             dir_path.display()
         ));
     }
 
-    eprintln!("Found {} files to analyze", files.len());
+    let total = files_to_analyze.len();
+    eprintln!("Found {} files to analyze", total);
 
     // First pass: collect all summaries
     let mut summaries: Vec<SemanticSummary> = Vec::new();
     let mut total_source_bytes = 0usize;
     let mut processed = 0usize;
-    let total = files.len();
 
-    for file_path in &files {
+    for file_path in &files_to_analyze {
         processed += 1;
         if processed % 100 == 0 || processed == total {
             eprintln!("Processing: {}/{} ({:.1}%)", processed, total, (processed as f64 / total as f64) * 100.0);
@@ -369,6 +441,12 @@ fn run_shard(cli: &Cli, dir_path: &Path, max_depth: usize) -> semfora_mcp::Resul
     let dir_str = dir_path.display().to_string();
     let stats = shard_writer.write_all(&dir_str)?;
 
+    // Save the indexed SHA for future incremental updates
+    if let Some(ref sha) = current_sha {
+        cache.set_indexed_sha(sha)?;
+        eprintln!("Saved indexed SHA: {}", sha);
+    }
+
     // Format output
     let (cache_size, _module_count) = shard_writer.cache_stats();
     let compression = if total_source_bytes > 0 {
@@ -378,12 +456,21 @@ fn run_shard(cli: &Cli, dir_path: &Path, max_depth: usize) -> semfora_mcp::Resul
     };
 
     let mut output = String::new();
+    let header = match update_strategy {
+        UpdateStrategy::Incremental(_) => "INCREMENTAL INDEX UPDATE",
+        UpdateStrategy::Rebase => "INDEX REBASED",
+        _ => "SHARDED INDEX CREATED",
+    };
     output.push_str(&format!("═══════════════════════════════════════════════════════\n"));
-    output.push_str(&format!("  SHARDED INDEX CREATED\n"));
+    output.push_str(&format!("  {}\n", header));
     output.push_str(&format!("═══════════════════════════════════════════════════════\n\n"));
 
     output.push_str(&format!("directory: {}\n", dir_path.display()));
     output.push_str(&format!("cache: {}\n", shard_writer.cache_path().display()));
+    if let Some(ref sha) = current_sha {
+        output.push_str(&format!("indexed_sha: {}\n", sha));
+    }
+    output.push_str(&format!("strategy: {}\n", update_strategy.description()));
     output.push_str(&format!("\n"));
 
     output.push_str(&format!("Files:\n"));
@@ -543,7 +630,7 @@ fn run_get_module(cli: &Cli, module_name: &str) -> semfora_mcp::Result<String> {
     Ok(content)
 }
 
-/// Search for symbols by name in the cached index
+/// Search for symbols by name in the cached index (with ripgrep fallback)
 fn run_search_symbols(cli: &Cli, query: &str) -> semfora_mcp::Result<String> {
     let current_dir = std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
         path: format!("current directory: {}", e),
@@ -551,13 +638,8 @@ fn run_search_symbols(cli: &Cli, query: &str) -> semfora_mcp::Result<String> {
 
     let cache = CacheDir::for_repo(&current_dir)?;
 
-    if !cache.has_symbol_index() {
-        return Err(McpDiffError::FileNotFound {
-            path: format!("No symbol index found. Run with --shard first to generate index."),
-        });
-    }
-
-    let results = cache.search_symbols(
+    // Use fallback-aware search that automatically uses ripgrep when no index exists
+    let search_result = cache.search_symbols_with_fallback(
         query,
         None, // module filter - could add later
         cli.kind.as_deref(),
@@ -567,23 +649,60 @@ fn run_search_symbols(cli: &Cli, query: &str) -> semfora_mcp::Result<String> {
 
     let mut output = String::new();
 
-    match cli.format {
-        OutputFormat::Json => {
-            let json = serde_json::json!({
-                "query": query,
-                "results": results,
-                "count": results.len()
-            });
-            output = serde_json::to_string_pretty(&json).unwrap_or_default();
+    if search_result.fallback_used {
+        // Ripgrep fallback results
+        let ripgrep_results = search_result.ripgrep_results.unwrap_or_default();
+
+        match cli.format {
+            OutputFormat::Json => {
+                let json = serde_json::json!({
+                    "query": query,
+                    "results": ripgrep_results,
+                    "count": ripgrep_results.len(),
+                    "fallback": true,
+                    "note": "Using ripgrep fallback (no semantic index). Run with --shard to generate index."
+                });
+                output = serde_json::to_string_pretty(&json).unwrap_or_default();
+            }
+            OutputFormat::Toon => {
+                output.push_str("_note: Using ripgrep fallback (no semantic index)\n");
+                output.push_str(&format!("query: \"{}\"\n", query));
+                output.push_str(&format!("results[{}]:\n", ripgrep_results.len()));
+                for entry in &ripgrep_results {
+                    let content_preview = if entry.content.len() > 60 {
+                        format!("{}...", &entry.content[..60])
+                    } else {
+                        entry.content.clone()
+                    };
+                    output.push_str(&format!(
+                        "  {}:{}:{}: {}\n",
+                        entry.file, entry.line, entry.column, content_preview.trim()
+                    ));
+                }
+            }
         }
-        OutputFormat::Toon => {
-            output.push_str(&format!("query: \"{}\"\n", query));
-            output.push_str(&format!("results[{}]:\n", results.len()));
-            for entry in &results {
-                output.push_str(&format!(
-                    "  {} ({}) - {} [{}] {}:{}\n",
-                    entry.symbol, entry.kind, entry.module, entry.risk, entry.file, entry.lines
-                ));
+    } else {
+        // Normal indexed search results
+        let results = search_result.indexed_results.unwrap_or_default();
+
+        match cli.format {
+            OutputFormat::Json => {
+                let json = serde_json::json!({
+                    "query": query,
+                    "results": results,
+                    "count": results.len()
+                });
+                output = serde_json::to_string_pretty(&json).unwrap_or_default();
+            }
+            OutputFormat::Toon => {
+                output.push_str(&format!("query: \"{}\"\n", query));
+                output.push_str(&format!("results[{}]:\n", results.len()));
+                for entry in &results {
+                    output.push_str(&format!(
+                        "  {} ({}) - {} [{}] {}:{}\n",
+                        entry.symbol, entry.kind, entry.module, entry.risk, entry.file, entry.lines
+                    ));
+                }
             }
         }
     }
@@ -1412,4 +1531,44 @@ fn print_ast(node: &tree_sitter::Node, source: &str, depth: usize) {
     for child in node.children(&mut cursor) {
         print_ast(&child, source, depth + 1);
     }
+}
+
+/// Run static code analysis on the cached index
+fn run_static_analysis(cli: &Cli) -> semfora_mcp::Result<String> {
+    use semfora_mcp::analysis::{analyze_module, analyze_repo, format_analysis_report as format_report};
+
+    let cwd = std::env::current_dir()?;
+
+    // Check if we have a cached index
+    let cache = semfora_mcp::CacheDir::for_repo(&cwd)?;
+    if !cache.exists() {
+        return Err(McpDiffError::GitError {
+            message: "No cached index found. Run with --shard first to generate the index.".to_string(),
+        });
+    }
+
+    // Check if analyzing a specific module
+    if let Some(ref module_name) = cli.analyze_module {
+        let metrics = analyze_module(&cwd, module_name)?;
+        let mut output = String::new();
+        output.push_str(&format!("Module: {}\n", metrics.name));
+        output.push_str(&format!("  Files: {}\n", metrics.files));
+        output.push_str(&format!("  Symbols: {}\n", metrics.symbols));
+        output.push_str(&format!("  Avg Complexity: {:.1}\n", metrics.avg_complexity));
+        output.push_str(&format!("  Max Complexity: {}\n", metrics.max_complexity));
+        if let Some(ref most_complex) = metrics.most_complex_symbol {
+            output.push_str(&format!("  Most Complex: {}\n", most_complex));
+        }
+        output.push_str(&format!("  Total LoC: {}\n", metrics.total_loc));
+        output.push_str(&format!("  High Risk Count: {}\n", metrics.high_risk_count));
+        output.push_str(&format!("  Instability: {:.2}\n", metrics.instability()));
+        return Ok(output);
+    }
+
+    // Full repo analysis
+    eprintln!("Running static analysis on cached index...");
+    let analysis = analyze_repo(&cwd)?;
+    let report = format_report(&analysis);
+
+    Ok(report)
 }

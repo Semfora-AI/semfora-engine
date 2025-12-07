@@ -193,6 +193,10 @@ pub struct SearchSymbolsRequest {
     /// Repository path (defaults to current directory)
     #[schemars(description = "Path to the repository root (defaults to current directory)")]
     pub path: Option<String>,
+
+    /// If true, search only uncommitted files (working overlay mode)
+    #[schemars(description = "If true, search only uncommitted files (real-time working overlay)")]
+    pub working_overlay: Option<bool>,
 }
 
 /// List all symbols in a specific module (lightweight index only)
@@ -257,6 +261,79 @@ pub struct CheckIndexRequest {
     /// Maximum age in seconds before considered stale (default: 3600 = 1 hour)
     #[schemars(description = "Maximum cache age in seconds (default: 3600 = 1 hour)")]
     pub max_age: Option<u64>,
+}
+
+// ============================================================================
+// Ripgrep Raw Search Types (SEM-55)
+// ============================================================================
+
+/// Request for direct ripgrep search (bypasses semantic index)
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RawSearchRequest {
+    /// Search pattern (regex supported)
+    #[schemars(description = "Search pattern (regex supported)")]
+    pub pattern: String,
+
+    /// Repository path (defaults to current directory)
+    #[schemars(description = "Path to search in (defaults to current directory)")]
+    pub path: Option<String>,
+
+    /// File type filters (e.g., ["rs", "ts"])
+    #[schemars(description = "File extensions to search (e.g., ['rs', 'ts']). If empty, searches all files.")]
+    pub file_types: Option<Vec<String>>,
+
+    /// Maximum results (default: 50, max: 200)
+    #[schemars(description = "Maximum results to return (default: 50, max: 200)")]
+    pub limit: Option<usize>,
+
+    /// Case-insensitive search (default: true)
+    #[schemars(description = "Case-insensitive search (default: true)")]
+    pub case_insensitive: Option<bool>,
+
+    /// Merge adjacent matches within N lines (default: 3)
+    #[schemars(description = "Merge adjacent matches within N lines (default: 3, 0 to disable)")]
+    pub merge_threshold: Option<usize>,
+}
+
+// ============================================================================
+// Test Runner Types (North Star - VALIDATE phase)
+// ============================================================================
+
+/// Request to run tests in a project directory
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RunTestsRequest {
+    /// Path to the project directory (defaults to current directory)
+    #[schemars(description = "Path to the project directory (defaults to current directory)")]
+    pub path: Option<String>,
+
+    /// Force a specific test framework (pytest, cargo, npm, vitest, jest, go)
+    /// If not specified, auto-detects from project files
+    #[schemars(description = "Force a specific test framework (pytest, cargo, npm, vitest, jest, go). Auto-detects if not specified.")]
+    pub framework: Option<String>,
+
+    /// Filter tests by name pattern (passed to test runner)
+    #[schemars(description = "Filter tests by name pattern (e.g., 'test_auth' for pytest, 'auth' for cargo test)")]
+    pub filter: Option<String>,
+
+    /// Run tests in verbose mode
+    #[schemars(description = "Run tests in verbose mode (more output)")]
+    pub verbose: Option<bool>,
+
+    /// Maximum time to run tests in seconds (default: 300)
+    #[schemars(description = "Maximum time to run tests in seconds (default: 300)")]
+    pub timeout: Option<u64>,
+}
+
+/// Request to detect test frameworks in a directory
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DetectTestsRequest {
+    /// Path to the project directory (defaults to current directory)
+    #[schemars(description = "Path to the project directory (defaults to current directory)")]
+    pub path: Option<String>,
+
+    /// Check subdirectories for monorepo setups
+    #[schemars(description = "Check subdirectories for monorepo setups (default: false)")]
+    pub check_subdirs: Option<bool>,
 }
 
 // ============================================================================

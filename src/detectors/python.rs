@@ -8,7 +8,7 @@
 
 use tree_sitter::{Node, Tree};
 
-use crate::detectors::common::{get_node_text, visit_all};
+use crate::detectors::common::{get_node_text, visit_all, visit_with_nesting_depth};
 use crate::error::Result;
 use crate::schema::{
     ControlFlowChange, ControlFlowKind, Location, RiskLevel, SemanticSummary, StateChange,
@@ -342,9 +342,18 @@ pub fn extract_state(summary: &mut SemanticSummary, root: &Node, source: &str) {
 // Control Flow Extraction
 // ============================================================================
 
-/// Extract control flow patterns
+/// Python control flow node kinds for nesting depth tracking
+const PYTHON_CONTROL_FLOW_KINDS: &[&str] = &[
+    "if_statement",
+    "for_statement",
+    "while_statement",
+    "try_statement",
+    "match_statement",
+];
+
+/// Extract control flow patterns with nesting depth for cognitive complexity
 pub fn extract_control_flow(summary: &mut SemanticSummary, root: &Node) {
-    visit_all(root, |node| {
+    visit_with_nesting_depth(root, |node, depth| {
         let kind = match node.kind() {
             "if_statement" => Some(ControlFlowKind::If),
             "for_statement" => Some(ControlFlowKind::For),
@@ -355,15 +364,18 @@ pub fn extract_control_flow(summary: &mut SemanticSummary, root: &Node) {
         };
 
         if let Some(k) = kind {
+            // Nesting depth is the depth we entered at, not after
+            let nesting = if depth > 0 { depth - 1 } else { 0 };
             summary.control_flow_changes.push(ControlFlowChange {
                 kind: k,
                 location: Location::new(
                     node.start_position().row + 1,
                     node.start_position().column,
                 ),
+                nesting_depth: nesting,
             });
         }
-    });
+    }, PYTHON_CONTROL_FLOW_KINDS);
 }
 
 #[cfg(test)]

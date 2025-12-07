@@ -648,6 +648,23 @@ impl SymbolKind {
             Self::TypeAlias => "type_alias",
         }
     }
+
+    /// Parse from string representation
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "function" | "fn" => Self::Function,
+            "component" => Self::Component,
+            "class" => Self::Class,
+            "method" => Self::Method,
+            "interface" => Self::Interface,
+            "trait" => Self::Trait,
+            "struct" => Self::Struct,
+            "enum" => Self::Enum,
+            "module" | "mod" => Self::Module,
+            "type_alias" | "type" => Self::TypeAlias,
+            _ => Self::Function, // Default fallback
+        }
+    }
 }
 
 /// Component prop definition
@@ -704,6 +721,15 @@ pub struct ControlFlowChange {
 
     /// Location in source
     pub location: Location,
+
+    /// Nesting depth (0 = top level, 1 = inside one control structure, etc.)
+    /// Used for cognitive complexity calculation
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub nesting_depth: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// Kind of control flow construct
@@ -738,6 +764,20 @@ impl ControlFlowKind {
             Self::Match => "match",
             Self::Try => "try",
             Self::Loop => "loop",
+        }
+    }
+
+    /// Parse from string representation
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "if" => Self::If,
+            "for" => Self::For,
+            "while" => Self::While,
+            "switch" => Self::Switch,
+            "match" => Self::Match,
+            "try" => Self::Try,
+            "loop" => Self::Loop,
+            _ => Self::If, // Default fallback
         }
     }
 }
@@ -788,6 +828,15 @@ impl RiskLevel {
             0..=1 => Self::Low,
             2..=3 => Self::Medium,
             _ => Self::High,
+        }
+    }
+
+    /// Parse risk level from string
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "high" => Self::High,
+            "medium" => Self::Medium,
+            _ => Self::Low,
         }
     }
 }

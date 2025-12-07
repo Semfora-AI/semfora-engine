@@ -19,8 +19,9 @@ use rmcp::{
 use tokio::sync::Mutex;
 
 use crate::{
-    encode_toon, encode_toon_directory, generate_repo_overview, Lang, SemanticSummary,
-    CacheDir, ShardWriter, SymbolIndexEntry,
+    encode_toon, encode_toon_directory, generate_repo_overview, Lang, MergedBlock,
+    SemanticSummary, CacheDir, RipgrepSearchResult, ShardWriter, SymbolIndexEntry,
+    test_runner::{self, TestFramework, TestRunOptions},
 };
 
 // Re-export types for external use
@@ -515,7 +516,7 @@ impl McpDiffServer {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-    #[tool(description = "Search for symbols by name across the repository. Returns lightweight index entries (symbol, hash, module, file, lines, risk) without full semantic details. Use get_symbol(hash) to fetch full details for specific symbols. This is much more token-efficient than get_module for targeted searches.")]
+    #[tool(description = "Search for symbols by name across the repository. Returns lightweight index entries (symbol, hash, module, file, lines, risk) without full semantic details. Use get_symbol(hash) to fetch full details for specific symbols. This is much more token-efficient than get_module for targeted searches. Falls back to ripgrep text search if no semantic index exists. Use working_overlay=true to search only uncommitted files.")]
     async fn search_symbols(
         &self,
         Parameters(request): Parameters<SearchSymbolsRequest>,
@@ -532,16 +533,31 @@ impl McpDiffServer {
             ))])),
         };
 
-        if !cache.has_symbol_index() {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "No symbol index found for {}. Run generate_index first to enable search.",
-                repo_path.display()
-            ))]));
-        }
-
         let limit = request.limit.unwrap_or(20).min(100);
 
-        let results = match cache.search_symbols(
+        // If working_overlay is true, search only uncommitted files
+        if request.working_overlay.unwrap_or(false) {
+            let file_types = match request.kind.as_deref() {
+                Some("component") => Some(vec!["tsx".to_string(), "jsx".to_string(), "vue".to_string(), "svelte".to_string()]),
+                Some("struct") | Some("trait") | Some("enum") => Some(vec!["rs".to_string()]),
+                Some("class") => Some(vec!["py".to_string(), "ts".to_string(), "tsx".to_string(), "java".to_string()]),
+                Some("interface") => Some(vec!["ts".to_string(), "tsx".to_string(), "java".to_string()]),
+                _ => None,
+            };
+
+            let results = match cache.search_working_overlay(&request.query, file_types, limit) {
+                Ok(r) => r,
+                Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Working overlay search failed: {}", e
+                ))])),
+            };
+
+            let output = format_working_overlay_results(&request.query, &results);
+            return Ok(CallToolResult::success(vec![Content::text(output)]));
+        }
+
+        // Use fallback-aware search
+        let result = match cache.search_symbols_with_fallback(
             &request.query,
             request.module.as_deref(),
             request.kind.as_deref(),
@@ -554,7 +570,75 @@ impl McpDiffServer {
             ))])),
         };
 
-        let output = format_search_results(&request.query, &results);
+        let output = if result.fallback_used {
+            format_ripgrep_results(&request.query, result.ripgrep_results.as_deref().unwrap_or(&[]))
+        } else {
+            format_search_results(&request.query, result.indexed_results.as_deref().unwrap_or(&[]))
+        };
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    #[tool(description = "Direct ripgrep search that bypasses the semantic index. Use this for searching comments, strings, non-indexed content, or when you need raw text search. Supports regex patterns and file type filtering. For symbol-aware search, prefer search_symbols.")]
+    async fn raw_search(
+        &self,
+        Parameters(request): Parameters<RawSearchRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        use crate::ripgrep::{RipgrepSearcher, SearchOptions};
+
+        let search_path = match &request.path {
+            Some(p) => self.resolve_path(p).await,
+            None => self.get_working_dir().await,
+        };
+
+        let limit = request.limit.unwrap_or(50).min(200);
+        let merge_threshold = request.merge_threshold.unwrap_or(3);
+
+        let mut options = SearchOptions::new(&request.pattern)
+            .with_limit(limit)
+            .with_merge_threshold(merge_threshold);
+
+        if request.case_insensitive.unwrap_or(true) {
+            options = options.case_insensitive();
+        }
+
+        if let Some(types) = &request.file_types {
+            options = options.with_file_types(types.clone());
+        }
+
+        let searcher = RipgrepSearcher::new();
+
+        // If merge_threshold > 0, return merged blocks; otherwise raw matches
+        let output = if merge_threshold > 0 {
+            match searcher.search_merged(&search_path, &options) {
+                Ok(blocks) => format_merged_blocks(&request.pattern, &blocks, &search_path),
+                Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Search failed: {}", e
+                ))])),
+            }
+        } else {
+            match searcher.search(&search_path, &options) {
+                Ok(matches) => {
+                    let results: Vec<RipgrepSearchResult> = matches
+                        .into_iter()
+                        .map(|m| RipgrepSearchResult {
+                            file: m.file.strip_prefix(&search_path)
+                                .unwrap_or(&m.file)
+                                .to_string_lossy()
+                                .to_string(),
+                            line: m.line,
+                            column: m.column,
+                            content: m.content,
+                        })
+                        .collect();
+                    format_ripgrep_results(&request.pattern, &results)
+                }
+                Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Search failed: {}", e
+                ))])),
+            }
+        };
+
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
@@ -757,6 +841,175 @@ impl McpDiffServer {
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
+
+    // ========================================================================
+    // Test Runner Tools (North Star - VALIDATE phase)
+    // ========================================================================
+
+    #[tool(description = "Run tests in a project directory. Auto-detects the test framework (pytest, cargo test, npm test, go test) or use a specific framework. Returns structured results including pass/fail counts, failures, and duration.")]
+    async fn run_tests(
+        &self,
+        Parameters(request): Parameters<RunTestsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let project_path = match &request.path {
+            Some(p) => self.resolve_path(p).await,
+            None => self.get_working_dir().await,
+        };
+
+        if !project_path.exists() {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Directory not found: {}", project_path.display()
+            ))]));
+        }
+
+        // Parse framework if specified
+        let framework = match &request.framework {
+            Some(f) => match f.to_lowercase().as_str() {
+                "pytest" | "python" => Some(TestFramework::Pytest),
+                "cargo" | "rust" => Some(TestFramework::Cargo),
+                "npm" | "node" => Some(TestFramework::Npm),
+                "vitest" => Some(TestFramework::Vitest),
+                "jest" => Some(TestFramework::Jest),
+                "go" | "golang" => Some(TestFramework::Go),
+                _ => return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Unknown framework '{}'. Valid options: pytest, cargo, npm, vitest, jest, go", f
+                ))])),
+            },
+            None => None,
+        };
+
+        // Build run options
+        let options = TestRunOptions {
+            filter: request.filter.clone(),
+            timeout_secs: request.timeout,
+            verbose: request.verbose.unwrap_or(false),
+            extra_args: Vec::new(),
+        };
+
+        // Run tests
+        let results = match framework {
+            Some(fw) => test_runner::run_tests_with_framework(&project_path, fw, &options),
+            None => test_runner::run_tests(&project_path, &options),
+        };
+
+        match results {
+            Ok(results) => {
+                let output = format_test_results(&results);
+                Ok(CallToolResult::success(vec![Content::text(output)]))
+            }
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Test execution failed: {}", e
+            ))])),
+        }
+    }
+
+    #[tool(description = "Detect test frameworks in a project directory. Returns detected framework(s) and their locations. Useful for monorepo setups where multiple test runners may be present.")]
+    async fn detect_tests(
+        &self,
+        Parameters(request): Parameters<DetectTestsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let project_path = match &request.path {
+            Some(p) => self.resolve_path(p).await,
+            None => self.get_working_dir().await,
+        };
+
+        if !project_path.exists() {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Directory not found: {}", project_path.display()
+            ))]));
+        }
+
+        let check_subdirs = request.check_subdirs.unwrap_or(false);
+
+        let mut output = String::new();
+        output.push_str("_type: test_frameworks\n");
+        output.push_str(&format!("path: {}\n", project_path.display()));
+
+        if check_subdirs {
+            // Check for monorepo setup
+            let frameworks = test_runner::detect_all_frameworks(&project_path);
+            output.push_str(&format!("detected: {}\n", frameworks.len()));
+
+            if frameworks.is_empty() {
+                output.push_str("frameworks: (none detected)\n");
+                output.push_str("hint: No Cargo.toml, package.json, pyproject.toml, or go.mod found.\n");
+            } else {
+                output.push_str("frameworks:\n");
+                for (fw, path) in &frameworks {
+                    let rel_path = path.strip_prefix(&project_path)
+                        .unwrap_or(path)
+                        .to_string_lossy();
+                    let rel_path = if rel_path.is_empty() { "." } else { &rel_path };
+                    output.push_str(&format!("  - {}: {}\n", fw.as_str(), rel_path));
+                }
+            }
+        } else {
+            // Single framework detection
+            let framework = test_runner::detect_framework(&project_path);
+            output.push_str(&format!("framework: {}\n", framework.as_str()));
+
+            if framework == TestFramework::Unknown {
+                output.push_str("hint: No test framework detected. Ensure project has Cargo.toml, package.json, pyproject.toml, or go.mod.\n");
+            }
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+}
+
+/// Format test results as compact TOON output
+fn format_test_results(results: &test_runner::TestResults) -> String {
+    let mut output = String::new();
+    output.push_str("_type: test_results\n");
+    output.push_str(&format!("framework: {}\n", results.framework.as_str()));
+    output.push_str(&format!("success: {}\n", results.success));
+    output.push_str(&format!("passed: {}\n", results.passed));
+    output.push_str(&format!("failed: {}\n", results.failed));
+    output.push_str(&format!("skipped: {}\n", results.skipped));
+    output.push_str(&format!("total: {}\n", results.total));
+    output.push_str(&format!("duration_ms: {}\n", results.duration_ms));
+
+    if let Some(code) = results.exit_code {
+        output.push_str(&format!("exit_code: {}\n", code));
+    }
+
+    if !results.failures.is_empty() {
+        output.push_str(&format!("\nfailures[{}]:\n", results.failures.len()));
+        for failure in &results.failures {
+            output.push_str(&format!("  - test: {}\n", failure.name));
+            if let Some(ref file) = failure.file {
+                output.push_str(&format!("    file: {}\n", file));
+            }
+            if let Some(line) = failure.line {
+                output.push_str(&format!("    line: {}\n", line));
+            }
+            if !failure.message.is_empty() {
+                // Truncate long messages
+                let msg = if failure.message.len() > 200 {
+                    format!("{}...", &failure.message[..200])
+                } else {
+                    failure.message.clone()
+                };
+                output.push_str(&format!("    message: {}\n", msg.replace('\n', "\\n")));
+            }
+        }
+    }
+
+    // Include truncated stdout/stderr for debugging
+    if !results.stdout.is_empty() {
+        let stdout = if results.stdout.len() > 500 {
+            format!("{}...(truncated)", &results.stdout[..500])
+        } else {
+            results.stdout.clone()
+        };
+        output.push_str(&format!("\n__stdout__:\n{}\n", stdout));
+    }
+
+    if !results.stderr.is_empty() && results.stderr.len() < 500 {
+        output.push_str(&format!("\n__stderr__:\n{}\n", results.stderr));
+    }
+
+    output
 }
 
 #[tool_handler]
@@ -1070,6 +1323,104 @@ fn format_search_results(query: &str, results: &[SymbolIndexEntry]) -> String {
     output
 }
 
+/// Format ripgrep fallback results as compact TOON
+fn format_ripgrep_results(query: &str, results: &[RipgrepSearchResult]) -> String {
+    let mut output = String::new();
+    output.push_str("_type: ripgrep_results\n");
+    output.push_str("_note: Using ripgrep fallback (no semantic index). Run generate_index for semantic search.\n");
+    output.push_str(&format!("query: \"{}\"\n", query));
+    output.push_str(&format!("showing: {}\n", results.len()));
+
+    if results.is_empty() {
+        output.push_str("results: (none)\n");
+    } else {
+        output.push_str(&format!("results[{}]{{file,line,col,content}}:\n", results.len()));
+        for entry in results {
+            // Truncate long content for display
+            let content = if entry.content.len() > 100 {
+                format!("{}...", &entry.content[..100])
+            } else {
+                entry.content.clone()
+            };
+            output.push_str(&format!(
+                "  {}:{}:{}: {}\n",
+                entry.file, entry.line, entry.column, content.trim()
+            ));
+        }
+    }
+
+    output
+}
+
+/// Format working overlay search results (uncommitted files only)
+fn format_working_overlay_results(query: &str, results: &[RipgrepSearchResult]) -> String {
+    let mut output = String::new();
+    output.push_str("_type: working_overlay_results\n");
+    output.push_str("_note: Searching uncommitted files only (staged + unstaged changes)\n");
+    output.push_str(&format!("query: \"{}\"\n", query));
+    output.push_str(&format!("showing: {}\n", results.len()));
+
+    if results.is_empty() {
+        output.push_str("results: (none - no uncommitted files match)\n");
+    } else {
+        // Group by file for cleaner output
+        let mut by_file: std::collections::BTreeMap<&str, Vec<&RipgrepSearchResult>> =
+            std::collections::BTreeMap::new();
+        for entry in results {
+            by_file.entry(&entry.file).or_default().push(entry);
+        }
+
+        output.push_str(&format!("files[{}]:\n", by_file.len()));
+        for (file, entries) in by_file {
+            output.push_str(&format!("  {}:\n", file));
+            for entry in entries {
+                // Truncate long content for display
+                let content = if entry.content.len() > 80 {
+                    format!("{}...", &entry.content[..80])
+                } else {
+                    entry.content.clone()
+                };
+                output.push_str(&format!(
+                    "    L{}: {}\n",
+                    entry.line, content.trim()
+                ));
+            }
+        }
+    }
+
+    output
+}
+
+/// Format merged blocks from ripgrep search as compact TOON
+fn format_merged_blocks(query: &str, blocks: &[MergedBlock], search_path: &std::path::Path) -> String {
+    let mut output = String::new();
+    output.push_str("_type: raw_search_results\n");
+    output.push_str(&format!("pattern: \"{}\"\n", query));
+    output.push_str(&format!("blocks: {}\n", blocks.len()));
+
+    let total_matches: usize = blocks.iter().map(|b| b.match_count).sum();
+    output.push_str(&format!("total_matches: {}\n", total_matches));
+
+    if blocks.is_empty() {
+        output.push_str("results: (none)\n");
+    } else {
+        output.push_str("\n");
+        for block in blocks {
+            let file = block.file.strip_prefix(search_path)
+                .unwrap_or(&block.file)
+                .to_string_lossy();
+            output.push_str(&format!("## {} (lines {}-{})\n", file, block.start_line, block.end_line));
+            for line in &block.lines {
+                let marker = if line.is_match { ">" } else { " " };
+                output.push_str(&format!("{}{:4}: {}\n", marker, line.line, line.content));
+            }
+            output.push_str("\n");
+        }
+    }
+
+    output
+}
+
 /// Format module symbols listing as compact TOON
 fn format_module_symbols(module: &str, results: &[SymbolIndexEntry], cache: &CacheDir) -> String {
     let mut output = String::new();
@@ -1154,6 +1505,10 @@ For token-efficient exploration, use the **query-driven workflow**:
 - **analyze_directory**: Analyze entire codebase
 - **analyze_diff**: Compare git branches/commits, or analyze uncommitted changes
 - **list_languages**: Show supported programming languages
+
+### Test Runner (VALIDATE phase)
+- **run_tests**: Run tests with auto-detected framework (pytest, cargo, npm, go). Returns structured results.
+- **detect_tests**: Detect test frameworks in a project. Useful for monorepos.
 
 ### Analyzing Uncommitted Changes
 To review uncommitted changes (staged + unstaged), use:

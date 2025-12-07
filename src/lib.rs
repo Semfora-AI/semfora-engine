@@ -39,6 +39,7 @@
 //! println!("{}", toon);
 //! ```
 
+pub mod analysis;
 pub mod benchmark;
 pub mod cache;
 pub mod cli;
@@ -55,6 +56,7 @@ pub mod risk;
 pub mod schema;
 pub mod search;
 pub mod shard;
+pub mod test_runner;
 pub mod tokens;
 pub mod toon;
 
@@ -83,7 +85,8 @@ pub use git::{
 // Re-export cache module types
 pub use cache::{
     get_cache_base_dir, list_cached_repos, prune_old_caches, CacheDir, CacheMeta,
-    IndexingStatus, LayeredIndexMeta, SourceFileInfo, SymbolIndexEntry,
+    IndexingStatus, LayeredIndexMeta, RipgrepSearchResult, SearchWithFallbackResult,
+    SourceFileInfo, SymbolIndexEntry,
 };
 
 // Re-export shard module types
@@ -112,3 +115,16 @@ pub use ripgrep::{BlockLine, MergedBlock, RipgrepSearcher, SearchMatch, SearchOp
 
 // Re-export drift detection types (Phase 2.5 - SEM-47)
 pub use drift::{count_tracked_files, DriftDetector, DriftStatus, UpdateStrategy};
+
+// Re-export test runner types (North Star - multi-language test harness)
+pub use test_runner::{
+    detect_all_frameworks, detect_framework, run_tests, run_tests_with_framework, TestFailure,
+    TestFramework, TestResults, TestRunOptions,
+};
+
+// Re-export static analysis types
+pub use analysis::{
+    analyze_call_graph, format_analysis_report as format_static_analysis_report,
+    analyze_module, analyze_repo, CallGraphAnalysis, ModuleMetrics, RepoAnalysis,
+    SymbolComplexity,
+};

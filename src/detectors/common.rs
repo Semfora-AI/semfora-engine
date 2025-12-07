@@ -65,6 +65,32 @@ where
     }
 }
 
+/// Visit all nodes tracking control flow nesting depth
+/// The visitor receives (node, nesting_depth) where nesting_depth increments
+/// inside control flow constructs (if, for, while, match, loop, try, switch)
+pub fn visit_with_nesting_depth<F>(node: &Node, mut visitor: F, control_flow_kinds: &[&str])
+where
+    F: FnMut(&Node, usize),
+{
+    visit_with_nesting_recursive(node, &mut visitor, 0, control_flow_kinds);
+}
+
+fn visit_with_nesting_recursive<F>(node: &Node, visitor: &mut F, depth: usize, cf_kinds: &[&str])
+where
+    F: FnMut(&Node, usize),
+{
+    visitor(node, depth);
+
+    // Check if this node increases nesting depth
+    let is_control_flow = cf_kinds.contains(&node.kind());
+    let child_depth = if is_control_flow { depth + 1 } else { depth };
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        visit_with_nesting_recursive(&child, visitor, child_depth, cf_kinds);
+    }
+}
+
 // ============================================================================
 // Semantic Processing
 // ============================================================================

@@ -13,7 +13,7 @@ use crate::tokens::{format_analysis_compact, format_analysis_report, TokenAnalyz
 #[command(author)]
 pub struct Cli {
     /// Path to file to analyze (single file mode)
-    #[arg(value_name = "FILE", required_unless_present_any = ["diff", "commit", "commits", "uncommitted", "cache_info", "cache_clear", "cache_prune", "dir", "benchmark", "list_modules", "get_module", "search_symbols", "list_symbols", "get_symbol", "get_overview"])]
+    #[arg(value_name = "FILE", required_unless_present_any = ["diff", "commit", "commits", "uncommitted", "cache_info", "cache_clear", "cache_prune", "dir", "benchmark", "list_modules", "get_module", "search_symbols", "list_symbols", "get_symbol", "get_overview", "analyze"])]
     pub file: Option<PathBuf>,
 
     /// Output format
@@ -97,6 +97,11 @@ pub struct Cli {
     #[arg(long)]
     pub shard: bool,
 
+    /// Incremental indexing: only re-index changed files since last index
+    /// Requires --shard. Uses git SHA comparison to detect changes.
+    #[arg(long, requires = "shard")]
+    pub incremental: bool,
+
     /// Show cache information
     #[arg(long)]
     pub cache_info: bool,
@@ -156,6 +161,19 @@ pub struct Cli {
     /// Run token efficiency benchmark comparing semantic vs raw file reads
     #[arg(long)]
     pub benchmark: bool,
+
+    // ============================================
+    // Static Analysis Options
+    // ============================================
+
+    /// Run static code analysis on the cached index
+    /// Shows complexity metrics, call graph analysis, and code health report
+    #[arg(long)]
+    pub analyze: bool,
+
+    /// Analyze a specific module only (requires --analyze)
+    #[arg(long, value_name = "MODULE", requires = "analyze")]
+    pub analyze_module: Option<String>,
 }
 
 /// Token analysis output mode

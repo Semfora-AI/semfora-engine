@@ -11,6 +11,7 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 
+use crate::analysis::{calculate_cognitive_complexity, max_nesting_depth};
 use crate::cache::{CacheDir, IndexingStatus, SourceFileInfo};
 use crate::error::Result;
 use crate::schema::{RepoOverview, RiskLevel, SemanticSummary, SymbolId, SymbolInfo, SymbolKind, SCHEMA_VERSION};
@@ -200,6 +201,30 @@ impl ShardWriter {
             if !summary.symbols.is_empty() {
                 for symbol_info in &summary.symbols {
                     let symbol_id = symbol_info.to_symbol_id(&namespace);
+
+                    // Calculate cognitive complexity from control flow
+                    // If symbol has its own control_flow, use that
+                    // Otherwise, filter summary's control_flow_changes by symbol's line range
+                    let (cc, nest) = if !symbol_info.control_flow.is_empty() {
+                        (
+                            calculate_cognitive_complexity(&symbol_info.control_flow),
+                            max_nesting_depth(&symbol_info.control_flow)
+                        )
+                    } else {
+                        // Filter file-level control flow by symbol's line range
+                        let symbol_cf: Vec<_> = summary.control_flow_changes.iter()
+                            .filter(|cf| {
+                                cf.location.line >= symbol_info.start_line
+                                    && cf.location.line <= symbol_info.end_line
+                            })
+                            .cloned()
+                            .collect();
+                        (
+                            calculate_cognitive_complexity(&symbol_cf),
+                            max_nesting_depth(&symbol_cf)
+                        )
+                    };
+
                     let entry = SymbolIndexEntry {
                         symbol: symbol_info.name.clone(),
                         hash: symbol_id.hash.clone(),
@@ -208,6 +233,8 @@ impl ShardWriter {
                         file: summary.file.clone(),
                         lines: format!("{}-{}", symbol_info.start_line, symbol_info.end_line),
                         risk: format!("{:?}", symbol_info.behavioral_risk).to_lowercase(),
+                        cognitive_complexity: cc,
+                        max_nesting: nest,
                     };
 
                     // Write as JSONL (one JSON object per line)
@@ -220,7 +247,10 @@ impl ShardWriter {
                     stats.index_entries += 1;
                 }
             } else if let Some(ref symbol_id) = summary.symbol_id {
-                // Fallback to old single-symbol format
+                // Fallback to old single-symbol format - use summary's control flow
+                let cc = calculate_cognitive_complexity(&summary.control_flow_changes);
+                let nest = max_nesting_depth(&summary.control_flow_changes);
+
                 let entry = SymbolIndexEntry {
                     symbol: summary.symbol.clone().unwrap_or_default(),
                     hash: symbol_id.hash.clone(),
@@ -235,6 +265,8 @@ impl ShardWriter {
                         _ => String::new(),
                     },
                     risk: format!("{:?}", summary.behavioral_risk).to_lowercase(),
+                    cognitive_complexity: cc,
+                    max_nesting: nest,
                 };
 
                 // Write as JSONL (one JSON object per line)
