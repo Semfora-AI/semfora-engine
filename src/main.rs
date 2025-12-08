@@ -84,6 +84,10 @@ fn run() -> semfora_mcp::Result<String> {
         return run_get_overview(&cli);
     }
 
+    if cli.get_call_graph {
+        return run_get_call_graph(&cli);
+    }
+
     // Handle static analysis
     if cli.analyze {
         return run_static_analysis(&cli);
@@ -807,6 +811,39 @@ fn run_get_overview(cli: &Cli) -> semfora_mcp::Result<String> {
 
     let content = fs::read_to_string(&overview_path)?;
     Ok(content)
+}
+
+/// Get the call graph from the cache
+fn run_get_call_graph(_cli: &Cli) -> semfora_mcp::Result<String> {
+    let current_dir = std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
+        path: format!("current directory: {}", e),
+    })?;
+
+    let cache = CacheDir::for_repo(&current_dir)?;
+
+    if !cache.exists() {
+        return Err(McpDiffError::FileNotFound {
+            path: format!("No index found. Run with --shard first to generate index."),
+        });
+    }
+
+    let call_graph_path = cache.call_graph_path();
+
+    if !call_graph_path.exists() {
+        return Err(McpDiffError::FileNotFound {
+            path: format!("Call graph not found in index. The index may need to be regenerated."),
+        });
+    }
+
+    // Load the call graph (parses TOON format into HashMap)
+    let graph = cache.load_call_graph()?;
+
+    // Output as JSON for easy parsing
+    let json = serde_json::to_string(&graph).map_err(|e| McpDiffError::FileNotFound {
+        path: format!("Failed to serialize call graph: {}", e),
+    })?;
+
+    Ok(json)
 }
 
 /// Recursively collect supported files from a directory

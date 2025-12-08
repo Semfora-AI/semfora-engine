@@ -13,7 +13,7 @@ use crate::tokens::{format_analysis_compact, format_analysis_report, TokenAnalyz
 #[command(author)]
 pub struct Cli {
     /// Path to file to analyze (single file mode)
-    #[arg(value_name = "FILE", required_unless_present_any = ["diff", "commit", "commits", "uncommitted", "cache_info", "cache_clear", "cache_prune", "dir", "benchmark", "list_modules", "get_module", "search_symbols", "list_symbols", "get_symbol", "get_overview", "analyze"])]
+    #[arg(value_name = "FILE", required_unless_present_any = ["diff", "commit", "commits", "uncommitted", "cache_info", "cache_clear", "cache_prune", "dir", "benchmark", "list_modules", "get_module", "search_symbols", "list_symbols", "get_symbol", "get_overview", "get_call_graph", "analyze"])]
     pub file: Option<PathBuf>,
 
     /// Output format
@@ -141,6 +141,11 @@ pub struct Cli {
     /// Get the repository overview from the cache
     #[arg(long)]
     pub get_overview: bool,
+
+    /// Get the call graph from the cached index
+    /// Returns JSON mapping symbol hashes to their callees
+    #[arg(long)]
+    pub get_call_graph: bool,
 
     /// Filter results by symbol kind (fn, struct, component, etc.)
     #[arg(long, value_name = "KIND")]
