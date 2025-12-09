@@ -22,6 +22,7 @@ use crate::{
     encode_toon, encode_toon_directory, generate_repo_overview, Lang, MergedBlock,
     SemanticSummary, CacheDir, RipgrepSearchResult, ShardWriter, SymbolIndexEntry,
     test_runner::{self, TestFramework, TestRunOptions},
+    server::ServerState,
 };
 
 // Re-export types for external use
@@ -39,6 +40,8 @@ pub struct McpDiffServer {
     working_dir: Arc<Mutex<PathBuf>>,
     /// Tool router for MCP
     tool_router: ToolRouter<McpDiffServer>,
+    /// Optional persistent server state for live layer updates
+    server_state: Option<Arc<ServerState>>,
 }
 
 impl Default for McpDiffServer {
@@ -55,6 +58,7 @@ impl McpDiffServer {
         Self {
             working_dir: Arc::new(Mutex::new(working_dir)),
             tool_router: Self::tool_router(),
+            server_state: None,
         }
     }
 
@@ -63,7 +67,29 @@ impl McpDiffServer {
         Self {
             working_dir: Arc::new(Mutex::new(working_dir)),
             tool_router: Self::tool_router(),
+            server_state: None,
         }
+    }
+
+    /// Create a new MCP server with persistent server state
+    ///
+    /// This enables live layer updates via FileWatcher and GitPoller.
+    pub fn with_server_state(working_dir: PathBuf, server_state: Arc<ServerState>) -> Self {
+        Self {
+            working_dir: Arc::new(Mutex::new(working_dir)),
+            tool_router: Self::tool_router(),
+            server_state: Some(server_state),
+        }
+    }
+
+    /// Check if persistent server state is enabled
+    pub fn has_server_state(&self) -> bool {
+        self.server_state.is_some()
+    }
+
+    /// Get the server state if available
+    pub fn server_state(&self) -> Option<&Arc<ServerState>> {
+        self.server_state.as_ref()
     }
 
     /// Resolve a path relative to the working directory
@@ -951,6 +977,73 @@ impl McpDiffServer {
             if framework == TestFramework::Unknown {
                 output.push_str("hint: No test framework detected. Ensure project has Cargo.toml, package.json, pyproject.toml, or go.mod.\n");
             }
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    // ========================================================================
+    // Layer Management Tools (SEM-98, SEM-99, SEM-101, SEM-102, SEM-104)
+    // ========================================================================
+
+    #[tool(description = "Get the current status of all semantic layers (Base, Branch, Working, AI). Shows which layers are stale, their update strategies, and symbol counts. Requires persistent server mode.")]
+    async fn get_layer_status(
+        &self,
+        Parameters(_request): Parameters<GetLayerStatusRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let server_state = match &self.server_state {
+            Some(state) => state,
+            None => return Ok(CallToolResult::error(vec![Content::text(
+                "Layer status not available. Server not running in persistent mode.\n\
+                 Hint: Start the MCP server with --persistent flag to enable live layer updates."
+            )])),
+        };
+
+        let status = server_state.status();
+        let mut output = String::new();
+        output.push_str("_type: layer_status\n");
+        output.push_str(&format!("repo_root: {}\n", status.repo_root.display()));
+        output.push_str(&format!("is_running: {}\n", status.is_running));
+        output.push_str(&format!("uptime_secs: {}\n", status.uptime.as_secs()));
+        output.push_str("\nlayers:\n");
+
+        for layer_status in &status.layers {
+            output.push_str(&format!("  - kind: {:?}\n", layer_status.kind));
+            output.push_str(&format!("    is_stale: {}\n", layer_status.is_stale));
+            output.push_str(&format!("    symbol_count: {}\n", layer_status.symbol_count));
+            output.push_str(&format!("    strategy: {:?}\n", layer_status.strategy));
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    #[tool(description = "Check if persistent server mode is enabled. Returns information about the server state and available background services.")]
+    async fn check_server_mode(
+        &self,
+        Parameters(_request): Parameters<CheckServerModeRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut output = String::new();
+        output.push_str("_type: server_mode\n");
+        output.push_str(&format!("persistent_mode: {}\n", self.server_state.is_some()));
+
+        if let Some(state) = &self.server_state {
+            output.push_str("features:\n");
+            output.push_str("  - file_watcher: enabled (Working layer auto-update)\n");
+            output.push_str("  - git_poller: enabled (Base/Branch layer polling)\n");
+            output.push_str("  - thread_safe: enabled (concurrent read access)\n");
+
+            let stats = state.stats();
+            output.push_str("\nindex_stats:\n");
+            output.push_str(&format!("  base_symbols: {}\n", stats.base_symbols));
+            output.push_str(&format!("  branch_symbols: {}\n", stats.branch_symbols));
+            output.push_str(&format!("  working_symbols: {}\n", stats.working_symbols));
+            output.push_str(&format!("  ai_symbols: {}\n", stats.ai_symbols));
+        } else {
+            output.push_str("features:\n");
+            output.push_str("  - file_watcher: disabled\n");
+            output.push_str("  - git_poller: disabled\n");
+            output.push_str("  - thread_safe: n/a\n");
+            output.push_str("\nhint: Start with --persistent to enable live layer updates\n");
         }
 
         Ok(CallToolResult::success(vec![Content::text(output)]))

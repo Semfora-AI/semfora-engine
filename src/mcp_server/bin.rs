@@ -2,14 +2,30 @@
 //!
 //! This binary runs the semfora-mcp MCP server using stdio transport,
 //! allowing AI assistants to call the semantic analysis tools.
+//!
+//! # Live Index Updates (Default)
+//!
+//! The server automatically maintains a fresh index with:
+//! - FileWatcher: Automatically updates Working layer on file changes
+//! - GitPoller: Polls for Base/Branch layer updates (git state changes)
+//! - Thread-safe access: Concurrent reads, exclusive writes
+//!
+//! This ensures the index stays fresh throughout long-running sessions.
+
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Result;
 use rmcp::transport::stdio;
 use rmcp::ServiceExt;
 use tracing_subscriber::{self, EnvFilter};
 
-// Import the MCP server from the library
+// Import the MCP server and persistent server components
 use semfora_mcp::mcp_server::McpDiffServer;
+use semfora_mcp::server::{
+    ServerState, FileWatcher, GitPoller,
+    init_event_emitter, emit_event, ServerStatusEvent,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -23,10 +39,40 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    tracing::info!("Starting semfora-mcp MCP server v{}", env!("CARGO_PKG_VERSION"));
+    // Parse arguments
+    let args: Vec<String> = std::env::args().collect();
+    let repo_path = args.iter()
+        .position(|arg| arg == "--repo" || arg == "-r")
+        .and_then(|i| args.get(i + 1))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-    // Create the server and serve via stdio
-    let server = McpDiffServer::new();
+    tracing::info!("Starting semfora-mcp MCP server v{}", env!("CARGO_PKG_VERSION"));
+    tracing::info!("Repository path: {}", repo_path.display());
+
+    // Always enable event emitter for live index updates
+    init_event_emitter(true);
+
+    // Create persistent server state for live index updates
+    let server_state = Arc::new(ServerState::new(repo_path.clone()));
+    server_state.set_running(true);
+
+    // Start background services for automatic layer updates
+    let file_watcher = FileWatcher::new(repo_path.clone());
+    let git_poller = GitPoller::new(repo_path.clone());
+
+    // Start watchers (they run in background threads)
+    let _watcher_handle = file_watcher.start(Arc::clone(&server_state))?;
+    let _poller_handle = git_poller.start(Arc::clone(&server_state))?;
+
+    tracing::info!("Started FileWatcher and GitPoller for live index updates");
+
+    // Emit server started event
+    emit_event(&ServerStatusEvent::started(&repo_path.to_string_lossy()));
+
+    // Create MCP server with persistent state
+    let server = McpDiffServer::with_server_state(repo_path, server_state);
+
     let service = server.serve(stdio()).await?;
 
     tracing::info!("MCP server initialized, waiting for requests...");

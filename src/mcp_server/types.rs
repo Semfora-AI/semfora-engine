@@ -337,6 +337,22 @@ pub struct DetectTestsRequest {
 }
 
 // ============================================================================
+// Layer Management Request Types (SEM-98, SEM-99, SEM-101, SEM-102, SEM-104)
+// ============================================================================
+
+/// Request to get layer status
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetLayerStatusRequest {
+    // No parameters needed - returns status of all layers
+}
+
+/// Request to check server mode
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CheckServerModeRequest {
+    // No parameters needed - returns server mode info
+}
+
+// ============================================================================
 // Re-exports
 // ============================================================================
 

@@ -55,6 +55,7 @@ pub mod ripgrep;
 pub mod risk;
 pub mod schema;
 pub mod search;
+pub mod server;
 pub mod shard;
 pub mod test_runner;
 pub mod tokens;
@@ -127,4 +128,10 @@ pub use analysis::{
     analyze_call_graph, format_analysis_report as format_static_analysis_report,
     analyze_module, analyze_repo, CallGraphAnalysis, ModuleMetrics, RepoAnalysis,
     SymbolComplexity,
+};
+
+// Re-export server types (SEM-98, SEM-99, SEM-101, SEM-102, SEM-104)
+pub use server::{
+    FileWatcher, GitPoller, LayerStatus, LayerSynchronizer, LayerUpdateStats,
+    ServerState, ServerStatus,
 };

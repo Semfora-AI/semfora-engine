@@ -72,6 +72,13 @@ grep-matcher = "0.1"
 ignore = "0.4"
 ordered-float = "4.2"
 
+# Thread-safe layer management (SEM-99)
+parking_lot = "0.12"
+
+# File system watching (SEM-101)
+notify = "7.0"
+notify-debouncer-mini = "0.5"
+
 [build-dependencies]
 cc = "1.0"
 
