@@ -571,13 +571,22 @@ fn run_benchmark(dir_path: &Path) -> semfora_mcp::Result<String> {
 // Shard Query Commands
 // ============================================================================
 
+/// Get the repository directory - uses --dir if provided, falls back to CWD.
+/// This is critical for CLI tools that spawn semfora-mcp from a different directory
+/// than the target repository (e.g., Tauri apps running from their own cwd).
+fn get_repo_dir(cli: &Cli) -> semfora_mcp::Result<PathBuf> {
+    match &cli.dir {
+        Some(dir) => Ok(dir.clone()),
+        None => std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
+            path: format!("current directory: {}", e),
+        }),
+    }
+}
+
 /// List all modules in the cached index
 fn run_list_modules(cli: &Cli) -> semfora_mcp::Result<String> {
-    let current_dir = std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
-        path: format!("current directory: {}", e),
-    })?;
-
-    let cache = CacheDir::for_repo(&current_dir)?;
+    let repo_dir = get_repo_dir(cli)?;
+    let cache = CacheDir::for_repo(&repo_dir)?;
 
     if !cache.exists() {
         return Err(McpDiffError::FileNotFound {
@@ -610,11 +619,8 @@ fn run_list_modules(cli: &Cli) -> semfora_mcp::Result<String> {
 
 /// Get a specific module's content from the cache
 fn run_get_module(cli: &Cli, module_name: &str) -> semfora_mcp::Result<String> {
-    let current_dir = std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
-        path: format!("current directory: {}", e),
-    })?;
-
-    let cache = CacheDir::for_repo(&current_dir)?;
+    let repo_dir = get_repo_dir(cli)?;
+    let cache = CacheDir::for_repo(&repo_dir)?;
 
     if !cache.exists() {
         return Err(McpDiffError::FileNotFound {
@@ -636,11 +642,8 @@ fn run_get_module(cli: &Cli, module_name: &str) -> semfora_mcp::Result<String> {
 
 /// Search for symbols by name in the cached index (with ripgrep fallback)
 fn run_search_symbols(cli: &Cli, query: &str) -> semfora_mcp::Result<String> {
-    let current_dir = std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
-        path: format!("current directory: {}", e),
-    })?;
-
-    let cache = CacheDir::for_repo(&current_dir)?;
+    let repo_dir = get_repo_dir(cli)?;
+    let cache = CacheDir::for_repo(&repo_dir)?;
 
     // Use fallback-aware search that automatically uses ripgrep when no index exists
     let search_result = cache.search_symbols_with_fallback(
@@ -716,11 +719,8 @@ fn run_search_symbols(cli: &Cli, query: &str) -> semfora_mcp::Result<String> {
 
 /// List all symbols in a module from the cached index
 fn run_list_module_symbols(cli: &Cli, module_name: &str) -> semfora_mcp::Result<String> {
-    let current_dir = std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
-        path: format!("current directory: {}", e),
-    })?;
-
-    let cache = CacheDir::for_repo(&current_dir)?;
+    let repo_dir = get_repo_dir(cli)?;
+    let cache = CacheDir::for_repo(&repo_dir)?;
 
     if !cache.has_symbol_index() {
         return Err(McpDiffError::FileNotFound {
@@ -763,11 +763,8 @@ fn run_list_module_symbols(cli: &Cli, module_name: &str) -> semfora_mcp::Result<
 
 /// Get a specific symbol's details by hash
 fn run_get_symbol(cli: &Cli, symbol_hash: &str) -> semfora_mcp::Result<String> {
-    let current_dir = std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
-        path: format!("current directory: {}", e),
-    })?;
-
-    let cache = CacheDir::for_repo(&current_dir)?;
+    let repo_dir = get_repo_dir(cli)?;
+    let cache = CacheDir::for_repo(&repo_dir)?;
 
     if !cache.exists() {
         return Err(McpDiffError::FileNotFound {
@@ -789,11 +786,8 @@ fn run_get_symbol(cli: &Cli, symbol_hash: &str) -> semfora_mcp::Result<String> {
 
 /// Get the repository overview from the cache
 fn run_get_overview(cli: &Cli) -> semfora_mcp::Result<String> {
-    let current_dir = std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
-        path: format!("current directory: {}", e),
-    })?;
-
-    let cache = CacheDir::for_repo(&current_dir)?;
+    let repo_dir = get_repo_dir(cli)?;
+    let cache = CacheDir::for_repo(&repo_dir)?;
 
     if !cache.exists() {
         return Err(McpDiffError::FileNotFound {
@@ -814,12 +808,9 @@ fn run_get_overview(cli: &Cli) -> semfora_mcp::Result<String> {
 }
 
 /// Get the call graph from the cache
-fn run_get_call_graph(_cli: &Cli) -> semfora_mcp::Result<String> {
-    let current_dir = std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
-        path: format!("current directory: {}", e),
-    })?;
-
-    let cache = CacheDir::for_repo(&current_dir)?;
+fn run_get_call_graph(cli: &Cli) -> semfora_mcp::Result<String> {
+    let repo_dir = get_repo_dir(cli)?;
+    let cache = CacheDir::for_repo(&repo_dir)?;
 
     if !cache.exists() {
         return Err(McpDiffError::FileNotFound {
