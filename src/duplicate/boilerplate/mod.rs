@@ -100,6 +100,116 @@ pub enum BoilerplateCategory {
     RustSerde,
 
     // =========================================================================
+    // Python Patterns (TODO: Implement in python.rs)
+    // =========================================================================
+    // TODO(SEM-XX): Python boilerplate detection - HIGH PRIORITY
+    // - PytestFixture: pytest fixtures (@pytest.fixture)
+    // - PythonDataclass: dataclass boilerplate (@dataclass)
+    // - FastAPIRoute: FastAPI route handlers (@app.get, @app.post)
+    // - PydanticModel: Pydantic model definitions (BaseModel subclasses)
+    // - DjangoView: Django view classes and functions
+    // - FlaskRoute: Flask route handlers (@app.route)
+
+    // =========================================================================
+    // Go Patterns (TODO: Implement in go.rs)
+    // =========================================================================
+    // TODO(SEM-XX): Go boilerplate detection - HIGH PRIORITY
+    // - GoHTTPHandler: HTTP handler functions (http.HandlerFunc pattern)
+    // - GoMiddleware: Middleware functions (func(next http.Handler) http.Handler)
+    // - GoErrorWrap: Error wrapping patterns (fmt.Errorf with %w)
+    // - GoBuilder: Builder struct patterns (With* methods returning *T)
+    // - GoInterface: Interface implementation boilerplate
+    // - GoTestHelper: Test helper functions (t.Helper())
+
+    // =========================================================================
+    // Java Patterns (TODO: Implement in java.rs)
+    // =========================================================================
+    // TODO(SEM-XX): Java boilerplate detection - HIGH PRIORITY
+    // - SpringController: @RestController/@Controller methods
+    // - SpringService: @Service class patterns
+    // - LombokGenerated: @Getter/@Setter/@Builder generated methods
+    // - JavaDTO: Data Transfer Object patterns (getters/setters/toString)
+    // - JpaEntity: @Entity boilerplate (getters/setters/equals/hashCode)
+    // - JunitTest: @Test methods with standard assertions
+
+    // =========================================================================
+    // C/C++ Patterns (TODO: Implement in c_family.rs)
+    // =========================================================================
+    // TODO(SEM-XX): C/C++ boilerplate detection - MEDIUM PRIORITY
+    // - CppGetter: Getter methods (getX() const)
+    // - CppSetter: Setter methods (setX(value))
+    // - CppRAII: RAII wrapper patterns (constructor/destructor pairs)
+    // - CppCopyMove: Copy/move constructor/assignment boilerplate
+    // - CppOperator: Operator overload boilerplate (==, !=, <, <<)
+    // - HeaderGuard: #ifndef/#define/#endif patterns
+
+    // =========================================================================
+    // C# Patterns (TODO: Implement in csharp.rs) - HIGHEST PRIORITY
+    // =========================================================================
+    // TODO(SEM-XX): C# boilerplate detection - HIGHEST PRIORITY (Enterprise adoption)
+    // ASP.NET Core:
+    // - AspNetController: Controller action methods
+    // - AspNetMinimalApi: Minimal API endpoint patterns (app.MapGet, app.MapPost)
+    // - AspNetMiddleware: Middleware registration patterns
+    // - AspNetDI: Dependency injection registrations (services.AddScoped, etc.)
+    // Entity Framework:
+    // - EFDbContext: DbContext boilerplate
+    // - EFDbSet: DbSet property declarations
+    // - EFFluentApi: Fluent API schema configuration
+    // - EFMigration: Migration patterns
+    // Testing:
+    // - XUnitTest: xUnit test methods ([Fact], [Theory])
+    // - NUnitTest: NUnit test methods ([Test], [TestCase])
+    // - MoqSetup: Moq mock setup patterns
+    // LINQ:
+    // - LinqChain: Select/Where/GroupBy boilerplate chains
+    // - LinqProjection: Projection-only pipelines
+    // Unity (optional):
+    // - UnityLifecycle: MonoBehaviour lifecycle methods (Start, Update, etc.)
+    // - UnitySerializedField: [SerializeField] patterns
+    // - UnityScriptableObject: ScriptableObject configs
+
+    // =========================================================================
+    // Kotlin Patterns (TODO: Implement in kotlin.rs) - HIGH PRIORITY
+    // =========================================================================
+    // TODO(SEM-XX): Kotlin boilerplate detection - HIGH PRIORITY (Android + JVM)
+    // - KotlinDataClass: data class copy/component boilerplate
+    // - SpringBootKotlin: Spring Boot annotation patterns
+    // - KtorRouting: Ktor routing block patterns
+    // - AndroidViewModel: ViewModel + LiveData boilerplate
+    // - CoroutineScope: Coroutine scope wrapper patterns
+    // - KotlinSerialization: @Serializable adapters
+
+    // =========================================================================
+    // Swift Patterns (TODO: Implement in swift.rs) - MEDIUM PRIORITY
+    // =========================================================================
+    // TODO(SEM-XX): Swift boilerplate detection - MEDIUM PRIORITY (iOS/macOS)
+    // - SwiftUIView: SwiftUI View body boilerplate
+    // - SwiftProtocol: Protocol conformance patterns
+    // - SwiftPropertyWrapper: @State, @Binding, @Published patterns
+    // - SwiftCodable: Codable implementation boilerplate
+    // - SwiftAsync: async/await task tree patterns
+
+    // =========================================================================
+    // PHP Patterns (TODO: Implement in php.rs) - MEDIUM PRIORITY
+    // =========================================================================
+    // TODO(SEM-XX): PHP boilerplate detection - MEDIUM PRIORITY (High ROI for Laravel)
+    // - LaravelController: Laravel controller methods
+    // - LaravelServiceProvider: Service provider patterns
+    // - LaravelMiddleware: Middleware handle() patterns
+    // - EloquentModel: Eloquent model boilerplate ($fillable, relations)
+    // - BladeComponent: Blade component patterns
+
+    // =========================================================================
+    // Ruby Patterns (TODO: Implement in ruby.rs) - LOW PRIORITY
+    // =========================================================================
+    // TODO(SEM-XX): Ruby boilerplate detection - LOW PRIORITY (Rails-focused)
+    // - ActiveRecordModel: ActiveRecord model patterns
+    // - RailsController: Rails controller action patterns
+    // - RSpecTest: RSpec describe/it scaffolding
+    // - RubyDSL: DSL-heavy config patterns
+
+    // =========================================================================
     // Cross-Language Patterns
     // =========================================================================
     /// Custom user-defined boilerplate category

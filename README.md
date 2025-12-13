@@ -106,6 +106,119 @@ See [CLI Reference](docs/cli.md) for full documentation.
 |--------|-----------|------------------------|
 | **Vue SFC** | `.vue` | Extracts `<script>` or `<script setup>` section; detects `lang` attribute (ts/tsx/js); parses with appropriate grammar |
 
+## Duplicate Detection & Boilerplate Patterns
+
+Semfora Engine includes semantic duplicate detection that identifies similar functions while filtering out expected boilerplate patterns.
+
+### Current Boilerplate Coverage
+
+| Language | Patterns | Status |
+|----------|----------|--------|
+| **JavaScript/TypeScript** | 14 patterns | Full support |
+| **Rust** | 13 patterns | Full support |
+| **Python** | 0 patterns | Planned |
+| **Go** | 0 patterns | Planned |
+| **Java** | 0 patterns | Planned |
+| **C/C++** | 0 patterns | Planned |
+
+### JavaScript/TypeScript Patterns (14)
+- ReactQuery, ReactHook, EventHandler, ApiRoute, TestSetup, TypeGuard
+- ConfigExport, ReduxPattern, ValidationSchema, TestMock, NextjsDataFetching
+- ReactWrapper, ClassicReduxReducer, ApiWrapper
+
+### Rust Patterns (13)
+- RustTraitImpl, RustBuilder, RustGetter, RustSetter, RustConstructor
+- RustConversion, RustDerived, RustErrorFrom, RustIterator, RustDeref
+- RustDrop, RustTest, RustSerde
+
+### Planned Boilerplate Patterns
+
+| Language | Planned Patterns | Priority |
+|----------|------------------|----------|
+| **Python** | pytest fixtures, dataclasses, FastAPI/Flask routes, Pydantic models, Django views | High |
+| **Go** | HTTP handlers, middleware, error wrapping, builder structs, test helpers | High |
+| **Java** | Spring controllers/services, Lombok-generated, DTOs, JPA entities, JUnit tests | High |
+| **C/C++** | Getters/setters, RAII wrappers, copy/move boilerplate, operator overloads | Medium |
+| **C#** | ASP.NET controllers, EF Core, xUnit/NUnit, LINQ chains, Unity lifecycle | Highest |
+| **Kotlin** | Data classes, Spring Boot, Ktor routing, Android ViewModel, coroutines | High |
+
+## Language Roadmap
+
+Prioritized based on enterprise adoption potential and architectural fit with Semfora's orchestrator-first design.
+
+### Priority 1: C# and .NET Ecosystem (HIGHEST)
+
+C# is the single biggest gap relative to enterprise, game-dev, and backend workloads.
+
+| Item | Details |
+|------|---------|
+| **Extensions** | `.cs` |
+| **Parser** | `tree-sitter-c-sharp` (mature, widely used) |
+| **Semantic Targets** | Classes, records, structs, interfaces, enums |
+| **Control Flow** | if, switch, await, try/catch, pattern matching |
+| **Modifiers** | async, unsafe, partial, static |
+
+**Framework Patterns:**
+- **ASP.NET Core**: Controllers, Minimal API endpoints, middleware, DI registrations
+- **Entity Framework**: DbContext, DbSet, Fluent API, migrations
+- **Testing**: xUnit/NUnit tests, Moq mocks
+- **LINQ**: Select/Where/GroupBy chains
+- **Unity** (optional): MonoBehaviour lifecycle, SerializeField patterns
+
+**Strategic Value**: Positions Semfora uniquely against Claude Code and GitHub Copilot Chat, which struggle with large .NET repos, LINQ-heavy reasoning, and EF Core side effects.
+
+### Priority 2: Kotlin
+
+Complements Java support for Android and modern JVM coverage.
+
+| Item | Details |
+|------|---------|
+| **Extensions** | `.kt`, `.kts` |
+| **Parser** | `tree-sitter-kotlin` (already integrated) |
+| **Targets** | Data classes, coroutines, extension functions, sealed classes |
+
+**Framework Patterns**: Spring Boot, Ktor routing, Android ViewModel + LiveData, coroutine scopes
+
+### Priority 3: Swift
+
+Unlocks iOS/macOS and SwiftUI ecosystems.
+
+| Item | Details |
+|------|---------|
+| **Extensions** | `.swift` |
+| **Parser** | `tree-sitter-swift` |
+| **Targets** | Struct vs class semantics, protocol conformance, property wrappers, async/await |
+
+### Priority 4: PHP
+
+High ROI due to extreme boilerplate density in Laravel/WordPress codebases.
+
+| Item | Details |
+|------|---------|
+| **Extensions** | `.php` |
+| **Parser** | `tree-sitter-php` |
+| **Targets** | Laravel controllers, service providers, middleware, Eloquent models |
+
+### Priority 5: Ruby
+
+Smaller but relevant via Rails ecosystem.
+
+| Item | Details |
+|------|---------|
+| **Extensions** | `.rb` |
+| **Parser** | `tree-sitter-ruby` |
+| **Targets** | ActiveRecord models, Rails controllers, RSpec scaffolding |
+
+### Priority 6: Infra Languages (Non-Semantic)
+
+Structural parsing for repo comprehension without full semantic analysis.
+
+| Language | Extensions | Mode |
+|----------|------------|------|
+| PowerShell | `.ps1` | Parser-only |
+| Dockerfile | `Dockerfile` | Structural |
+| Makefile | `Makefile` | Structural |
+
 ## Known Unsupported Formats
 
 These formats were identified in test repositories but are not currently supported:
@@ -116,11 +229,8 @@ These formats were identified in test repositories but are not currently support
 | **MDX** | `.mdx` | 861 | Documentation format (Markdown + JSX) |
 | **AsciiDoc** | `.adoc` | 690 | Documentation format |
 | **Protocol Buffers** | `.proto`, `.pb` | 550 | `devgen-tree-sitter-protobuf` requires tree-sitter 0.21 (incompatible) |
-| **Ruby** | `.rb` | varies | No tree-sitter grammar added yet |
-| **Swift** | `.swift` | varies | No tree-sitter grammar added yet |
-| **PHP** | `.php` | varies | No tree-sitter grammar added yet |
-| **Scala** | `.scala` | varies | No tree-sitter grammar added yet |
-| **Elixir** | `.ex`, `.exs` | varies | No tree-sitter grammar added yet |
+| **Scala** | `.scala` | varies | Complex AST, only if enterprise demand |
+| **Elixir** | `.ex`, `.exs` | varies | Lower priority |
 
 *Counts from typescript-eslint, terraform, spring-framework, and prometheus test repositories.
 
