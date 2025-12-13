@@ -377,6 +377,76 @@
             color: var(--accent);
             font-weight: bold;
         }
+        /* Connected Repos Cards */
+        .repo-card {
+            background: var(--bg);
+            border-radius: 6px;
+            padding: 12px;
+            border-left: 3px solid var(--accent);
+        }
+        .repo-card.active {
+            border-left-color: var(--success);
+        }
+        .repo-card-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 8px;
+        }
+        .repo-card-name {
+            font-size: 14px;
+            font-weight: bold;
+            color: var(--text);
+        }
+        .repo-card-path {
+            font-size: 10px;
+            color: var(--text-dim);
+            word-break: break-all;
+            margin-bottom: 6px;
+        }
+        .repo-card-stats {
+            display: flex;
+            gap: 12px;
+            font-size: 11px;
+        }
+        .repo-card-stat {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .repo-card-stat .label {
+            color: var(--text-dim);
+        }
+        .repo-card-stat .value {
+            color: var(--accent);
+            font-weight: bold;
+        }
+        .repo-card-indexes {
+            margin-top: 8px;
+            padding-top: 8px;
+            border-top: 1px solid rgba(255,255,255,0.1);
+        }
+        .repo-card-index {
+            display: inline-block;
+            background: var(--primary);
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 10px;
+            margin-right: 5px;
+            margin-bottom: 4px;
+        }
+        .repo-card-index.ready {
+            background: rgba(74, 222, 128, 0.2);
+            color: var(--success);
+        }
+        /* Event log entry types */
+        .log-entry.event {
+            color: #c084fc;
+        }
+        .log-entry.event-repo {
+            border-left: 3px solid var(--accent);
+            padding-left: 8px;
+        }
     </style>
 </head>
 <body>
@@ -396,49 +466,39 @@
                             Disconnected
                         </span>
                     </div>
-                    <div style="display: flex; gap: 10px;">
-                        <input type="text" id="repoPath" value="/home/kadajett/Dev/next.js" placeholder="Repository path" style="flex: 1;">
+                    <div style="display: flex; gap: 10px; align-items: center;">
+                        <select id="repoPresets" onchange="selectRepoPreset()">
+                            <option value="">-- Quick Connect --</option>
+                            <option value="/home/kadajett/Dev/Semfora_org/pokemon-test">Pokemon Test</option>
+                            <option value="/home/kadajett/Dev/next.js">Next.js</option>
+                            <option value="/home/kadajett/Dev/semfora-test-repos/repos/angular-realworld">Angular Realworld</option>
+                        </select>
+                        <input type="text" id="repoPath" value="/home/kadajett/Dev/Semfora_org/pokemon-test" placeholder="Repository path" style="flex: 1;">
                         <button id="connectRepoBtn" onclick="connectToRepo()" disabled>Connect to Repo</button>
                     </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Repo Info Panel -->
-        <div class="row">
-            <div class="col">
-                <div class="panel">
-                    <h2>Repository Info</h2>
-                    <div class="info-grid" id="repoInfo">
-                        <div class="info-item">
-                            <div class="info-label">Status</div>
-                            <div class="info-value" id="repoStatus">Not connected</div>
-                        </div>
+                    <div style="margin-top: 10px;">
+                        <button id="connectAllBtn" onclick="connectAllRepos()" disabled style="background: #16a34a;">Connect All 3 Repos</button>
+                        <span id="multiRepoStatus" style="margin-left: 10px; font-size: 12px; color: var(--text-dim);"></span>
                     </div>
                 </div>
             </div>
         </div>
 
-        <div class="row">
-            <!-- Worktrees -->
-            <div class="col">
-                <div class="panel">
-                    <h2>Worktrees</h2>
-                    <ul class="worktree-list" id="worktreeList">
-                        <li>No worktrees loaded</li>
-                    </ul>
-                </div>
+        <!-- Connected Repos Panel -->
+        <div class="panel">
+            <h2>Connected Repositories (<span id="repoCount">0</span>)</h2>
+            <div id="connectedRepos" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(350px, 1fr)); gap: 15px;">
+                <div class="no-data">No repositories connected yet. Use "Connect All 3 Repos" or connect individually.</div>
             </div>
+        </div>
 
-            <!-- Indexes -->
-            <div class="col">
-                <div class="panel">
-                    <h2>Indexes</h2>
-                    <ul class="index-list" id="indexList">
-                        <li>No indexes loaded</li>
-                    </ul>
-                </div>
+        <!-- Event Log Panel -->
+        <div class="panel">
+            <h2>Event Stream <span id="eventCount" style="font-size: 11px; color: var(--text-dim);">(0 events)</span></h2>
+            <div class="log" id="eventLog" style="height: 150px;">
+                <div class="no-data">Events will appear here when files change...</div>
             </div>
+            <button onclick="clearEventLog()" style="margin-top: 10px; background: var(--primary);">Clear Events</button>
         </div>
 
         <!-- Queries Panel -->
@@ -547,6 +607,8 @@
         let ws = null;
         let queryId = 1;
         let subscriptions = [];
+        let connectedRepos = {}; // repo_id -> connection info
+        let eventCount = 0;
 
         function log(message, type = 'info') {
             const logEl = document.getElementById('log');
@@ -562,18 +624,188 @@
             const status = document.getElementById('connectionStatus');
             const connectBtn = document.getElementById('connectBtn');
             const connectRepoBtn = document.getElementById('connectRepoBtn');
+            const connectAllBtn = document.getElementById('connectAllBtn');
 
             if (connected) {
                 status.className = 'status connected';
                 status.innerHTML = '<span class="dot"></span>Connected';
                 connectBtn.textContent = 'Disconnect';
                 connectRepoBtn.disabled = false;
+                connectAllBtn.disabled = false;
             } else {
                 status.className = 'status disconnected';
                 status.innerHTML = '<span class="dot"></span>Disconnected';
                 connectBtn.textContent = 'Connect';
                 connectRepoBtn.disabled = true;
+                connectAllBtn.disabled = true;
             }
+        }
+
+        function selectRepoPreset() {
+            const select = document.getElementById('repoPresets');
+            const input = document.getElementById('repoPath');
+            if (select.value) {
+                input.value = select.value;
+            }
+        }
+
+        const DEFAULT_REPOS = [
+            '/home/kadajett/Dev/Semfora_org/pokemon-test',
+            '/home/kadajett/Dev/next.js',
+            '/home/kadajett/Dev/semfora-test-repos/repos/angular-realworld'
+        ];
+
+        let multiRepoConnectIndex = 0;
+
+        function connectAllRepos() {
+            multiRepoConnectIndex = 0;
+            document.getElementById('multiRepoStatus').textContent = 'Connecting to repos...';
+            connectNextRepo();
+        }
+
+        function connectNextRepo() {
+            if (multiRepoConnectIndex < DEFAULT_REPOS.length) {
+                const repo = DEFAULT_REPOS[multiRepoConnectIndex];
+                document.getElementById('multiRepoStatus').textContent =
+                    `Connecting ${multiRepoConnectIndex + 1}/${DEFAULT_REPOS.length}: ${repo.split('/').pop()}...`;
+                send({ type: 'connect', directory: repo });
+                multiRepoConnectIndex++;
+                // Wait a bit for the connection to complete before connecting the next one
+                setTimeout(connectNextRepo, 500);
+            } else {
+                document.getElementById('multiRepoStatus').textContent =
+                    `All ${DEFAULT_REPOS.length} repos connected!`;
+            }
+        }
+
+        // Auto-subscribe to all events after WebSocket connects
+        function autoSubscribeToEvents() {
+            send({ type: 'subscribe', events: ['*'] });
+            log('Auto-subscribed to all events (*)', 'info');
+        }
+
+        // Render all connected repos as cards
+        function renderConnectedRepos() {
+            const container = document.getElementById('connectedRepos');
+            const repoIds = Object.keys(connectedRepos);
+            document.getElementById('repoCount').textContent = repoIds.length;
+
+            if (repoIds.length === 0) {
+                container.innerHTML = '<div class="no-data">No repositories connected yet. Use "Connect All 3 Repos" or connect individually.</div>';
+                return;
+            }
+
+            container.innerHTML = repoIds.map(repoId => {
+                const repo = connectedRepos[repoId];
+                const name = repo.base_repo_path.split('/').pop();
+                const totalSymbols = (repo.indexes || []).reduce((sum, idx) => sum + (idx.symbol_count || 0), 0);
+                const worktreeCount = (repo.worktrees || []).length;
+                const indexCount = (repo.indexes || []).length;
+
+                return `
+                    <div class="repo-card active" data-repo-id="${repoId}">
+                        <div class="repo-card-header">
+                            <span class="repo-card-name">${escapeHtml(name)}</span>
+                            <span class="status connected" style="font-size: 10px; padding: 2px 8px;">
+                                <span class="dot"></span>
+                                ${repo.client_id}
+                            </span>
+                        </div>
+                        <div class="repo-card-path">${escapeHtml(repo.base_repo_path)}</div>
+                        <div class="repo-card-stats">
+                            <div class="repo-card-stat">
+                                <span class="label">Branch:</span>
+                                <span class="value">${repo.base_branch || 'unknown'}</span>
+                            </div>
+                            <div class="repo-card-stat">
+                                <span class="label">Worktrees:</span>
+                                <span class="value">${worktreeCount}</span>
+                            </div>
+                            <div class="repo-card-stat">
+                                <span class="label">Total Symbols:</span>
+                                <span class="value">${totalSymbols.toLocaleString()}</span>
+                            </div>
+                        </div>
+                        <div class="repo-card-indexes">
+                            ${(repo.indexes || []).map(idx => `
+                                <span class="repo-card-index ${idx.status === 'ready' ? 'ready' : ''}"
+                                      title="${idx.scope}: ${idx.symbol_count} symbols">
+                                    ${idx.scope} (${idx.symbol_count})
+                                </span>
+                            `).join('')}
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        // Add event to the event log
+        function logEvent(eventName, payload, repoPath) {
+            eventCount++;
+            document.getElementById('eventCount').textContent = `(${eventCount} events)`;
+
+            const logEl = document.getElementById('eventLog');
+            // Clear "no data" message if present
+            if (logEl.querySelector('.no-data')) {
+                logEl.innerHTML = '';
+            }
+
+            const entry = document.createElement('div');
+            entry.className = 'log-entry event event-repo';
+            const time = new Date().toLocaleTimeString();
+            const repoName = repoPath ? repoPath.split('/').pop() : 'unknown';
+
+            // Parse payload for file info if available
+            let details = '';
+            if (payload) {
+                if (payload.files && payload.files.length > 0) {
+                    details = ` - ${payload.files.length} file(s): ${payload.files.slice(0, 3).join(', ')}${payload.files.length > 3 ? '...' : ''}`;
+                } else if (payload.file) {
+                    details = ` - ${payload.file}`;
+                } else if (typeof payload === 'string') {
+                    details = ` - ${payload}`;
+                }
+            }
+
+            entry.innerHTML = `<span class="log-timestamp">${time}</span><strong>[${escapeHtml(repoName)}]</strong> ${escapeHtml(eventName)}${details}`;
+            logEl.appendChild(entry);
+            logEl.scrollTop = logEl.scrollHeight;
+        }
+
+        function clearEventLog() {
+            eventCount = 0;
+            document.getElementById('eventCount').textContent = '(0 events)';
+            document.getElementById('eventLog').innerHTML = '<div class="no-data">Events will appear here when files change...</div>';
+        }
+
+        // Try to find the repo path from event data by matching scope or path fragments
+        function findRepoPathForEvent(msg) {
+            // Try to match by scope name in the event
+            const scope = msg.payload?.scope || msg.scope;
+            if (scope) {
+                for (const repo of Object.values(connectedRepos)) {
+                    for (const idx of (repo.indexes || [])) {
+                        if (idx.scope === scope) {
+                            return repo.base_repo_path;
+                        }
+                    }
+                }
+            }
+            // Try to match by path in the event payload
+            const filePath = msg.payload?.file || msg.payload?.path;
+            if (filePath) {
+                for (const repo of Object.values(connectedRepos)) {
+                    if (filePath.startsWith(repo.base_repo_path)) {
+                        return repo.base_repo_path;
+                    }
+                }
+            }
+            // Return first repo if only one connected
+            const repos = Object.values(connectedRepos);
+            if (repos.length === 1) {
+                return repos[0].base_repo_path;
+            }
+            return null;
         }
 
         function toggleConnection() {
@@ -593,6 +825,8 @@
             ws.onopen = () => {
                 log('WebSocket connected', 'received');
                 updateStatus(true);
+                // Auto-subscribe to all events
+                setTimeout(autoSubscribeToEvents, 100);
             };
 
             ws.onmessage = (event) => {
@@ -607,7 +841,11 @@
             ws.onclose = () => {
                 log('WebSocket disconnected', 'info');
                 updateStatus(false);
-                document.getElementById('repoStatus').textContent = 'Not connected';
+                // Clear connected repos on disconnect
+                connectedRepos = {};
+                renderConnectedRepos();
+                subscriptions = [];
+                updateSubscriptions();
             };
         }
 
@@ -638,13 +876,12 @@
                         resultKeys: msg.result ? Object.keys(msg.result) : null,
                         result: msg.result
                     });
-                    // Check if this is an index info response
+                    // Check if this is an index info response - update all repo cards
                     if (msg.result && msg.result.indexes) {
-                        updateIndexList(msg.result.indexes);
-                        updateCallGraphScopeSelector(msg.result.indexes);
-                        if (msg.result.worktrees) {
-                            updateWorktreeList(msg.result.worktrees);
-                        }
+                        // Update the call graph scope selector with all indexes
+                        const allIndexes = Object.values(connectedRepos).flatMap(r => r.indexes || []);
+                        const combinedIndexes = [...allIndexes, ...msg.result.indexes];
+                        updateCallGraphScopeSelector(combinedIndexes);
                     }
                     displayResults(msg.result);
                     break;
@@ -654,11 +891,15 @@
                     break;
                 case 'event':
                     console.log('%c[EVENT]', 'color: #c084fc; font-weight: bold', msg);
-                    log(`Event: ${msg.name}`, 'received');
+                    // Log event to the event stream panel
+                    const repoPath = msg.repo_path || msg.payload?.repo_path || findRepoPathForEvent(msg);
+                    logEvent(msg.name, msg.payload, repoPath);
                     displayResults({ event: msg.name, payload: msg.payload });
                     // Auto-refresh indexes when layer_updated event received
                     if (msg.name && msg.name.includes('layer_updated')) {
                         refreshIndexes();
+                        // Update repo cards when indexes change
+                        setTimeout(renderConnectedRepos, 200);
                     }
                     break;
                 case 'subscribed':
@@ -684,61 +925,15 @@
         }
 
         function displayConnectionInfo(info) {
-            document.getElementById('repoStatus').textContent = 'Connected';
+            // Store the repo connection info
+            connectedRepos[info.repo_id] = info;
+            renderConnectedRepos();
 
-            const infoGrid = document.getElementById('repoInfo');
-            infoGrid.innerHTML = `
-                <div class="info-item">
-                    <div class="info-label">Client ID</div>
-                    <div class="info-value">${info.client_id}</div>
-                </div>
-                <div class="info-item">
-                    <div class="info-label">Repo ID</div>
-                    <div class="info-value">${info.repo_id}</div>
-                </div>
-                <div class="info-item">
-                    <div class="info-label">Path</div>
-                    <div class="info-value">${info.base_repo_path}</div>
-                </div>
-                <div class="info-item">
-                    <div class="info-label">Base Branch</div>
-                    <div class="info-value">${info.base_branch}</div>
-                </div>
-                <div class="info-item">
-                    <div class="info-label">Feature Branch</div>
-                    <div class="info-value">${info.feature_branch || 'none'}</div>
-                </div>
-            `;
+            // Also update the call graph scope selector with all indexes across all repos
+            const allIndexes = Object.values(connectedRepos).flatMap(r => r.indexes || []);
+            updateCallGraphScopeSelector(allIndexes);
 
-            // Update worktrees
-            const wtList = document.getElementById('worktreeList');
-            if (info.worktrees && info.worktrees.length > 0) {
-                wtList.innerHTML = info.worktrees.map(wt => `
-                    <li>
-                        <strong>${wt.branch}</strong>
-                        ${wt.is_semfora ? '<span class="badge semfora">semfora</span>' : ''}
-                        <br><small>${wt.path}</small>
-                    </li>
-                `).join('');
-            } else {
-                wtList.innerHTML = '<li>No worktrees</li>';
-            }
-
-            // Update indexes
-            const idxList = document.getElementById('indexList');
-            if (info.indexes && info.indexes.length > 0) {
-                idxList.innerHTML = info.indexes.map(idx => `
-                    <li>
-                        <strong>${idx.scope}</strong>
-                        <span class="badge ready">${idx.status}</span>
-                        <br><small>${idx.symbol_count} symbols</small>
-                    </li>
-                `).join('');
-                // Also update the call graph scope selector
-                updateCallGraphScopeSelector(info.indexes);
-            } else {
-                idxList.innerHTML = '<li>No indexes (run semfora-mcp --shard)</li>';
-            }
+            log(`Connected to repo: ${info.base_repo_path.split('/').pop()} (${info.repo_id})`, 'info');
         }
 
         function displayResults(result) {
@@ -746,35 +941,7 @@
             resultsEl.innerHTML = `<pre>${JSON.stringify(result, null, 2)}</pre>`;
         }
 
-        function updateIndexList(indexes) {
-            const idxList = document.getElementById('indexList');
-            if (indexes && indexes.length > 0) {
-                idxList.innerHTML = indexes.map(idx => `
-                    <li>
-                        <strong>${idx.scope}</strong>
-                        <span class="badge ready">${idx.status}</span>
-                        <br><small>${idx.symbol_count} symbols</small>
-                    </li>
-                `).join('');
-            } else {
-                idxList.innerHTML = '<li>No indexes (run semfora-mcp --shard)</li>';
-            }
-        }
-
-        function updateWorktreeList(worktrees) {
-            const wtList = document.getElementById('worktreeList');
-            if (worktrees && worktrees.length > 0) {
-                wtList.innerHTML = worktrees.map(wt => `
-                    <li>
-                        <strong>${wt.branch}</strong>
-                        ${wt.is_semfora ? '<span class="badge semfora">semfora</span>' : ''}
-                        <br><small>${wt.path}</small>
-                    </li>
-                `).join('');
-            } else {
-                wtList.innerHTML = '<li>No worktrees</li>';
-            }
-        }
+        // updateIndexList and updateWorktreeList removed - now handled by renderConnectedRepos()
 
         function connectToRepo() {
             const path = document.getElementById('repoPath').value;

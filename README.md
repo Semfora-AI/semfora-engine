@@ -26,24 +26,24 @@ The project builds three binaries:
 
 | Binary | Purpose |
 |--------|---------|
-| `semfora-mcp` | CLI for semantic analysis, indexing, and querying |
-| `semfora-mcp-server` | MCP server for AI agent integration |
+| `semfora-engine` | CLI for semantic analysis, indexing, and querying |
+| `semfora-engine-server` | MCP server for AI agent integration |
 | `semfora-daemon` | WebSocket daemon for real-time updates |
 
 ## Usage
 
 ```bash
 # Analyze a single file
-semfora-mcp path/to/file.rs
+semfora-engine path/to/file.rs
 
 # Analyze a directory and create sharded index
-semfora-mcp --dir . --shard
+semfora-engine --dir . --shard
 
 # Query the index
-semfora-mcp --search-symbols "authenticate"
+semfora-engine --search-symbols "authenticate"
 
 # Start MCP server (for AI agents)
-semfora-mcp-server
+semfora-engine-server
 
 # Start WebSocket daemon (for real-time updates)
 semfora-daemon
@@ -128,7 +128,7 @@ These formats were identified in test repositories but are not currently support
 
 ```
 src/
-├── main.rs              # CLI entry point (semfora-mcp binary)
+├── main.rs              # CLI entry point (semfora-engine binary)
 ├── cli.rs               # CLI argument definitions
 ├── lib.rs               # Library exports
 ├── lang.rs              # Language detection from file extensions
@@ -155,7 +155,7 @@ src/
 │   ├── config.rs
 │   ├── grammar.rs       # AST node mappings per language
 │   └── generic.rs       # Generic extraction using grammars
-├── mcp_server/          # MCP server (semfora-mcp-server binary)
+├── mcp_server/          # MCP server (semfora-engine-server binary)
 │   ├── mod.rs           # MCP tool handlers
 │   └── bin.rs           # Server entry point
 └── socket_server/       # WebSocket daemon (semfora-daemon binary)
@@ -178,10 +178,11 @@ src/
 
 | Document | Description |
 |----------|-------------|
-| [Features](docs/features.md) | Incremental indexing, layered indexes, risk assessment, and more |
+| [Quick Start](docs/quickstart.md) | Get up and running in 5 minutes |
 | [CLI Reference](docs/cli.md) | Complete CLI usage, flags, and examples |
+| [Features](docs/features.md) | Incremental indexing, layered indexes, risk assessment |
 | [WebSocket Daemon](docs/websocket-daemon.md) | Real-time updates, protocol, and query methods |
-| [Query-Driven Architecture](docs/query-driven-architecture.md) | Token-efficient querying patterns |
+| [Adding Languages](docs/adding-languages.md) | Guide for adding new language support |
 | [Engineering](docs/engineering.md) | Implementation details and status |
 
 ## License
