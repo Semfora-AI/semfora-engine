@@ -687,10 +687,10 @@ fn encode_symbol_shard_from_info(
         lines.push(format!("control_flow[{}]: {}", cf.len(), cf.join(",")));
     }
 
-    // Calls (use file-level calls for now, filtered by line range would be ideal)
-    // For now, include all file-level calls as context
-    if !summary.calls.is_empty() {
-        let meaningful_calls: Vec<_> = summary
+    // Calls - use symbol-level calls (symbol_info.calls) which are correctly attributed
+    // during extraction via find_containing_symbol_by_line
+    if !symbol_info.calls.is_empty() {
+        let meaningful_calls: Vec<_> = symbol_info
             .calls
             .iter()
             .filter(|c| is_meaningful_call(&c.name, c.object.as_deref()))

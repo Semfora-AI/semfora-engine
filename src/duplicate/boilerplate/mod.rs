@@ -64,6 +64,10 @@ pub enum BoilerplateCategory {
     NextjsDataFetching,
     /// React wrapper components (React.memo, forwardRef)
     ReactWrapper,
+    /// Classic Redux reducer (switch on action.type - pre-RTK)
+    ClassicReduxReducer,
+    /// Axios/Fetch API wrapper (thin HTTP wrappers)
+    ApiWrapper,
 
     // =========================================================================
     // Rust Patterns
@@ -119,6 +123,8 @@ impl BoilerplateCategory {
             BoilerplateCategory::TestMock => "Test mock (Jest/Vitest)",
             BoilerplateCategory::NextjsDataFetching => "Next.js data fetching function",
             BoilerplateCategory::ReactWrapper => "React wrapper (memo/forwardRef)",
+            BoilerplateCategory::ClassicReduxReducer => "Classic Redux reducer (pre-RTK)",
+            BoilerplateCategory::ApiWrapper => "API wrapper (thin HTTP wrapper)",
             // Rust
             BoilerplateCategory::RustTraitImpl => "Rust trait implementation",
             BoilerplateCategory::RustBuilder => "Rust builder pattern method",
@@ -153,7 +159,9 @@ impl BoilerplateCategory {
             | BoilerplateCategory::ValidationSchema
             | BoilerplateCategory::TestMock
             | BoilerplateCategory::NextjsDataFetching
-            | BoilerplateCategory::ReactWrapper => Some(Lang::JavaScript),
+            | BoilerplateCategory::ReactWrapper
+            | BoilerplateCategory::ClassicReduxReducer
+            | BoilerplateCategory::ApiWrapper => Some(Lang::JavaScript),
             // Rust patterns
             BoilerplateCategory::RustTraitImpl
             | BoilerplateCategory::RustBuilder
@@ -698,6 +706,7 @@ mod tests {
     use super::*;
     use crate::schema::{Call, ControlFlowChange, ControlFlowKind, Location};
 
+    /// Create a symbol with simple call names (no object)
     pub fn make_symbol(name: &str, calls: Vec<&str>, control_flow: usize) -> SymbolInfo {
         SymbolInfo {
             name: name.to_string(),
@@ -706,6 +715,38 @@ mod tests {
                 .map(|n| Call {
                     name: n.to_string(),
                     object: None,
+                    is_awaited: false,
+                    in_try: false,
+                    is_hook: false,
+                    is_io: false,
+                    location: Location::default(),
+                })
+                .collect(),
+            control_flow: (0..control_flow)
+                .map(|_| ControlFlowChange {
+                    kind: ControlFlowKind::If,
+                    location: Location::default(),
+                    nesting_depth: 0,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Create a symbol with calls that have object (for API wrapper tests)
+    /// Format: ("method", Some("object")) or ("method", None)
+    pub fn make_symbol_with_calls(
+        name: &str,
+        calls: Vec<(&str, Option<&str>)>,
+        control_flow: usize,
+    ) -> SymbolInfo {
+        SymbolInfo {
+            name: name.to_string(),
+            calls: calls
+                .into_iter()
+                .map(|(n, obj)| Call {
+                    name: n.to_string(),
+                    object: obj.map(|s| s.to_string()),
                     is_awaited: false,
                     in_try: false,
                     is_hook: false,

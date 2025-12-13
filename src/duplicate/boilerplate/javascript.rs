@@ -17,6 +17,8 @@
 //! - **Test Mocks**: jest.mock, vi.mock, spyOn
 //! - **Next.js Data**: getServerSideProps, getStaticProps, generateMetadata
 //! - **React Wrappers**: React.memo, forwardRef
+//! - **Classic Redux**: switch (action.type) reducers (pre-RTK)
+//! - **API Wrappers**: Thin axios/fetch wrappers
 
 use super::{BoilerplateCategory, PatternMatcher};
 use crate::lang::Lang;
@@ -94,6 +96,18 @@ pub static PATTERNS: &[PatternMatcher] = &[
         category: BoilerplateCategory::ReactWrapper,
         languages: &[Lang::JavaScript],
         detector: is_react_wrapper,
+        enabled_by_default: true,
+    },
+    PatternMatcher {
+        category: BoilerplateCategory::ClassicReduxReducer,
+        languages: &[Lang::JavaScript],
+        detector: is_classic_redux_reducer,
+        enabled_by_default: true,
+    },
+    PatternMatcher {
+        category: BoilerplateCategory::ApiWrapper,
+        languages: &[Lang::JavaScript],
+        detector: is_api_wrapper,
         enabled_by_default: true,
     },
 ];
@@ -402,6 +416,95 @@ pub fn is_react_wrapper(info: &SymbolInfo) -> bool {
 
     // Wrapper with minimal additional logic (wrapper call + maybe 1-2 other calls like displayName)
     info.calls.len() <= wrapper_calls.len() + 2 && info.control_flow.len() <= 1
+}
+
+/// Classic Redux reducer: switch on action.type pattern (pre-RTK)
+///
+/// Detects classic Redux reducers that use switch statements to handle actions.
+/// These are boilerplate by design - each case handles a specific action type.
+pub fn is_classic_redux_reducer(info: &SymbolInfo) -> bool {
+    let name_lower = info.name.to_lowercase();
+
+    // Must have "reducer" in the name
+    if !name_lower.contains("reducer") {
+        return false;
+    }
+
+    // Classic reducers have substantial control flow (switch cases)
+    // Each case in a switch typically gets counted as control flow
+    // Minimum 2 cases (including default) to be a real reducer
+    if info.control_flow.len() < 2 {
+        return false;
+    }
+
+    // Classic reducers have minimal explicit calls - they mostly spread state
+    // Allow some calls for utility functions like structuredClone, etc.
+    info.calls.len() <= 3
+}
+
+/// API wrapper: thin HTTP wrappers around axios/fetch
+///
+/// Detects simple API wrapper functions that are just thin wrappers around HTTP calls.
+/// These are intentionally similar and shouldn't be flagged as problematic duplicates.
+/// Pattern: fetch*/get*/create*/update*/delete* with single axios/fetch call
+pub fn is_api_wrapper(info: &SymbolInfo) -> bool {
+    // Check for HTTP client calls
+    // Note: calls are structured as {name: "get", object: Some("axios")} not "axios.get"
+    let http_calls: Vec<_> = info
+        .calls
+        .iter()
+        .filter(|c| {
+            let name = c.name.as_str();
+            let obj = c.object.as_deref().unwrap_or("");
+
+            // Check if it's an HTTP method call on an HTTP client object
+            let is_http_method = matches!(name, "get" | "post" | "put" | "patch" | "delete" | "request" | "head" | "options");
+            let is_http_client = matches!(obj, "axios" | "http" | "api" | "client" | "fetch" | "request" | "ky" | "got" | "superagent");
+
+            // Axios/fetch/HTTP library patterns
+            is_http_method && is_http_client
+                // Direct fetch call (no object)
+                || name == "fetch" && obj.is_empty()
+                // Axios instance call patterns
+                || name == "axios" && obj.is_empty()
+                // Full qualified patterns (legacy support)
+                || name.starts_with("axios.")
+                || name.starts_with("http.")
+                || name.starts_with("api.")
+                || name.starts_with("client.")
+        })
+        .collect();
+
+    if http_calls.is_empty() {
+        return false;
+    }
+
+    // API wrapper name patterns
+    let name_lower = info.name.to_lowercase();
+    let is_api_name = name_lower.starts_with("fetch")
+        || name_lower.starts_with("get")
+        || name_lower.starts_with("create")
+        || name_lower.starts_with("update")
+        || name_lower.starts_with("delete")
+        || name_lower.starts_with("post")
+        || name_lower.starts_with("patch")
+        || name_lower.starts_with("put")
+        || name_lower.starts_with("upload")
+        || name_lower.starts_with("download")
+        || name_lower.starts_with("search")
+        || name_lower.starts_with("save")
+        || name_lower.starts_with("load")
+        || name_lower.ends_with("api")
+        || name_lower.ends_with("request")
+        || name_lower.ends_with("service");
+
+    if !is_api_name {
+        return false;
+    }
+
+    // Thin wrapper: HTTP call + minimal additional logic
+    // Allow a few extra calls for headers, params, etc.
+    info.calls.len() <= http_calls.len() + 2 && info.control_flow.len() <= 1
 }
 
 #[cfg(test)]
@@ -903,5 +1006,185 @@ mod tests {
     fn test_react_wrapper_not_wrapper() {
         let symbol = make_symbol("Component", vec!["useState", "useEffect"], 1);
         assert!(!is_react_wrapper(&symbol));
+    }
+
+    // =========================================================================
+    // Classic Redux Reducer Tests
+    // =========================================================================
+
+    #[test]
+    fn test_classic_reducer_basic() {
+        // Reducer with switch cases (each case = 1 control flow)
+        let symbol = make_symbol("userReducer", vec![], 5);
+        assert!(is_classic_redux_reducer(&symbol));
+    }
+
+    #[test]
+    fn test_classic_reducer_global() {
+        let symbol = make_symbol("globalReducer", vec![], 6);
+        assert!(is_classic_redux_reducer(&symbol));
+    }
+
+    #[test]
+    fn test_classic_reducer_with_utility_call() {
+        // Reducer that calls a utility function
+        let symbol = make_symbol("todoReducer", vec!["structuredClone"], 4);
+        assert!(is_classic_redux_reducer(&symbol));
+    }
+
+    #[test]
+    fn test_classic_reducer_root() {
+        let symbol = make_symbol("rootReducer", vec!["combineReducers"], 2);
+        assert!(is_classic_redux_reducer(&symbol));
+    }
+
+    #[test]
+    fn test_classic_reducer_not_reducer_name() {
+        let symbol = make_symbol("handleAction", vec![], 5);
+        assert!(!is_classic_redux_reducer(&symbol));
+    }
+
+    #[test]
+    fn test_classic_reducer_too_few_cases() {
+        // Only 1 case - not really a reducer
+        let symbol = make_symbol("simpleReducer", vec![], 1);
+        assert!(!is_classic_redux_reducer(&symbol));
+    }
+
+    #[test]
+    fn test_classic_reducer_too_many_calls() {
+        // Too complex - more like a function with business logic
+        let symbol = make_symbol(
+            "complexReducer",
+            vec!["fetch", "process", "validate", "transform"],
+            5,
+        );
+        assert!(!is_classic_redux_reducer(&symbol));
+    }
+
+    // =========================================================================
+    // API Wrapper Tests
+    // =========================================================================
+
+    use crate::duplicate::boilerplate::tests::make_symbol_with_calls;
+
+    #[test]
+    fn test_api_wrapper_axios_get() {
+        // Call structure: {name: "get", object: Some("axios")}
+        let symbol = make_symbol_with_calls("fetchUser", vec![("get", Some("axios"))], 0);
+        assert!(is_api_wrapper(&symbol));
+    }
+
+    #[test]
+    fn test_api_wrapper_axios_post() {
+        let symbol = make_symbol_with_calls("createUser", vec![("post", Some("axios"))], 0);
+        assert!(is_api_wrapper(&symbol));
+    }
+
+    #[test]
+    fn test_api_wrapper_axios_patch() {
+        let symbol = make_symbol_with_calls("updateUser", vec![("patch", Some("axios"))], 0);
+        assert!(is_api_wrapper(&symbol));
+    }
+
+    #[test]
+    fn test_api_wrapper_axios_delete() {
+        let symbol = make_symbol_with_calls("deleteUser", vec![("delete", Some("axios"))], 0);
+        assert!(is_api_wrapper(&symbol));
+    }
+
+    #[test]
+    fn test_api_wrapper_fetch() {
+        // fetch() is called without an object
+        let symbol = make_symbol_with_calls("getProducts", vec![("fetch", None)], 0);
+        assert!(is_api_wrapper(&symbol));
+    }
+
+    #[test]
+    fn test_api_wrapper_with_headers() {
+        // API call with header configuration
+        let symbol = make_symbol_with_calls(
+            "fetchWithAuth",
+            vec![("get", Some("axios")), ("getToken", None)],
+            0,
+        );
+        assert!(is_api_wrapper(&symbol));
+    }
+
+    #[test]
+    fn test_api_wrapper_upload() {
+        let symbol = make_symbol_with_calls("uploadFile", vec![("put", Some("axios"))], 0);
+        assert!(is_api_wrapper(&symbol));
+    }
+
+    #[test]
+    fn test_api_wrapper_search() {
+        let symbol = make_symbol_with_calls("searchUsers", vec![("get", Some("axios"))], 0);
+        assert!(is_api_wrapper(&symbol));
+    }
+
+    #[test]
+    fn test_api_wrapper_service_suffix() {
+        let symbol = make_symbol_with_calls("userService", vec![("get", Some("axios"))], 0);
+        assert!(is_api_wrapper(&symbol));
+    }
+
+    #[test]
+    fn test_api_wrapper_request_suffix() {
+        let symbol = make_symbol_with_calls("authRequest", vec![("fetch", None)], 0);
+        assert!(is_api_wrapper(&symbol));
+    }
+
+    #[test]
+    fn test_api_wrapper_http_client() {
+        let symbol = make_symbol_with_calls("getUsers", vec![("get", Some("http"))], 0);
+        assert!(is_api_wrapper(&symbol));
+    }
+
+    #[test]
+    fn test_api_wrapper_client() {
+        let symbol = make_symbol_with_calls("fetchData", vec![("get", Some("client"))], 0);
+        assert!(is_api_wrapper(&symbol));
+    }
+
+    #[test]
+    fn test_api_wrapper_too_complex() {
+        // Too much business logic - not just a wrapper
+        let symbol = make_symbol_with_calls(
+            "fetchAndProcess",
+            vec![
+                ("get", Some("axios")),
+                ("validate", None),
+                ("transform", None),
+                ("cache", None),
+                ("notify", None),
+            ],
+            2,
+        );
+        assert!(!is_api_wrapper(&symbol));
+    }
+
+    #[test]
+    fn test_api_wrapper_no_http_call() {
+        let symbol = make_symbol_with_calls(
+            "fetchData",
+            vec![("process", None), ("transform", None)],
+            0,
+        );
+        assert!(!is_api_wrapper(&symbol));
+    }
+
+    #[test]
+    fn test_api_wrapper_wrong_name() {
+        // Has axios call but not an API-like name
+        let symbol = make_symbol_with_calls("processData", vec![("get", Some("axios"))], 0);
+        assert!(!is_api_wrapper(&symbol));
+    }
+
+    #[test]
+    fn test_api_wrapper_with_control_flow() {
+        // Too much control flow - has business logic
+        let symbol = make_symbol_with_calls("fetchUser", vec![("get", Some("axios"))], 2);
+        assert!(!is_api_wrapper(&symbol));
     }
 }

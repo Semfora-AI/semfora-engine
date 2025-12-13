@@ -846,7 +846,11 @@ const JS_CONTROL_FLOW_KINDS: &[&str] = &[
 ];
 
 /// Extract control flow patterns with nesting depth for cognitive complexity
+/// and attribute them to symbols based on line ranges
 pub fn extract_control_flow(summary: &mut SemanticSummary, root: &Node) {
+    // Collect all control flow items with their line numbers
+    let mut all_cf: Vec<(ControlFlowChange, usize)> = Vec::new();
+
     visit_with_nesting_depth(root, |node, depth| {
         let kind = match node.kind() {
             "if_statement" => Some(ControlFlowKind::If),
@@ -859,13 +863,39 @@ pub fn extract_control_flow(summary: &mut SemanticSummary, root: &Node) {
 
         if let Some(k) = kind {
             let nesting = if depth > 0 { depth - 1 } else { 0 };
-            summary.control_flow_changes.push(ControlFlowChange {
+            let line = node.start_position().row + 1;
+            let cf = ControlFlowChange {
                 kind: k,
-                location: Location::new(node.start_position().row + 1, node.start_position().column),
+                location: Location::new(line, node.start_position().column),
                 nesting_depth: nesting,
-            });
+            };
+            all_cf.push((cf, line));
         }
     }, JS_CONTROL_FLOW_KINDS);
+
+    // Attribute control flow to symbols based on line ranges
+    let mut cf_by_symbol: std::collections::HashMap<usize, Vec<ControlFlowChange>> =
+        std::collections::HashMap::new();
+    let mut file_level_cf: Vec<ControlFlowChange> = Vec::new();
+
+    for (cf, line) in all_cf {
+        if let Some(symbol_idx) = find_containing_symbol_by_line(line, &summary.symbols) {
+            cf_by_symbol.entry(symbol_idx).or_default().push(cf);
+        } else {
+            // Control flow is at file level (not inside any symbol)
+            file_level_cf.push(cf);
+        }
+    }
+
+    // Assign control flow to their respective symbols
+    for (symbol_idx, cf_items) in cf_by_symbol {
+        if symbol_idx < summary.symbols.len() {
+            summary.symbols[symbol_idx].control_flow = cf_items;
+        }
+    }
+
+    // Keep file-level control flow for backward compatibility
+    summary.control_flow_changes = file_level_cf;
 }
 
 // =============================================================================
@@ -1293,6 +1323,92 @@ export default defineComponent({
         assert!(
             all_calls.iter().any(|c| *c == "ref" || *c == "onMounted" || *c == "defineComponent"),
             "Should detect composition API calls like ref/onMounted"
+        );
+    }
+
+    // ==========================================================================
+    // One-liner Arrow Function Tests (Bug regression tests)
+    // ==========================================================================
+
+    /// Test one-liner arrow functions with axios calls have calls attributed
+    /// This is a regression test for the bug where one-liner arrow functions
+    /// like `export const fetchUser = (id) => axios.get(\`/user/${id}\`)` were
+    /// not having their calls extracted.
+    #[test]
+    fn test_oneliner_arrow_axios_calls() {
+        let source = r#"import axios from 'axios';
+
+export const fetchUserByUsername = (username: string): Promise<any> => axios.get(`/v1/user/${username}`);
+
+export const fetchUserVotes = (accessToken: string, username: string, skip: number): Promise<any> => axios.get(
+    `/v1/entry/votes-of/${username}`, {
+        headers: { 'Authorization': `Bearer ${accessToken}` },
+        params: { skip }
+    });
+"#;
+        let tree = parse_source(source, Lang::TypeScript);
+        let path = PathBuf::from("/test/api.ts");
+        let summary = extract(&path, source, &tree, Lang::TypeScript).unwrap();
+
+        // Should have 2 symbols
+        assert!(summary.symbols.len() >= 2, "Should have at least 2 symbols, got {}", summary.symbols.len());
+
+        // Find fetchUserByUsername
+        let fetch_user = summary.symbols.iter().find(|s| s.name == "fetchUserByUsername");
+        assert!(fetch_user.is_some(), "Should find fetchUserByUsername symbol");
+        let fetch_user = fetch_user.unwrap();
+
+        // Debug output
+        eprintln!("fetchUserByUsername: lines {}-{}, calls: {:?}",
+            fetch_user.start_line, fetch_user.end_line, fetch_user.calls);
+        eprintln!("file-level calls: {:?}", summary.calls.iter().map(|c| &c.name).collect::<Vec<_>>());
+
+        // This is the key assertion - the axios.get call should be attributed to the symbol
+        assert!(
+            !fetch_user.calls.is_empty(),
+            "fetchUserByUsername should have calls attributed (axios.get), but has none. \
+            Symbol lines: {}-{}, file-level calls: {:?}",
+            fetch_user.start_line, fetch_user.end_line,
+            summary.calls.iter().map(|c| format!("{}@{}", c.name, c.location.line)).collect::<Vec<_>>()
+        );
+
+        let call_names: Vec<_> = fetch_user.calls.iter().map(|c| c.name.as_str()).collect();
+        assert!(call_names.contains(&"get"), "Should have 'get' call (from axios.get)");
+    }
+
+    /// Test multi-line arrow functions with switch statements have control flow
+    #[test]
+    fn test_arrow_function_control_flow() {
+        let source = r#"
+export const globalReducer = (state = initialState, action: GlobalActions) => {
+    switch (action.type) {
+        case SET_ACCESS_TOKEN:
+            return { ...state, accessToken: action.payload };
+        case SET_USER_INFO:
+            return { ...state, userInfo: action.payload };
+        case CLEAR_USER:
+            return initialState;
+        default:
+            return state;
+    }
+};
+"#;
+        let tree = parse_source(source, Lang::TypeScript);
+        let path = PathBuf::from("/test/reducer.ts");
+        let summary = extract(&path, source, &tree, Lang::TypeScript).unwrap();
+
+        // Find globalReducer
+        let reducer = summary.symbols.iter().find(|s| s.name == "globalReducer");
+        assert!(reducer.is_some(), "Should find globalReducer symbol");
+        let reducer = reducer.unwrap();
+
+        eprintln!("globalReducer: lines {}-{}, control_flow: {:?}",
+            reducer.start_line, reducer.end_line, reducer.control_flow);
+
+        // The reducer should have control flow (switch statement)
+        assert!(
+            !reducer.control_flow.is_empty(),
+            "globalReducer should have control flow (switch statement), but has none"
         );
     }
 }
