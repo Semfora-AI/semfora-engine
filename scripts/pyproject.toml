@@ -1,0 +1,9 @@
+[project]
+name = "semfora-perf"
+version = "0.1.0"
+description = "Performance testing suite for Semfora Engine"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.uv]
+dev-dependencies = []
