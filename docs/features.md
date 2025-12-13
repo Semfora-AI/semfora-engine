@@ -39,13 +39,13 @@ Based on drift magnitude, the engine selects the optimal strategy:
 
 ```bash
 # Initial index
-semfora-mcp --dir . --shard
+semfora-engine --dir . --shard
 
 # Incremental update (only changed files)
-semfora-mcp --dir . --shard --incremental
+semfora-engine --dir . --shard --incremental
 
 # Force full rebuild
-semfora-mcp --dir . --shard  # Without --incremental
+semfora-engine --dir . --shard  # Without --incremental
 ```
 
 ### MCP Usage
@@ -172,7 +172,7 @@ Every symbol is assigned a risk level based on its characteristics:
 
 ```bash
 # CLI: Find high-risk symbols
-semfora-mcp --search-symbols "handle" --risk high
+semfora-engine --search-symbols "handle" --risk high
 
 # MCP tool
 { "name": "search_symbols", "arguments": { "query": "handle", "risk": "high" } }
@@ -234,10 +234,10 @@ Semfora includes a built-in test runner that auto-detects frameworks:
 
 ```bash
 # Auto-detect and run tests
-semfora-mcp --run-tests
+semfora-engine --run-tests
 
 # Filter tests by pattern
-semfora-mcp --run-tests --filter "auth"
+semfora-engine --run-tests --filter "auth"
 ```
 
 ### MCP Usage
@@ -302,10 +302,10 @@ TOON (Token-Oriented Object Notation) is a compressed format optimized for AI to
 
 ```bash
 # TOON (default)
-semfora-mcp file.rs --format toon
+semfora-engine file.rs --format toon
 
 # JSON
-semfora-mcp file.rs --format json
+semfora-engine file.rs --format json
 ```
 
 ### Token Analysis
@@ -313,7 +313,7 @@ semfora-mcp file.rs --format json
 Compare token efficiency:
 
 ```bash
-semfora-mcp file.rs --analyze-tokens full --compare-compact
+semfora-engine file.rs --analyze-tokens full --compare-compact
 ```
 
 ---
@@ -346,10 +346,10 @@ After incremental updates, graphs are automatically regenerated to stay in sync 
 
 ## Cache Structure
 
-Indexes are stored in `~/.cache/semfora-mcp/{repo_hash}/`:
+Indexes are stored in `~/.cache/semfora-engine/{repo_hash}/`:
 
 ```
-~/.cache/semfora-mcp/abc123/
+~/.cache/semfora-engine/abc123/
 ├── repo_overview.toon      # High-level architecture summary
 ├── modules/                # Per-module symbol data
 │   ├── api.toon
@@ -370,13 +370,13 @@ Indexes are stored in `~/.cache/semfora-mcp/{repo_hash}/`:
 
 ```bash
 # Show cache info
-semfora-mcp --cache-info
+semfora-engine --cache-info
 
 # Clear cache for current directory
-semfora-mcp --cache-clear
+semfora-engine --cache-clear
 
 # Prune old caches
-semfora-mcp --cache-prune 30  # Remove caches older than 30 days
+semfora-engine --cache-prune 30  # Remove caches older than 30 days
 ```
 
 ---

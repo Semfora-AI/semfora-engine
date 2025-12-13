@@ -1,4 +1,4 @@
-# Semfora-MCP Engineering Requirements Document
+# Semfora Engine Engineering Requirements Document
 
 > Companion document to `plan.md` - Implementation specifications for Phase 1
 
@@ -20,7 +20,7 @@
 | Library exports | `src/lib.rs` | Done | Public API |
 | Entry point | `src/main.rs` | Done | Full CLI |
 | **MCP Server** | `src/mcp_server/` | Done | stdio transport, 4 tools |
-| **MCP Binary** | `src/mcp_server/bin.rs` | Done | `semfora-mcp-server` binary |
+| **MCP Binary** | `src/mcp_server/bin.rs` | Done | `semfora-engine-server` binary |
 | **Python ADK** | `semfora-adk/` | Done | Model B orchestration, toon-format parser |
 
 ### Language Extraction Support
@@ -82,7 +82,7 @@
 
 This document provides concrete engineering specifications for implementing the MCP Semantic Diff & TOON Encoder Phase 1 MVP as described in `plan.md`.
 
-**Goal**: Build `semfora-mcp`, a Rust CLI that parses source files using tree-sitter, extracts semantic information, and outputs TOON-formatted summaries.
+**Goal**: Build `semfora-engine`, a Rust CLI that parses source files using tree-sitter, extracts semantic information, and outputs TOON-formatted summaries.
 
 ---
 
@@ -92,7 +92,7 @@ This document provides concrete engineering specifications for implementing the 
 
 ```toml
 [package]
-name = "semfora-mcp"
+name = "semfora-engine"
 version = "0.1.0"
 edition = "2021"
 
@@ -156,7 +156,7 @@ The `toon-format` library (v0.9.0b1, 792 tests, 91% coverage) handles all TOON p
 ## 3. Project Structure
 
 ```
-semfora-mcp/
+semfora-engine/
 ├── src/
 │   ├── main.rs              # CLI entry point
 │   ├── lib.rs               # Library exports
@@ -366,7 +366,7 @@ use clap::Parser;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "semfora-mcp")]
+#[command(name = "semfora-engine")]
 #[command(about = "Semantic code analyzer with TOON output")]
 #[command(version)]
 pub struct Cli {

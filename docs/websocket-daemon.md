@@ -456,18 +456,18 @@ Control logging with the `RUST_LOG` environment variable:
 semfora-daemon
 
 # Debug logging
-RUST_LOG=semfora_mcp=debug semfora-daemon
+RUST_LOG=semfora_engine=debug semfora-daemon
 
 # Trace logging (very verbose)
-RUST_LOG=semfora_mcp=trace semfora-daemon
+RUST_LOG=semfora_engine=trace semfora-daemon
 ```
 
 ## Cache Locations
 
-Indexes are stored in `~/.cache/semfora-mcp/`:
+Indexes are stored in `~/.cache/semfora-engine/`:
 
-- Base repository: `~/.cache/semfora-mcp/{repo_hash}/`
-- Worktrees: `~/.cache/semfora-mcp/{worktree_path_hash}/`
+- Base repository: `~/.cache/semfora-engine/{repo_hash}/`
+- Worktrees: `~/.cache/semfora-engine/{worktree_path_hash}/`
 
 Each cache contains:
 - `repo_overview.toon` - Repository overview

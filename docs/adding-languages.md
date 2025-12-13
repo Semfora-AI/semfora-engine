@@ -176,10 +176,10 @@ tree-sitter parse example.rb
 # )
 ```
 
-Or use the `--print-ast` flag in semfora-mcp:
+Or use the `--print-ast` flag in semfora-engine:
 
 ```bash
-semfora-mcp example.rb --print-ast
+semfora-engine example.rb --print-ast
 ```
 
 ## Step 4: Wire Up the Dispatcher

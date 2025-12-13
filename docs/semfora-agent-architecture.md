@@ -10,7 +10,7 @@ This document describes the architecture for `semfora-cli`, a terminal-based cod
 
 **Phase 1 (Foundation) COMPLETED:**
 - `semfora-adk` Python package created with uv
-- CLI subprocess integration with `semfora-mcp` binary
+- CLI subprocess integration with `semfora-engine` binary
 - TOON parsing via `toon-format` library (v0.9.0b1)
 - Model B architecture implemented (orchestrator controls tools, Claude reasons)
 - 31 tests passing
@@ -43,7 +43,7 @@ This document covers **local tooling we fully control**:
 
 The Semfora Engine provides two binaries built from the `semfora-engine` (Rust) project:
 
-### 1. `semfora-mcp`
+### 1. `semfora-engine`
 
 A command-line tool for developers that can:
 - Analyze individual files
@@ -55,7 +55,7 @@ A command-line tool for developers that can:
 
 This binary is designed for local developer workflows and debugging. It is **not** used by any ADK or CLI agent.
 
-### 2. `semfora-mcp-server`
+### 2. `semfora-engine-server`
 
 A headless binary that exposes the full MCP toolset over the MCP protocol.
 This server is used by:
@@ -163,7 +163,7 @@ The orchestrator makes ALL tool decisions. Claude API only receives curated sema
 
 ## Layer 1: Semantic Engine (Existing)
 
-The existing Semfora/semfora-mcp codebase provides the semantic foundation. **No changes required to this layer.**
+The existing Semfora/semfora-engine codebase provides the semantic foundation. **No changes required to this layer.**
 
 ### Available MCP Tools (16 total)
 
@@ -874,7 +874,7 @@ get_symbol:      1 symbol only    # Always bounded
    - toon-format library for TOON parsing
 
 2. ✅ Implemented `SemforaTools`
-   - CLI subprocess wrapper for semfora-mcp binary
+   - CLI subprocess wrapper for semfora-engine binary
    - TOON output parsing via toon-format library
    - Core tools: analyze_file, analyze_directory, get_repo_overview, analyze_diff
    - Error handling with fallback parsing

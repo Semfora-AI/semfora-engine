@@ -113,9 +113,9 @@ semfora/
 
 ---
 
-## Developer CLI Tools (`semfora-mcp`)
+## Developer CLI Tools (`semfora-engine`)
 
-The Semfora Engine ships with a developer-facing CLI binary named `semfora-mcp` that provides:
+The Semfora Engine ships with a developer-facing CLI binary named `semfora-engine` that provides:
 
 - File analysis
 - Recursive directory analysis
@@ -134,7 +134,7 @@ This CLI exists to support:
 - Running one-off local analyses
 
 None of the ADK or agent-driven systems (`semfora-cli`, `semfora-ci`) use this CLI.
-They exclusively interact with the MCP server (`semfora-mcp-server`).
+They exclusively interact with the MCP server (`semfora-engine-server`).
 
 ---
 
@@ -657,7 +657,7 @@ semfora cache prune --orphaned
 - Identify bottlenecks, add caching where needed
 
 **Priority 10: Agent Consumption Specification**
-- Create formal documentation for AI agents on how to use semfora-mcp
+- Create formal documentation for AI agents on how to use semfora-engine
 - Document all input formats, options, and CLI/MCP invocation patterns
 - Define output interpretation guide (what each field means, how to reason about it)
 - Provide decision trees for common agent tasks
@@ -674,7 +674,7 @@ semfora cache prune --orphaned
 This phase transforms the prototype into a production-ready product.
 
 **Rename & Rebrand:**
-- ✅ Renamed package from `mcp-diff` to `semfora-mcp`
+- ✅ Renamed package from `mcp-diff` to `semfora-engine`
 - Domains acquired: semfora.com, semfora.org, semfora.dev
 - ✅ Updated all binaries, crates, and documentation
 - Design logo and brand identity
