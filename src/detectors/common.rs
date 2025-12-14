@@ -29,18 +29,8 @@ pub fn normalize_whitespace(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Safely truncate a string at a UTF-8 char boundary
-pub fn truncate_to_char_boundary(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
-    }
-    // Find the last valid char boundary at or before max_bytes
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
+// Re-export from utils for backwards compatibility
+pub use crate::utils::truncate_to_char_boundary;
 
 // ============================================================================
 // AST Traversal

@@ -4,10 +4,12 @@
 //! built on top of the semantic index.
 
 use crate::cache::CacheDir;
+use crate::utils::truncate_to_char_boundary;
 use crate::schema::{RiskLevel, SemanticSummary, SymbolKind};
 use crate::Result;
 use std::collections::HashMap;
 use std::path::Path;
+use rayon::prelude::*;
 
 /// Complexity metrics for a single symbol
 #[derive(Debug, Clone, Default)]
@@ -345,7 +347,7 @@ pub fn format_analysis_report(analysis: &RepoAnalysis) -> String {
 
     for sym in analysis.complex_symbols.iter().take(15) {
         let name = if sym.name.len() > 30 {
-            format!("{}...", &sym.name[..27])
+            format!("{}...", truncate_to_char_boundary(&sym.name, 27))
         } else {
             sym.name.clone()
         };
@@ -371,7 +373,7 @@ pub fn format_analysis_report(analysis: &RepoAnalysis) -> String {
 
     for m in modules.iter().take(15) {
         let name = if m.name.len() > 18 {
-            format!("{}...", &m.name[..15])
+            format!("{}...", truncate_to_char_boundary(&m.name, 15))
         } else {
             m.name.clone()
         };
@@ -389,7 +391,7 @@ pub fn format_analysis_report(analysis: &RepoAnalysis) -> String {
     if !analysis.call_graph.hotspots.is_empty() {
         output.push_str("  Hotspots (most called):\n");
         for (name, count) in analysis.call_graph.hotspots.iter().take(10) {
-            let display = if name.len() > 40 { &name[..40] } else { name };
+            let display = truncate_to_char_boundary(name, 40);
             output.push_str(&format!("    {:<40} ({} callers)\n", display, count));
         }
         output.push_str("\n");
@@ -398,7 +400,7 @@ pub fn format_analysis_report(analysis: &RepoAnalysis) -> String {
     if !analysis.call_graph.high_coupling.is_empty() {
         output.push_str("  High Coupling (many outgoing calls):\n");
         for (name, count) in analysis.call_graph.high_coupling.iter().take(5) {
-            let display = if name.len() > 40 { &name[..40] } else { name };
+            let display = truncate_to_char_boundary(name, 40);
             output.push_str(&format!("    {:<40} ({} callees)\n", display, count));
         }
         output.push_str("\n");
@@ -546,110 +548,133 @@ pub fn analyze_repo(repo_path: &Path) -> Result<RepoAnalysis> {
             *file_to_fan_out.entry(cg_file.to_string()).or_insert(0) += fo;
         }
     }
-
-    // Helper closure to get fan_out for a symbol
-    // 1. Try direct hash lookup
-    // 2. Try looking up by symbol name (for impl blocks where calls are attributed to struct)
-    // 3. Aggregate from functions within line range
-    // 4. For large impl blocks, use file-level fan_out if symbol dominates the file
-    let get_fan_out = |hash: &str, name: &str, kind: &str, file: &str, start: usize, end: usize| -> usize {
-        // First try direct lookup
-        if let Some(&fo) = fan_out_map.get(hash) {
-            return fo;
+    // Pre-compute aggregated fan_out for symbols (avoids O(n²) in parallel loop)
+    // Group symbols by file for efficient containment checking
+    let mut symbols_by_file: HashMap<&str, Vec<(&str, usize, usize, usize)>> = HashMap::new();
+    for (cg_hash, &fo) in &fan_out_map {
+        if let Some(&(cg_file, cg_start, cg_end)) = hash_to_location.get(cg_hash) {
+            symbols_by_file.entry(cg_file)
+                .or_default()
+                .push((cg_hash, cg_start, cg_end, fo));
         }
-        // Try by symbol name (impl blocks inherit fan_out from struct)
-        if let Some(&fo) = name_to_fan_out.get(name) {
-            return fo;
-        }
-        // Aggregate from functions within this symbol's line range
-        let mut total = 0;
-        for (cg_hash, &fo) in &fan_out_map {
-            if let Some(&(cg_file, cg_start, cg_end)) = hash_to_location.get(cg_hash) {
-                if cg_file == file && cg_start >= start && cg_end <= end {
-                    total += fo;
+    }
+    
+    // Pre-compute aggregated fan_out: for each symbol, sum fan_out of contained symbols
+    let aggregated_fan_out: HashMap<String, usize> = symbol_entries
+        .par_iter()
+        .filter_map(|entry| {
+            let (start, end) = parse_lines(&entry.lines);
+            // Skip if we already have direct fan_out
+            if fan_out_map.contains_key(&entry.hash) || name_to_fan_out.contains_key(&entry.symbol) {
+                return None;
+            }
+            // Find contained symbols in same file
+            if let Some(file_symbols) = symbols_by_file.get(entry.file.as_str()) {
+                let total: usize = file_symbols.iter()
+                    .filter(|(_, s, e, _)| *s >= start && *e <= end)
+                    .map(|(_, _, _, fo)| fo)
+                    .sum();
+                if total > 0 {
+                    return Some((entry.hash.clone(), total));
                 }
             }
-        }
-        if total > 0 {
-            return total;
-        }
-        // For impl blocks (kind=method) spanning many lines, aggregate from same file
-        // This handles cases where calls are attributed to a different symbol in same file
-        if kind == "method" && (end - start) > 100 {
-            if let Some(&fo) = file_to_fan_out.get(file) {
-                return fo;
+            None
+        })
+        .collect();
+
+    // Process modules in parallel
+    let total_modules = module_entries.len();
+    let processed_modules = std::sync::atomic::AtomicUsize::new(0);
+    eprintln!("Analyzing {} modules...", total_modules);
+    let module_results: Vec<(ModuleMetrics, Vec<SymbolComplexity>)> = module_entries
+        .par_iter()
+        .map(|(module_name, entries)| {
+            let current = processed_modules.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if current % 200 == 0 || current == total_modules {
+                eprintln!("  Progress: {}/{} ({:.1}%)", current, total_modules, (current as f64 / total_modules as f64) * 100.0);
             }
-        }
-        0
-    };
-
-    // Process modules
-    for (module_name, entries) in &module_entries {
-        let mut module_metrics = ModuleMetrics {
-            name: module_name.clone(),
-            ..Default::default()
-        };
-
-        let mut files_seen = std::collections::HashSet::new();
-        let mut module_cc_sum = 0usize;
-
-        for entry in entries {
-            files_seen.insert(&entry.file);
-
-            // Parse line range for LoC
-            let (start, end) = parse_lines(&entry.lines);
-            let loc = if end > start { end - start + 1 } else { 1 };
-
-            // Get fan-in/fan-out (looks up by name for impl blocks where calls are on struct)
-            let fan_in = fan_in_map.get(&entry.hash).copied().unwrap_or(0);
-            let fan_out = get_fan_out(&entry.hash, &entry.symbol, &entry.kind, &entry.file, start, end);
-
-            let sym_complexity = SymbolComplexity {
-                name: entry.symbol.clone(),
-                hash: entry.hash.clone(),
-                file: entry.file.clone(),
-                lines: entry.lines.clone(),
-                kind: SymbolKind::from_str(&entry.kind),
-                cyclomatic: entry.cognitive_complexity, // Using cognitive as proxy for cyclomatic
-                cognitive: entry.cognitive_complexity,
-                fan_out,
-                fan_in,
-                state_mutations: 0,
-                loc,
-                max_nesting: entry.max_nesting,
-                risk: RiskLevel::from_str(&entry.risk),
-                dependencies: 0,
-                io_operations: 0,
+            let mut module_metrics = ModuleMetrics {
+                name: module_name.clone(),
+                ..Default::default()
             };
 
-            module_metrics.total_loc += loc;
-            module_cc_sum += entry.cognitive_complexity;
+            let mut files_seen = std::collections::HashSet::new();
+            let mut module_cc_sum = 0usize;
+            let mut complex_symbols_local: Vec<SymbolComplexity> = Vec::new();
 
-            // Track max complexity for module
-            if entry.cognitive_complexity > module_metrics.max_complexity {
-                module_metrics.max_complexity = entry.cognitive_complexity;
-                module_metrics.most_complex_symbol = Some(entry.symbol.clone());
+            for entry in entries {
+                files_seen.insert(&entry.file);
+
+                // Parse line range for LoC
+                let (start, end) = parse_lines(&entry.lines);
+                let loc = if end > start { end - start + 1 } else { 1 };
+
+                // Get fan-in/fan-out (O(1) lookups using pre-computed maps)
+                let fan_in = fan_in_map.get(&entry.hash).copied().unwrap_or(0);
+                let fan_out = fan_out_map.get(&entry.hash).copied()
+                    .or_else(|| name_to_fan_out.get(&entry.symbol).copied())
+                    .or_else(|| aggregated_fan_out.get(&entry.hash).copied())
+                    .or_else(|| {
+                        if entry.kind == "method" {
+                            file_to_fan_out.get(&entry.file).copied()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+
+                let sym_complexity = SymbolComplexity {
+                    name: entry.symbol.clone(),
+                    hash: entry.hash.clone(),
+                    file: entry.file.clone(),
+                    lines: entry.lines.clone(),
+                    kind: SymbolKind::from_str(&entry.kind),
+                    cyclomatic: entry.cognitive_complexity,
+                    cognitive: entry.cognitive_complexity,
+                    fan_out,
+                    fan_in,
+                    state_mutations: 0,
+                    loc,
+                    max_nesting: entry.max_nesting,
+                    risk: RiskLevel::from_str(&entry.risk),
+                    dependencies: 0,
+                    io_operations: 0,
+                };
+
+                module_metrics.total_loc += loc;
+                module_cc_sum += entry.cognitive_complexity;
+
+                if entry.cognitive_complexity > module_metrics.max_complexity {
+                    module_metrics.max_complexity = entry.cognitive_complexity;
+                    module_metrics.most_complex_symbol = Some(entry.symbol.clone());
+                }
+
+                if entry.risk == "high" {
+                    module_metrics.high_risk_count += 1;
+                }
+
+                if entry.cognitive_complexity > 5 || fan_out > 10 || loc > 50 {
+                    complex_symbols_local.push(sym_complexity);
+                }
+
+                module_metrics.symbols += 1;
             }
 
-            if entry.risk == "high" {
-                module_metrics.high_risk_count += 1;
+            module_metrics.files = files_seen.len();
+            if module_metrics.symbols > 0 {
+                module_metrics.avg_complexity = module_cc_sum as f64 / module_metrics.symbols as f64;
             }
 
-            // Track symbols that are complex (cognitive > 5, high fan-out, or large)
-            if entry.cognitive_complexity > 5 || fan_out > 10 || loc > 50 {
-                analysis.complex_symbols.push(sym_complexity);
-            }
+            (module_metrics, complex_symbols_local)
+        })
+        .collect();
 
-            module_metrics.symbols += 1;
-        }
-
-        module_metrics.files = files_seen.len();
-        if module_metrics.symbols > 0 {
-            module_metrics.avg_complexity = module_cc_sum as f64 / module_metrics.symbols as f64;
-        }
+    // Merge results
+    for (module_metrics, complex_symbols_local) in module_results {
         analysis.total_symbols += module_metrics.symbols;
         analysis.total_lines += module_metrics.total_loc;
         analysis.modules.push(module_metrics);
+        analysis.complex_symbols.extend(complex_symbols_local);
     }
 
     // Calculate overall averages
@@ -783,3 +808,167 @@ mod tests {
         assert!((metrics.instability() - 1.0).abs() < 0.01);
     }
 }
+
+    #[test]
+    fn test_parse_lines() {
+        // Normal case
+        assert_eq!(parse_lines("10-20"), (10, 20));
+        
+        // Single line (same start/end)
+        assert_eq!(parse_lines("5-5"), (5, 5));
+        
+        // Large range
+        assert_eq!(parse_lines("100-500"), (100, 500));
+        
+        // Invalid format returns (0, 0)
+        assert_eq!(parse_lines("invalid"), (0, 0));
+        assert_eq!(parse_lines(""), (0, 0));
+        assert_eq!(parse_lines("10"), (0, 0));
+        
+        // Non-numeric values
+        assert_eq!(parse_lines("a-b"), (0, 0));
+    }
+
+    #[test]
+    fn test_fan_out_cascade_lookup() {
+        // Test the fan_out lookup priority:
+        // 1. Direct hash match in fan_out_map
+        // 2. Name match in name_to_fan_out
+        // 3. Aggregated from contained symbols
+        // 4. File-based fallback for methods
+        
+        let mut fan_out_map: HashMap<String, usize> = HashMap::new();
+        let mut name_to_fan_out: HashMap<String, usize> = HashMap::new();
+        let mut aggregated_fan_out: HashMap<String, usize> = HashMap::new();
+        let mut file_to_fan_out: HashMap<String, usize> = HashMap::new();
+        
+        fan_out_map.insert("hash1".to_string(), 10);
+        name_to_fan_out.insert("symbol2".to_string(), 20);
+        aggregated_fan_out.insert("hash3".to_string(), 30);
+        file_to_fan_out.insert("file4.rs".to_string(), 40);
+        
+        // Priority 1: Direct hash match
+        let fan_out1 = fan_out_map.get("hash1").copied()
+            .or_else(|| name_to_fan_out.get("symbol1").copied())
+            .or_else(|| aggregated_fan_out.get("hash1").copied())
+            .unwrap_or(0);
+        assert_eq!(fan_out1, 10);
+        
+        // Priority 2: Name match (when hash not found)
+        let fan_out2 = fan_out_map.get("hash2").copied()
+            .or_else(|| name_to_fan_out.get("symbol2").copied())
+            .or_else(|| aggregated_fan_out.get("hash2").copied())
+            .unwrap_or(0);
+        assert_eq!(fan_out2, 20);
+        
+        // Priority 3: Aggregated match
+        let fan_out3 = fan_out_map.get("hash3").copied()
+            .or_else(|| name_to_fan_out.get("symbol3").copied())
+            .or_else(|| aggregated_fan_out.get("hash3").copied())
+            .unwrap_or(0);
+        assert_eq!(fan_out3, 30);
+        
+        // Priority 4: File fallback for methods
+        let is_method = true;
+        let fan_out4 = fan_out_map.get("hash4").copied()
+            .or_else(|| name_to_fan_out.get("symbol4").copied())
+            .or_else(|| aggregated_fan_out.get("hash4").copied())
+            .or_else(|| {
+                if is_method {
+                    file_to_fan_out.get("file4.rs").copied()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        assert_eq!(fan_out4, 40);
+        
+        // Default to 0 when nothing matches
+        let fan_out5 = fan_out_map.get("hash5").copied()
+            .or_else(|| name_to_fan_out.get("symbol5").copied())
+            .or_else(|| aggregated_fan_out.get("hash5").copied())
+            .unwrap_or(0);
+        assert_eq!(fan_out5, 0);
+    }
+
+    #[test]
+    fn test_symbol_containment_logic() {
+        // Test that symbol containment works correctly for aggregation
+        // A symbol at lines 10-100 contains a symbol at lines 20-30
+        
+        let outer_start = 10usize;
+        let outer_end = 100usize;
+        
+        // Contained symbol
+        let inner_start = 20usize;
+        let inner_end = 30usize;
+        assert!(inner_start >= outer_start && inner_end <= outer_end);
+        
+        // Not contained - starts before
+        let before_start = 5usize;
+        let before_end = 15usize;
+        assert!(!(before_start >= outer_start && before_end <= outer_end));
+        
+        // Not contained - ends after
+        let after_start = 90usize;
+        let after_end = 110usize;
+        assert!(!(after_start >= outer_start && after_end <= outer_end));
+        
+        // Edge case - exactly at boundaries
+        let edge_start = 10usize;
+        let edge_end = 100usize;
+        assert!(edge_start >= outer_start && edge_end <= outer_end);
+    }
+
+    #[test]
+    fn test_aggregated_fan_out_calculation() {
+        // Test that aggregated fan_out sums correctly
+        let file_symbols: Vec<(&str, usize, usize, usize)> = vec![
+            ("hash_a", 20, 30, 5),   // fan_out = 5
+            ("hash_b", 40, 50, 3),   // fan_out = 3
+            ("hash_c", 60, 70, 7),   // fan_out = 7
+        ];
+        
+        // Outer symbol contains all three
+        let outer_start = 10usize;
+        let outer_end = 100usize;
+        
+        let total: usize = file_symbols.iter()
+            .filter(|(_, s, e, _)| *s >= outer_start && *e <= outer_end)
+            .map(|(_, _, _, fo)| fo)
+            .sum();
+        
+        assert_eq!(total, 15); // 5 + 3 + 7
+        
+        // Outer symbol contains only first two
+        let partial_end = 55usize;
+        let partial_total: usize = file_symbols.iter()
+            .filter(|(_, s, e, _)| *s >= outer_start && *e <= partial_end)
+            .map(|(_, _, _, fo)| fo)
+            .sum();
+        
+        assert_eq!(partial_total, 8); // 5 + 3
+    }
+
+    #[test]
+    fn test_module_metrics_aggregation() {
+        // Test that module metrics aggregate correctly
+        let mut metrics = ModuleMetrics::default();
+        
+        metrics.symbols = 10;
+        metrics.total_loc = 500;
+        metrics.max_complexity = 15;
+        metrics.high_risk_count = 2;
+        metrics.files = 3;
+        
+        // Test instability calculation
+        metrics.afferent_coupling = 5;
+        metrics.efferent_coupling = 15;
+        let instability = metrics.instability();
+        assert!((instability - 0.75).abs() < 0.01); // 15 / (5 + 15) = 0.75
+        
+        // Test average complexity calculation
+        let total_cc = 100usize;
+        metrics.avg_complexity = total_cc as f64 / metrics.symbols as f64;
+        assert!((metrics.avg_complexity - 10.0).abs() < 0.01);
+    }

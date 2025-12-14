@@ -14,18 +14,8 @@ use serde_json::{json, Map, Value};
 
 use crate::analysis::{calculate_cognitive_complexity, max_nesting_depth};
 use crate::schema::{ModuleGroup, RepoOverview, RepoStats, RiskLevel, SemanticSummary, SymbolKind};
+use crate::utils::truncate_to_char_boundary;
 
-/// Safely truncate a string at a UTF-8 char boundary
-fn truncate_to_char_boundary(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
-    }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
 
 // ============================================================================
 // Noisy call filtering - these are implementation details, not architecture

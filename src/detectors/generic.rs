@@ -16,7 +16,8 @@
 
 use tree_sitter::{Node, Tree};
 
-use crate::detectors::common::{find_containing_symbol_by_line, get_node_text, get_node_text_normalized, truncate_to_char_boundary};
+use crate::detectors::common::{find_containing_symbol_by_line, get_node_text, get_node_text_normalized};
+use crate::utils::truncate_to_char_boundary;
 use crate::detectors::grammar::LangGrammar;
 use crate::error::Result;
 use crate::schema::{

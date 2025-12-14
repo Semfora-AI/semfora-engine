@@ -1,10 +1,12 @@
 //! Helper functions for the MCP server
 //!
-//! This module contains shared utility functions used across MCP tools.
 
 use std::fs;
+use crate::utils::truncate_to_char_boundary;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+use rayon::prelude::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::{extract, Lang, McpDiffError, SemanticSummary, CacheDir, ShardWriter};
 
@@ -85,7 +87,7 @@ pub fn check_cache_staleness(cache: &CacheDir) -> Option<String> {
             "⚠️ Index may be stale. {} file(s) modified since last indexing: {}. Run generate_index to refresh.",
             stale_files.len(),
             if files_str.len() > 100 {
-                format!("{}...", &files_str[..100])
+                format!("{}...", truncate_to_char_boundary(&files_str, 100))
             } else {
                 files_str
             }
@@ -318,28 +320,28 @@ pub fn parse_and_extract(
 
 /// Analyze a collection of files and return their semantic summaries with total bytes
 pub fn analyze_files_with_stats(files: &[PathBuf]) -> (Vec<SemanticSummary>, usize) {
-    let mut summaries = Vec::new();
-    let mut total_bytes = 0usize;
+    let total_bytes_atomic = AtomicUsize::new(0);
 
-    for file_path in files {
-        let lang = match Lang::from_path(file_path) {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
+    let summaries: Vec<SemanticSummary> = files
+        .par_iter()
+        .filter_map(|file_path| {
+            let lang = match Lang::from_path(file_path) {
+                Ok(l) => l,
+                Err(_) => return None,
+            };
 
-        let source = match fs::read_to_string(file_path) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
+            let source = match fs::read_to_string(file_path) {
+                Ok(s) => s,
+                Err(_) => return None,
+            };
 
-        total_bytes += source.len();
+            total_bytes_atomic.fetch_add(source.len(), Ordering::Relaxed);
 
-        if let Ok(summary) = parse_and_extract(file_path, &source, lang) {
-            summaries.push(summary);
-        }
-    }
+            parse_and_extract(file_path, &source, lang).ok()
+        })
+        .collect();
 
-    (summaries, total_bytes)
+    (summaries, total_bytes_atomic.load(Ordering::Relaxed))
 }
 
 /// Generate a sharded index for a directory.

@@ -63,8 +63,11 @@ pub mod socket_server;
 pub mod test_runner;
 pub mod tokens;
 pub mod toon;
+pub mod utils;
 
 // Re-export commonly used types
+pub use utils::{truncate_to_char_boundary, truncate_with_ellipsis};
+
 pub use cli::{Cli, OperationMode, OutputFormat};
 pub use error::{McpDiffError, Result};
 pub use extract::extract;

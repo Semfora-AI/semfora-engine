@@ -25,6 +25,7 @@ use crate::{
     server::ServerState,
     duplicate::{DuplicateDetector, FunctionSignature},
 };
+use crate::utils::truncate_to_char_boundary;
 
 // Re-export types for external use
 pub use types::*;
@@ -1716,7 +1717,7 @@ fn format_test_results(results: &test_runner::TestResults) -> String {
             if !failure.message.is_empty() {
                 // Truncate long messages
                 let msg = if failure.message.len() > 200 {
-                    format!("{}...", &failure.message[..200])
+                    format!("{}...", truncate_to_char_boundary(&failure.message, 200))
                 } else {
                     failure.message.clone()
                 };
@@ -1728,7 +1729,7 @@ fn format_test_results(results: &test_runner::TestResults) -> String {
     // Include truncated stdout/stderr for debugging
     if !results.stdout.is_empty() {
         let stdout = if results.stdout.len() > 500 {
-            format!("{}...(truncated)", &results.stdout[..500])
+            format!("{}...(truncated)", truncate_to_char_boundary(&results.stdout, 500))
         } else {
             results.stdout.clone()
         };
@@ -2050,7 +2051,7 @@ fn format_ripgrep_results(query: &str, results: &[RipgrepSearchResult]) -> Strin
         for entry in results {
             // Truncate long content for display
             let content = if entry.content.len() > 100 {
-                format!("{}...", &entry.content[..100])
+                format!("{}...", truncate_to_char_boundary(&entry.content, 100))
             } else {
                 entry.content.clone()
             };
@@ -2088,7 +2089,7 @@ fn format_working_overlay_results(query: &str, results: &[RipgrepSearchResult]) 
             for entry in entries {
                 // Truncate long content for display
                 let content = if entry.content.len() > 80 {
-                    format!("{}...", &entry.content[..80])
+                    format!("{}...", truncate_to_char_boundary(&entry.content, 80))
                 } else {
                     entry.content.clone()
                 };

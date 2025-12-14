@@ -4,23 +4,12 @@
 //! source files using language-specific detectors.
 
 use std::path::Path;
+use crate::utils::truncate_to_char_boundary;
 
 /// Maximum length for raw source fallback when extraction is incomplete
 const MAX_FALLBACK_LEN: usize = 1000;
 use tree_sitter::Tree;
 
-/// Safely truncate a string at a UTF-8 char boundary
-fn truncate_to_char_boundary(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
-    }
-    // Find the last valid char boundary at or before max_bytes
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
 
 use crate::error::Result;
 use crate::lang::Lang;

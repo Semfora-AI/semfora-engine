@@ -16,6 +16,7 @@
 use tree_sitter::{Node, Tree};
 
 use crate::detectors::common::{find_containing_symbol_by_line, get_node_text, visit_all};
+use crate::utils::truncate_to_char_boundary;
 use crate::error::Result;
 use crate::schema::{Call, RiskLevel, SemanticSummary, StateChange, SymbolInfo, SymbolKind};
 
@@ -287,7 +288,7 @@ fn extract_attribute_state_change(node: &Node, source: &str) -> Option<StateChan
             let init_text = get_node_text(&child, source);
             // Truncate long initializers
             initializer = if init_text.len() > 50 {
-                format!("{}...", &init_text[..47])
+                format!("{}...", truncate_to_char_boundary(&init_text, 47))
             } else {
                 init_text
             };

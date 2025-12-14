@@ -19,6 +19,9 @@ use semfora_engine::{
     // Drift detection for incremental indexing (SEM-47)
     count_tracked_files, DriftDetector, UpdateStrategy, LayerKind,
 };
+use semfora_engine::truncate_to_char_boundary;
+use rayon::prelude::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn main() -> ExitCode {
     match run() {
@@ -212,52 +215,59 @@ fn run_directory(cli: &Cli, dir_path: &Path, max_depth: usize) -> semfora_engine
         eprintln!("Found {} files to analyze", files.len());
     }
 
-    // First pass: collect all summaries
-    let mut summaries: Vec<SemanticSummary> = Vec::new();
-    let mut all_source_len = 0usize;
-    let mut _failed_count = 0usize;
-    let mut total_lines = 0usize;
+    // First pass: collect all summaries (parallel with rayon)
+    let all_source_len_atomic = AtomicUsize::new(0);
+    let total_lines_atomic = AtomicUsize::new(0);
+    let verbose = cli.verbose;
+    let show_progress = cli.progress;
 
-    for file_path in &files {
-        let relative_path = file_path
-            .strip_prefix(dir_path)
-            .unwrap_or(file_path)
-            .display()
-            .to_string();
+    let summaries: Vec<SemanticSummary> = files
+        .par_iter()
+        .filter_map(|file_path| {
+            // Try to detect language
+            let lang = match Lang::from_path(file_path) {
+                Ok(l) => l,
+                Err(_) => return None,
+            };
 
-        // Try to detect language
-        let lang = match Lang::from_path(file_path) {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-
-        // Read and analyze file
-        let source = match fs::read_to_string(file_path) {
-            Ok(s) => s,
-            Err(e) => {
-                if cli.verbose {
-                    eprintln!("Skipping {}: {}", relative_path, e);
+            // Read and analyze file
+            let source = match fs::read_to_string(file_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    if verbose {
+                        let relative_path = file_path
+                            .strip_prefix(dir_path)
+                            .unwrap_or(file_path)
+                            .display()
+                            .to_string();
+                        eprintln!("Skipping {}: {}", relative_path, e);
+                    }
+                    return None;
                 }
-                continue;
-            }
-        };
+            };
 
-        all_source_len += source.len();
-        total_lines += source.lines().count();
+            all_source_len_atomic.fetch_add(source.len(), Ordering::Relaxed);
+            total_lines_atomic.fetch_add(source.lines().count(), Ordering::Relaxed);
 
-        let summary = match parse_and_extract_string(file_path, &source, lang) {
-            Ok(s) => s,
-            Err(e) => {
-                if cli.verbose {
-                    eprintln!("Failed to analyze {}: {}", relative_path, e);
+            match parse_and_extract_string(file_path, &source, lang) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    if verbose {
+                        let relative_path = file_path
+                            .strip_prefix(dir_path)
+                            .unwrap_or(file_path)
+                            .display()
+                            .to_string();
+                        eprintln!("Failed to analyze {}: {}", relative_path, e);
+                    }
+                    None
                 }
-                _failed_count += 1;
-                continue;
             }
-        };
+        })
+        .collect();
 
-        summaries.push(summary);
-    }
+    let all_source_len = all_source_len_atomic.load(Ordering::Relaxed);
+    let total_lines = total_lines_atomic.load(Ordering::Relaxed);
 
     // Generate repository overview
     let dir_str = dir_path.display().to_string();
@@ -402,49 +412,52 @@ fn run_shard(cli: &Cli, dir_path: &Path, max_depth: usize) -> semfora_engine::Re
     let total = files_to_analyze.len();
     eprintln!("Found {} files to analyze", total);
 
-    // First pass: collect all summaries
-    let mut summaries: Vec<SemanticSummary> = Vec::new();
-    let mut total_source_bytes = 0usize;
-    let mut processed = 0usize;
+    // First pass: collect all summaries (parallel with rayon)
+    let processed = AtomicUsize::new(0);
+    let total_source_bytes_atomic = AtomicUsize::new(0);
+    let verbose = cli.verbose;
+    let show_progress = cli.progress;
 
-    for file_path in &files_to_analyze {
-        processed += 1;
-        if processed % 100 == 0 || processed == total {
-            eprintln!("Processing: {}/{} ({:.1}%)", processed, total, (processed as f64 / total as f64) * 100.0);
-        }
-
-        // Try to detect language
-        let lang = match Lang::from_path(file_path) {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-
-        // Read and analyze file
-        let source = match fs::read_to_string(file_path) {
-            Ok(s) => s,
-            Err(e) => {
-                if cli.verbose {
-                    eprintln!("Skipping {}: {}", file_path.display(), e);
-                }
-                continue;
+    let summaries: Vec<SemanticSummary> = files_to_analyze
+        .par_iter()
+        .filter_map(|file_path| {
+            let current = processed.fetch_add(1, Ordering::Relaxed) + 1;
+            if show_progress && (current % 500 == 0 || current == total) {
+                eprintln!("Processing: {}/{} ({:.1}%)", current, total, (current as f64 / total as f64) * 100.0);
             }
-        };
 
-        total_source_bytes += source.len();
+            // Try to detect language
+            let lang = match Lang::from_path(file_path) {
+                Ok(l) => l,
+                Err(_) => return None,
+            };
 
-        let summary = match parse_and_extract_string(file_path, &source, lang) {
-            Ok(s) => s,
-            Err(e) => {
-                if cli.verbose {
-                    eprintln!("Failed to analyze {}: {}", file_path.display(), e);
+            // Read and analyze file
+            let source = match fs::read_to_string(file_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    if verbose {
+                        eprintln!("Skipping {}: {}", file_path.display(), e);
+                    }
+                    return None;
                 }
-                continue;
+            };
+
+            total_source_bytes_atomic.fetch_add(source.len(), Ordering::Relaxed);
+
+            match parse_and_extract_string(file_path, &source, lang) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    if verbose {
+                        eprintln!("Failed to analyze {}: {}", file_path.display(), e);
+                    }
+                    None
+                }
             }
-        };
+        })
+        .collect();
 
-        summaries.push(summary);
-    }
-
+    let total_source_bytes = total_source_bytes_atomic.load(Ordering::Relaxed);
     eprintln!("Analyzed {} files ({} bytes source)", summaries.len(), total_source_bytes);
 
     // Add summaries to shard writer
@@ -686,7 +699,7 @@ fn run_search_symbols(cli: &Cli, query: &str) -> semfora_engine::Result<String> 
                 output.push_str(&format!("results[{}]:\n", ripgrep_results.len()));
                 for entry in &ripgrep_results {
                     let content_preview = if entry.content.len() > 60 {
-                        format!("{}...", &entry.content[..60])
+                        format!("{}...", truncate_to_char_boundary(&entry.content, 60))
                     } else {
                         entry.content.clone()
                     };
@@ -1574,7 +1587,7 @@ fn print_ast(node: &tree_sitter::Node, source: &str, depth: usize) {
 fn run_static_analysis(cli: &Cli) -> semfora_engine::Result<String> {
     use semfora_engine::analysis::{analyze_module, analyze_repo, format_analysis_report as format_report};
 
-    let cwd = std::env::current_dir()?;
+    let cwd = cli.dir.clone().unwrap_or_else(|| std::env::current_dir().expect("Failed to get current directory"));
 
     // Check if we have a cached index
     let cache = semfora_engine::CacheDir::for_repo(&cwd)?;
@@ -1615,7 +1628,7 @@ fn run_find_duplicates(cli: &Cli) -> semfora_engine::Result<String> {
     use semfora_engine::{CacheDir, DuplicateDetector, FunctionSignature};
     use std::io::{BufRead, BufReader};
 
-    let cwd = std::env::current_dir()?;
+    let cwd = cli.dir.clone().unwrap_or_else(|| std::env::current_dir().expect("Failed to get current directory"));
     let cache = CacheDir::for_repo(&cwd)?;
 
     if !cache.exists() {
@@ -1721,7 +1734,7 @@ fn run_check_duplicates(cli: &Cli) -> semfora_engine::Result<String> {
     use std::io::{BufRead, BufReader};
 
     let symbol_hash = cli.check_duplicates.as_ref().unwrap();
-    let cwd = std::env::current_dir()?;
+    let cwd = cli.dir.clone().unwrap_or_else(|| std::env::current_dir().expect("Failed to get current directory"));
     let cache = CacheDir::for_repo(&cwd)?;
 
     if !cache.exists() {

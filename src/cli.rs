@@ -24,6 +24,10 @@ pub struct Cli {
     #[arg(short, long)]
     pub verbose: bool,
 
+    /// Show progress percentage during long operations
+    #[arg(long)]
+    pub progress: bool,
+
     /// Print the parsed AST (for debugging)
     #[arg(long)]
     pub print_ast: bool,
