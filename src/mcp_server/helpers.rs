@@ -398,3 +398,138 @@ pub fn generate_index_internal(
         compression_pct: compression,
     })
 }
+
+// ============================================================================
+// Repo Overview Filtering
+// ============================================================================
+
+/// Test directory patterns to exclude
+const TEST_DIR_PATTERNS: &[&str] = &[
+    "tests",
+    "__tests__",
+    "test-repos",
+    "test_",
+    "_test",
+    "spec",
+    "fixtures",
+];
+
+/// Check if a module name indicates a test directory
+fn is_test_module(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    TEST_DIR_PATTERNS.iter().any(|pattern| {
+        lower == *pattern
+            || lower.starts_with(&format!("{}/", pattern))
+            || lower.ends_with(&format!("/{}", pattern))
+            || lower.contains(&format!("/{}/", pattern))
+    })
+}
+
+/// Filter repo overview TOON content to limit modules and exclude test dirs
+///
+/// # Arguments
+/// * `content` - The raw TOON content from repo_overview.toon
+/// * `max_modules` - Maximum number of modules to include (0 = no limit)
+/// * `exclude_test_dirs` - Whether to exclude test directories
+///
+/// # Returns
+/// Filtered TOON content with updated module count
+pub fn filter_repo_overview(content: &str, max_modules: usize, exclude_test_dirs: bool) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut output = String::new();
+    let mut in_modules = false;
+    let mut modules_collected: Vec<&str> = Vec::new();
+    let mut total_modules = 0;
+    let mut excluded_count = 0;
+
+    for line in &lines {
+        // Detect modules section start: "modules[N]{...}:"
+        if line.starts_with("modules[") && line.ends_with(':') {
+            in_modules = true;
+            // Parse original count from "modules[30]..." format
+            if let Some(count_str) = line.strip_prefix("modules[").and_then(|s| s.split(']').next()) {
+                total_modules = count_str.parse().unwrap_or(0);
+            }
+            continue;
+        }
+
+        if in_modules {
+            // Module lines are indented with 2 spaces and contain commas
+            if line.starts_with("  ") && line.contains(',') {
+                // Parse module name (first field)
+                let module_name = line.trim().split(',').next().unwrap_or("");
+
+                // Check if should exclude
+                if exclude_test_dirs && is_test_module(module_name) {
+                    excluded_count += 1;
+                    continue;
+                }
+
+                modules_collected.push(line);
+            } else {
+                // End of modules section - flush collected modules
+                in_modules = false;
+
+                // Apply limit
+                let final_modules: Vec<&str> = if max_modules > 0 && modules_collected.len() > max_modules {
+                    modules_collected.iter().take(max_modules).copied().collect()
+                } else {
+                    modules_collected.clone()
+                };
+
+                // Write modules header with actual count
+                let header_parts: Vec<&str> = lines.iter()
+                    .find(|l| l.starts_with("modules["))
+                    .map(|l| l.split(']').collect::<Vec<_>>())
+                    .unwrap_or_default();
+
+                if header_parts.len() >= 2 {
+                    // Show filtered count and note total
+                    if excluded_count > 0 || (max_modules > 0 && modules_collected.len() > max_modules) {
+                        let showing = final_modules.len();
+                        output.push_str(&format!(
+                            "modules[{}/{}]{}\n",
+                            showing,
+                            total_modules,
+                            header_parts[1]
+                        ));
+                    } else {
+                        output.push_str(&format!("modules[{}]{}\n", final_modules.len(), header_parts[1]));
+                    }
+                }
+
+                // Write filtered modules
+                for module_line in &final_modules {
+                    output.push_str(module_line);
+                    output.push('\n');
+                }
+
+                // Write the current line (which ended the modules section)
+                output.push_str(line);
+                output.push('\n');
+
+                // Clear for potential future modules sections
+                modules_collected.clear();
+            }
+        } else {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+
+    // Handle case where file ends during modules section
+    if in_modules && !modules_collected.is_empty() {
+        let final_modules: Vec<&str> = if max_modules > 0 && modules_collected.len() > max_modules {
+            modules_collected.iter().take(max_modules).copied().collect()
+        } else {
+            modules_collected.clone()
+        };
+
+        for module_line in &final_modules {
+            output.push_str(module_line);
+            output.push('\n');
+        }
+    }
+
+    output
+}

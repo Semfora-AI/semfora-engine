@@ -31,7 +31,7 @@ use crate::utils::truncate_to_char_boundary;
 pub use types::*;
 use helpers::{
     check_cache_staleness, check_cache_staleness_detailed, collect_files, parse_and_extract,
-    generate_index_internal, IndexGenerationResult, analyze_files_with_stats,
+    generate_index_internal, IndexGenerationResult, analyze_files_with_stats, filter_repo_overview,
 };
 
 // ============================================================================
@@ -136,6 +136,126 @@ impl McpDiffServer {
     }
 
     // ========================================================================
+    // Quick Context Tool
+    // ========================================================================
+
+    #[tool(description = "Get quick git and project context in ~200 tokens. **Use this FIRST** when starting work on a repository to understand: current branch, last commit, index status, and project type. Much faster and smaller than get_repo_overview.")]
+    async fn get_context(
+        &self,
+        Parameters(request): Parameters<GetContextRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        use std::process::Command;
+
+        let repo_path = match &request.path {
+            Some(p) => self.resolve_path(p).await,
+            None => self.get_working_dir().await,
+        };
+
+        let mut output = String::new();
+        output.push_str("_type: context\n");
+
+        // Get repo name from directory
+        let repo_name = repo_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+        output.push_str(&format!("repo_name: \"{}\"\n", repo_name));
+
+        // Git branch
+        let branch = Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(&repo_path)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        output.push_str(&format!("branch: \"{}\"\n", branch));
+
+        // Git remote
+        let remote = Command::new("git")
+            .args(["remote", "get-url", "origin"])
+            .current_dir(&repo_path)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|| "none".to_string());
+        output.push_str(&format!("remote: \"{}\"\n", remote));
+
+        // Last commit info (hash, message, author, date)
+        let commit_info = Command::new("git")
+            .args(["log", "-1", "--format=%h|%s|%an|%ci"])
+            .current_dir(&repo_path)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+
+        if let Some(info) = commit_info {
+            let parts: Vec<&str> = info.splitn(4, '|').collect();
+            if parts.len() >= 4 {
+                output.push_str("last_commit:\n");
+                output.push_str(&format!("  hash: \"{}\"\n", parts[0]));
+                // Truncate message to 60 chars
+                let msg = if parts[1].len() > 60 {
+                    format!("{}...", &parts[1][..57])
+                } else {
+                    parts[1].to_string()
+                };
+                output.push_str(&format!("  message: \"{}\"\n", msg));
+                output.push_str(&format!("  author: \"{}\"\n", parts[2]));
+                // Simplify date to just the date part
+                let date = parts[3].split(' ').next().unwrap_or(parts[3]);
+                output.push_str(&format!("  date: \"{}\"\n", date));
+            }
+        }
+
+        // Check index status
+        let cache_result = CacheDir::for_repo(&repo_path);
+        match cache_result {
+            Ok(cache) if cache.exists() => {
+                let staleness = check_cache_staleness_detailed(&cache, 3600);
+                if staleness.is_stale {
+                    output.push_str("index_status: \"stale\"\n");
+                    output.push_str(&format!("stale_files: {}\n", staleness.modified_files.len()));
+                } else {
+                    output.push_str("index_status: \"fresh\"\n");
+                }
+
+                // Try to read project type and entry points from overview
+                let overview_path = cache.repo_overview_path();
+                if let Ok(content) = fs::read_to_string(&overview_path) {
+                    // Extract framework line
+                    for line in content.lines() {
+                        if line.starts_with("framework:") {
+                            let framework = line.trim_start_matches("framework:").trim().trim_matches('"');
+                            output.push_str(&format!("project_type: \"{}\"\n", framework));
+                            break;
+                        }
+                    }
+                    // Extract entry points
+                    for line in content.lines() {
+                        if line.starts_with("entry_points") {
+                            output.push_str(&format!("{}\n", line));
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(_) => {
+                output.push_str("index_status: \"missing\"\n");
+                output.push_str("hint: \"Run generate_index to create semantic index\"\n");
+            }
+            Err(_) => {
+                output.push_str("index_status: \"error\"\n");
+            }
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    // ========================================================================
     // Analysis Tools
     // ========================================================================
 
@@ -225,7 +345,7 @@ impl McpDiffServer {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-    #[tool(description = "Analyze changes between git branches or commits. Shows semantic diff of what changed, including new symbols, modified functions, changed dependencies, and risk assessment for each changed file. Use target_ref='WORKING' to analyze uncommitted changes.")]
+    #[tool(description = "**Use for code reviews** - analyzes changes between git branches or commits semantically. Shows new/modified symbols, changed dependencies, and risk assessment for each file. Use target_ref='WORKING' to review uncommitted changes before committing.")]
     async fn analyze_diff(
         &self,
         Parameters(request): Parameters<AnalyzeDiffRequest>,
@@ -287,15 +407,22 @@ impl McpDiffServer {
     // Sharded Index Tools
     // ========================================================================
 
-    #[tool(description = "Get the repository overview from a pre-built sharded index. Returns a compact summary (~300KB even for massive repos) with framework detection, module list, risk breakdown, and entry points. Use this FIRST to understand a codebase before diving into specific modules.")]
+    #[tool(description = "Get the repository overview from a pre-built sharded index. Returns a compact summary with framework detection, module list, risk breakdown, and entry points. Use this to understand a codebase before diving into specific modules. By default excludes test directories and limits to 30 modules for token efficiency.")]
     async fn get_repo_overview(
         &self,
         Parameters(request): Parameters<GetRepoOverviewRequest>,
     ) -> Result<CallToolResult, McpError> {
+        use std::process::Command;
+
         let repo_path = match &request.path {
             Some(p) => self.resolve_path(p).await,
             None => self.get_working_dir().await,
         };
+
+        // Parse options with defaults
+        let max_modules = request.max_modules.unwrap_or(30);
+        let exclude_test_dirs = request.exclude_test_dirs.unwrap_or(true);
+        let include_git_context = request.include_git_context.unwrap_or(true);
 
         // Auto-generate index if missing
         let (cache, gen_result) = match self.ensure_index(&repo_path).await {
@@ -329,7 +456,50 @@ impl McpDiffServer {
                     }
                 }
 
-                output.push_str(&content);
+                // Add git context if requested
+                if include_git_context {
+                    let branch = Command::new("git")
+                        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                        .current_dir(&repo_path)
+                        .output()
+                        .ok()
+                        .filter(|o| o.status.success())
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+
+                    let commit = Command::new("git")
+                        .args(["log", "-1", "--format=%h %s"])
+                        .current_dir(&repo_path)
+                        .output()
+                        .ok()
+                        .filter(|o| o.status.success())
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+
+                    if branch.is_some() || commit.is_some() {
+                        output.push_str("git_context:\n");
+                        if let Some(b) = branch {
+                            output.push_str(&format!("  branch: \"{}\"\n", b));
+                        }
+                        if let Some(c) = commit {
+                            // Truncate commit message
+                            let c = if c.len() > 60 {
+                                format!("{}...", &c[..57])
+                            } else {
+                                c
+                            };
+                            output.push_str(&format!("  last_commit: \"{}\"\n", c));
+                        }
+                        output.push('\n');
+                    }
+                }
+
+                // Filter and limit modules in the content
+                let filtered_content = filter_repo_overview(
+                    &content,
+                    max_modules,
+                    exclude_test_dirs,
+                );
+
+                output.push_str(&filtered_content);
                 Ok(CallToolResult::success(vec![Content::text(output)]))
             }
             Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
@@ -511,11 +681,13 @@ impl McpDiffServer {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-    #[tool(description = "Get the call graph showing which functions call which other functions. Returns a mapping of symbol -> [called symbols] that can be used to understand code flow and impact radius of changes.")]
+    #[tool(description = "Understand code flow and dependencies between functions. **Use with filters** (module, symbol) for targeted analysis - unfiltered output can be very large. Returns a mapping of symbol -> [called symbols] useful for architectural understanding.")]
     async fn get_call_graph(
         &self,
         Parameters(request): Parameters<GetCallGraphRequest>,
     ) -> Result<CallToolResult, McpError> {
+        use std::io::{BufRead, BufReader};
+        
         let repo_path = match &request.path {
             Some(p) => self.resolve_path(p).await,
             None => self.get_working_dir().await,
@@ -545,80 +717,160 @@ impl McpDiffServer {
         let limit = request.limit.unwrap_or(500).min(2000) as usize;
         let offset = request.offset.unwrap_or(0) as usize;
         let summary_only = request.summary_only.unwrap_or(false);
+        
+        // Check file size - for large files (>10MB), require filter or default to summary
+        let file_size = fs::metadata(&call_graph_path).map(|m| m.len()).unwrap_or(0);
+        let is_large = file_size > 10 * 1024 * 1024; // 10MB threshold
+        
+        if is_large && request.module.is_none() && request.symbol.is_none() && !summary_only {
+            // For large repos without filters, return summary with instructions
+            let file = match fs::File::open(&call_graph_path) {
+                Ok(f) => f,
+                Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Failed to open call graph: {}", e
+                ))])),
+            };
+            
+            let reader = BufReader::new(file);
+            let mut total_edges = 0usize;
+            let mut total_callees = 0usize;
+            let mut top_callers: Vec<(String, usize)> = Vec::new();
+            
+            for line in reader.lines().filter_map(|l| l.ok()) {
+                if line.starts_with("_type:") || line.starts_with("schema_version:") || line.starts_with("edges:") {
+                    continue;
+                }
+                if let Some(colon_pos) = line.find(':') {
+                    let caller = line[..colon_pos].trim().to_string();
+                    let rest = line[colon_pos + 1..].trim();
+                    if rest.starts_with('[') && rest.ends_with(']') {
+                        let inner = &rest[1..rest.len()-1];
+                        let callee_count = if inner.is_empty() { 0 } else { inner.matches(',').count() + 1 };
+                        total_edges += 1;
+                        total_callees += callee_count;
+                        
+                        // Track top callers (by callee count)
+                        if callee_count > 10 {
+                            top_callers.push((caller, callee_count));
+                        }
+                    }
+                }
+            }
+            
+            // Sort and take top 20
+            top_callers.sort_by(|a, b| b.1.cmp(&a.1));
+            top_callers.truncate(20);
+            
+            let mut output = String::new();
+            output.push_str("_type: call_graph_summary\n");
+            output.push_str(&format!("file_size: {} MB\n", file_size / 1024 / 1024));
+            output.push_str(&format!("total_callers: {}\n", total_edges));
+            output.push_str(&format!("total_call_edges: {}\n", total_callees));
+            output.push_str(&format!("avg_callees_per_caller: {:.1}\n\n", total_callees as f64 / total_edges.max(1) as f64));
+            
+            output.push_str("top_callers_by_fan_out:\n");
+            for (caller, count) in &top_callers {
+                output.push_str(&format!("  {} ({} callees)\n", caller, count));
+            }
+            
+            output.push_str("\n⚠️ Large call graph detected. Use filters to query specific parts:\n");
+            output.push_str("  - module: Filter by module name\n");
+            output.push_str("  - symbol: Filter by symbol name\n");
+            output.push_str("  - summary_only: true for statistics only\n");
+            
+            return Ok(CallToolResult::success(vec![Content::text(output)]));
+        }
 
-        // Read and parse call graph
-        let content = match fs::read_to_string(&call_graph_path) {
-            Ok(c) => c,
+        // Stream through file with filtering (for filtered queries or small files)
+        let file = match fs::File::open(&call_graph_path) {
+            Ok(f) => f,
             Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!(
-                "Failed to read call graph: {}", e
+                "Failed to open call graph: {}", e
             ))])),
         };
-
-        // Parse into edges: Vec<(caller, Vec<callees>)>
+        
+        let reader = BufReader::new(file);
         let mut edges: Vec<(String, Vec<String>)> = Vec::new();
-        for line in content.lines() {
+        let mut total_edges = 0usize;
+        let mut skipped = 0usize;
+        
+        for line in reader.lines().filter_map(|l| l.ok()) {
             // Skip header lines
             if line.starts_with("_type:") || line.starts_with("schema_version:") || line.starts_with("edges:") {
                 continue;
             }
-            // Parse "hash: ["callee1","callee2"]"
+            
+            // Parse edge
             if let Some(colon_pos) = line.find(':') {
-                let caller = line[..colon_pos].trim().to_string();
+                let caller = line[..colon_pos].trim();
                 let rest = line[colon_pos + 1..].trim();
+                
                 if rest.starts_with('[') && rest.ends_with(']') {
+                    total_edges += 1;
+                    
                     let inner = &rest[1..rest.len()-1];
                     let callees: Vec<String> = inner
                         .split(',')
                         .filter(|s| !s.is_empty())
                         .map(|s| s.trim().trim_matches('"').to_string())
                         .collect();
-                    edges.push((caller, callees));
+                    
+                    // Apply filters during streaming
+                    let matches_filter = {
+                        let mut matches = true;
+                        
+                        if let Some(module) = &request.module {
+                            let caller_matches = caller.contains(module.as_str());
+                            let callee_matches = callees.iter().any(|c| c.contains(module.as_str()));
+                            if !caller_matches && !callee_matches {
+                                matches = false;
+                            }
+                        }
+                        
+                        if matches {
+                            if let Some(symbol) = &request.symbol {
+                                let symbol_lower = symbol.to_lowercase();
+                                let caller_matches = caller.to_lowercase().contains(&symbol_lower);
+                                let callee_matches = callees.iter().any(|c| c.to_lowercase().contains(&symbol_lower));
+                                if !caller_matches && !callee_matches {
+                                    matches = false;
+                                }
+                            }
+                        }
+                        
+                        matches
+                    };
+                    
+                    if matches_filter {
+                        // Handle offset
+                        if skipped < offset {
+                            skipped += 1;
+                            continue;
+                        }
+                        
+                        // Collect edges (for both summary and non-summary mode)
+                        if edges.len() < limit {
+                            edges.push((caller.to_string(), callees));
+                        }
+                        
+                        // Early exit if we have enough for non-summary mode
+                        // (summary mode will process all matching edges)
+                    }
                 }
             }
         }
 
-        let total_edges = edges.len();
-
-        // Apply filters
-        let filtered_edges: Vec<_> = edges.into_iter()
-            .filter(|(caller, callees)| {
-                // Module filter
-                if let Some(module) = &request.module {
-                    let caller_matches = caller.contains(module);
-                    let callee_matches = callees.iter().any(|c| c.contains(module));
-                    if !caller_matches && !callee_matches {
-                        return false;
-                    }
-                }
-                // Symbol filter
-                if let Some(symbol) = &request.symbol {
-                    let symbol_lower = symbol.to_lowercase();
-                    let caller_matches = caller.to_lowercase().contains(&symbol_lower);
-                    let callee_matches = callees.iter().any(|c| c.to_lowercase().contains(&symbol_lower));
-                    if !caller_matches && !callee_matches {
-                        return false;
-                    }
-                }
-                true
-            })
-            .collect();
-
-        let filtered_count = filtered_edges.len();
+        let filtered_count = skipped + edges.len();
 
         // Summary mode: return statistics only
         if summary_only {
-            let output = format_call_graph_summary(&filtered_edges, total_edges, filtered_count);
+            let output = format_call_graph_summary(&edges, total_edges, edges.len());
             return Ok(CallToolResult::success(vec![Content::text(output)]));
         }
 
-        // Apply pagination
-        let paginated: Vec<_> = filtered_edges.into_iter()
-            .skip(offset)
-            .take(limit)
-            .collect();
-
+        // Paginated output
         let output = format_call_graph_paginated(
-            &paginated,
+            &edges,
             total_edges,
             filtered_count,
             offset,
@@ -655,7 +907,7 @@ impl McpDiffServer {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-    #[tool(description = "Search for symbols by name across the repository. Returns lightweight index entries (symbol, hash, module, file, lines, risk) without full semantic details. Use get_symbol(hash) to fetch full details for specific symbols. This is much more token-efficient than get_module for targeted searches. Falls back to ripgrep text search if no semantic index exists. Use working_overlay=true to search only uncommitted files.")]
+    #[tool(description = "**Use for finding specific code** by symbol name. Returns lightweight entries (~400 tokens for 20 results) - much more efficient than browsing modules. Supports wildcards like '*Manager'. Use get_symbol(hash) for full details on specific matches. Falls back to ripgrep if no index exists.")]
     async fn search_symbols(
         &self,
         Parameters(request): Parameters<SearchSymbolsRequest>,
@@ -1183,7 +1435,7 @@ impl McpDiffServer {
     // Duplicate Detection Tools
     // ========================================================================
 
-    #[tool(description = "Find all duplicate function clusters in repository. Returns groups of similar functions that may be candidates for consolidation. Uses semantic fingerprinting for efficient O(n) coarse filtering followed by Jaccard similarity for accurate matching.")]
+    #[tool(description = "Find code duplication across the entire codebase. **Use for codebase health audits** or before major refactoring. Fast even on massive repos (O(n) fingerprinting). Returns groups of similar functions that may be candidates for consolidation.")]
     async fn find_duplicates(
         &self,
         Parameters(request): Parameters<FindDuplicatesRequest>,
@@ -1285,7 +1537,7 @@ impl McpDiffServer {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-    #[tool(description = "Check if a specific function has duplicates. Returns similar functions to the specified symbol hash. Use this before writing new code to avoid duplication.")]
+    #[tool(description = "**Use before writing new functions** to avoid duplication. Returns similar existing functions that match the specified symbol hash. Also useful during refactoring to find consolidation candidates.")]
     async fn check_duplicates(
         &self,
         Parameters(request): Parameters<CheckDuplicatesRequest>,
@@ -1520,7 +1772,7 @@ impl McpDiffServer {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-    #[tool(description = "Get callers of a symbol - reverse call graph lookup. Answers 'what functions call this symbol?' Essential for understanding impact radius before making changes. Returns direct callers and optionally their callers (up to depth 3).")]
+    #[tool(description = "**Use before modifying existing code** to understand impact radius. Answers 'what functions call this symbol?' Shows what will break if you change this function. Returns direct callers and optionally transitive callers (up to depth 3).")]
     async fn get_callers(
         &self,
         Parameters(request): Parameters<GetCallersRequest>,

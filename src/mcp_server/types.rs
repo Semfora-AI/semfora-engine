@@ -66,6 +66,18 @@ pub struct AnalyzeDiffRequest {
 pub struct ListLanguagesRequest {}
 
 // ============================================================================
+// Quick Context Request Type
+// ============================================================================
+
+/// Request to get quick git and project context (~200 tokens)
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetContextRequest {
+    /// Path to the repository (defaults to current directory)
+    #[schemars(description = "Path to the repository root (defaults to current directory)")]
+    pub path: Option<String>,
+}
+
+// ============================================================================
 // Sharded Index Request Types
 // ============================================================================
 
@@ -75,6 +87,18 @@ pub struct GetRepoOverviewRequest {
     /// Path to the repository (defaults to current directory)
     #[schemars(description = "Path to the repository root (defaults to current directory)")]
     pub path: Option<String>,
+
+    /// Maximum modules to include (default: 30, use 0 for no limit)
+    #[schemars(description = "Maximum modules to include in output (default: 30). Set to 0 for no limit. Modules are sorted by symbol count.")]
+    pub max_modules: Option<usize>,
+
+    /// Exclude test directories from module listing (default: true)
+    #[schemars(description = "Exclude test directories (tests, __tests__, test-repos) from module listing (default: true)")]
+    pub exclude_test_dirs: Option<bool>,
+
+    /// Include git context (branch, last commit) in output (default: true)
+    #[schemars(description = "Include git context (branch, last commit) in output (default: true)")]
+    pub include_git_context: Option<bool>,
 }
 
 /// Request to get a module from sharded index
