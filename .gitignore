@@ -1,9 +1,18 @@
+# Build artifacts
 /target
 /dist
 
-# Test and benchmark output
+# Semfora cache
+.semfora_index/
+
+# Logs and output
+*.log
 *.txt
 !README.txt
+
+# Demo/test output (except repo-compare-website)
+*.html
+!repo-compare-website/**/*.html
 
 # OS files
 .DS_Store
@@ -11,3 +20,6 @@
 # IDE
 .idea/
 .vscode/
+
+# Old PM config
+.pm/
