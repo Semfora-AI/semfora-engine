@@ -71,3 +71,64 @@ jobs:
             semfora-engine-*.tar.gz
             semfora-engine-*.zip
           if-no-files-found: error
+
+  # Semantic code analysis using semfora-ci
+  semfora-ci:
+    name: Semantic Analysis
+    needs: build
+    runs-on: ubuntu-latest
+    # Only run on PRs (not pushes to main)
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for diff analysis
+
+      - name: Download semfora-engine
+        uses: actions/download-artifact@v4
+        with:
+          name: semfora-engine-linux-x86_64
+          path: .
+
+      - name: Extract and install semfora-engine
+        run: |
+          tar -xzf semfora-engine-linux-x86_64.tar.gz
+          chmod +x semfora-engine semfora-engine-server semfora-daemon
+          sudo mv semfora-engine semfora-engine-server semfora-daemon /usr/local/bin/
+          semfora-engine --version
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Clone and build semfora-ci
+        run: |
+          git clone --depth 1 https://github.com/Semfora-AI/semfora-ci.git /tmp/semfora-ci
+          cd /tmp/semfora-ci
+          cargo build --release
+          sudo cp target/release/semfora-ci /usr/local/bin/
+          semfora-ci --version
+
+      - name: Cache Semfora Index
+        uses: actions/cache@v4
+        with:
+          path: .semfora-cache
+          key: semfora-index-${{ runner.os }}-${{ hashFiles('**/*.rs') }}
+          restore-keys: |
+            semfora-index-${{ runner.os }}-
+
+      - name: Run Semantic Analysis
+        id: semfora
+        run: semfora-ci --ci --soft-fail
+        # --ci: Auto-detect GitHub Actions, set format, write step summary
+        # --soft-fail: Don't fail the build, just report issues
+        # Remove --soft-fail to enforce quality gates
+
+      # Optional: Fail the build if there are errors
+      # Uncomment below to enforce quality gates
+      # - name: Check Results
+      #   if: steps.semfora.outputs.errors > 0
+      #   run: |
+      #     echo "Semfora-CI found ${{ steps.semfora.outputs.errors }} error(s)"
+      #     exit 1
