@@ -102,10 +102,16 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Clone and build semfora-ci
+      - name: Checkout semfora-ci
+        uses: actions/checkout@v4
+        with:
+          repository: Semfora-AI/semfora-ci
+          path: semfora-ci
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build semfora-ci
         run: |
-          git clone --depth 1 https://github.com/Semfora-AI/semfora-ci.git /tmp/semfora-ci
-          cd /tmp/semfora-ci
+          cd semfora-ci
           cargo build --release
           sudo cp target/release/semfora-ci /usr/local/bin/
           semfora-ci --version
