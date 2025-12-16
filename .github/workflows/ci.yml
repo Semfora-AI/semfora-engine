@@ -10,8 +10,81 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Semantic analysis runs FIRST - fail fast before building
+  semfora-ci:
+    name: Semantic Analysis
+    runs-on: ubuntu-latest
+    # Only run on PRs (not pushes to main)
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for diff analysis
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache semfora-engine build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: semfora-engine-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            semfora-engine-${{ runner.os }}-
+
+      - name: Build semfora-engine
+        run: |
+          cargo build --release
+          sudo cp target/release/semfora-engine /usr/local/bin/
+          semfora-engine --version
+
+      - name: Checkout semfora-ci
+        uses: actions/checkout@v4
+        with:
+          repository: Semfora-AI/semfora-ci
+          path: semfora-ci
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache semfora-ci build
+        uses: actions/cache@v4
+        with:
+          path: semfora-ci/target
+          key: semfora-ci-${{ runner.os }}-${{ hashFiles('semfora-ci/**/Cargo.lock') }}
+          restore-keys: |
+            semfora-ci-${{ runner.os }}-
+
+      - name: Build semfora-ci
+        run: |
+          cd semfora-ci
+          cargo build --release
+          sudo cp target/release/semfora-ci /usr/local/bin/
+          semfora-ci --version
+
+      - name: Cache Semantic Index
+        uses: actions/cache@v4
+        with:
+          path: .semfora-cache
+          key: semfora-index-${{ runner.os }}-${{ hashFiles('**/*.rs') }}
+          restore-keys: |
+            semfora-index-${{ runner.os }}-
+
+      - name: Run Semantic Analysis
+        id: semfora
+        run: semfora-ci --ci
+        # --ci: Auto-detect GitHub Actions, set format, write step summary
+        # Exits non-zero on errors, blocking the PR
+
+  # Build only runs after semantic analysis passes (for PRs)
+  # For pushes to main, build runs immediately
   build:
     name: Build (${{ matrix.os }})
+    needs: [semfora-ci]
+    # Run if: push to main OR (PR AND semfora-ci passed)
+    if: |
+      always() &&
+      (github.event_name == 'push' || needs.semfora-ci.result == 'success')
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -75,61 +148,3 @@ jobs:
             semfora-engine-*.tar.gz
             semfora-engine-*.zip
           if-no-files-found: error
-
-  # Semantic code analysis using semfora-ci
-  semfora-ci:
-    name: Semantic Analysis
-    needs: build
-    runs-on: ubuntu-latest
-    # Only run on PRs (not pushes to main)
-    if: github.event_name == 'pull_request'
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # Full history for diff analysis
-
-      - name: Download semfora-engine
-        uses: actions/download-artifact@v4
-        with:
-          name: semfora-engine-linux-x86_64
-          path: .
-
-      - name: Extract and install semfora-engine
-        run: |
-          tar -xzf semfora-engine-linux-x86_64.tar.gz
-          chmod +x semfora-engine semfora-engine-server semfora-daemon
-          sudo mv semfora-engine semfora-engine-server semfora-daemon /usr/local/bin/
-          semfora-engine --version
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Checkout semfora-ci
-        uses: actions/checkout@v4
-        with:
-          repository: Semfora-AI/semfora-ci
-          path: semfora-ci
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build semfora-ci
-        run: |
-          cd semfora-ci
-          cargo build --release
-          sudo cp target/release/semfora-ci /usr/local/bin/
-          semfora-ci --version
-
-      - name: Cache Semfora Index
-        uses: actions/cache@v4
-        with:
-          path: .semfora-cache
-          key: semfora-index-${{ runner.os }}-${{ hashFiles('**/*.rs') }}
-          restore-keys: |
-            semfora-index-${{ runner.os }}-
-
-      - name: Run Semantic Analysis
-        id: semfora
-        run: semfora-ci --ci
-        # --ci: Auto-detect GitHub Actions, set format, write step summary
-        # Exits non-zero on errors, blocking the PR
