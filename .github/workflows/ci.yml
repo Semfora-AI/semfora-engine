@@ -123,22 +123,13 @@ jobs:
       - name: Cache Semfora Index
         uses: actions/cache@v4
         with:
-          path: .semfora-cache
+          path: ~/.cache/semfora-engine
           key: semfora-index-${{ runner.os }}-${{ hashFiles('**/*.rs') }}
           restore-keys: |
             semfora-index-${{ runner.os }}-
 
       - name: Run Semantic Analysis
         id: semfora
-        run: semfora-ci --ci --soft-fail
+        run: semfora-ci --ci
         # --ci: Auto-detect GitHub Actions, set format, write step summary
-        # --soft-fail: Don't fail the build, just report issues
-        # Remove --soft-fail to enforce quality gates
-
-      # Optional: Fail the build if there are errors
-      # Uncomment below to enforce quality gates
-      # - name: Check Results
-      #   if: steps.semfora.outputs.errors > 0
-      #   run: |
-      #     echo "Semfora-CI found ${{ steps.semfora.outputs.errors }} error(s)"
-      #     exit 1
+        # Add --soft-fail to report issues without failing the build
