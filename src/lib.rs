@@ -40,6 +40,7 @@
 //! ```
 
 pub mod analysis;
+pub mod bad_code;  // INTENTIONALLY BAD CODE FOR TESTING
 pub mod benchmark;
 pub mod benchmark_builder;
 pub mod bm25;
