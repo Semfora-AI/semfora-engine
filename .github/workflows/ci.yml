@@ -123,7 +123,7 @@ jobs:
       - name: Cache Semfora Index
         uses: actions/cache@v4
         with:
-          path: ~/.cache/semfora-engine
+          path: .semfora-cache
           key: semfora-index-${{ runner.os }}-${{ hashFiles('**/*.rs') }}
           restore-keys: |
             semfora-index-${{ runner.os }}-
@@ -132,4 +132,4 @@ jobs:
         id: semfora
         run: semfora-ci --ci
         # --ci: Auto-detect GitHub Actions, set format, write step summary
-        # Add --soft-fail to report issues without failing the build
+        # Exits non-zero on errors, blocking the PR
