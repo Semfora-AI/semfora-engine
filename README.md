@@ -2,18 +2,6 @@
 
 Semantic code analyzer that produces compressed TOON (Text Object-Oriented Notation) output for AI-assisted code review. Extracts symbols, dependencies, control flow, state changes, and risk assessments from source files.
 
-> [!IMPORTANT]
-> **🚀 Transitioning to Rust-based ADK**
->
-> We are moving away from the Python-based `semfora-adk` to a pure Rust implementation in [`semfora-cli`](https://github.com/Semfora-org/semfora-cli). The new Rust ADK provides better performance, single-binary distribution, and tighter integration with the semantic engine.
->
-> ```bash
-> # Use the new Rust-based CLI agent
-> semfora-cli --rust-adk
-> ```
->
-> See the [semfora-cli repository](https://github.com/Semfora-org/semfora-cli) for installation and usage.
-
 ## Installation
 
 ```bash
@@ -55,180 +43,193 @@ See [CLI Reference](docs/cli.md) for full documentation.
 
 ### Programming Languages
 
-| Language | Extensions | Family | Implementation Details |
-|----------|------------|--------|------------------------|
-| **TypeScript** | `.ts`, `.mts`, `.cts` | JavaScript | Full AST extraction via `tree-sitter-typescript`; exports, interfaces, enums, decorators |
-| **TSX** | `.tsx` | JavaScript | TypeScript + JSX/React component detection, hooks, styled-components |
-| **JavaScript** | `.js`, `.mjs`, `.cjs` | JavaScript | Functions, classes, imports; framework detection for React/Express/Angular |
-| **JSX** | `.jsx` | JavaScript | JavaScript + JSX component detection |
-| **Rust** | `.rs` | Rust | Functions, structs, traits, enums; `pub` visibility detection via `tree-sitter-rust` |
-| **Python** | `.py`, `.pyi` | Python | Functions, classes, decorators; underscore-prefix privacy convention |
-| **Go** | `.go` | Go | Functions, methods, structs; uppercase-export convention via `tree-sitter-go` |
-| **Java** | `.java` | Java | Classes, interfaces, enums, methods; public/private/protected modifiers |
-| **Kotlin** | `.kt`, `.kts` | Kotlin | Classes, functions, objects; visibility modifiers via `tree-sitter-kotlin-ng` |
-| **C** | `.c`, `.h` | C Family | Functions, structs, enums; `extern` detection via `tree-sitter-c` |
-| **C++** | `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hxx`, `.hh` | C Family | Classes, structs, templates; access specifiers via `tree-sitter-cpp` |
-| **Shell/Bash** | `.sh`, `.bash`, `.zsh`, `.fish` | Shell | Function definitions, variable assignments, command calls via `tree-sitter-bash` |
-| **Gradle** | `.gradle` | Gradle | Groovy-based build files; closures, method calls via `tree-sitter-groovy` |
+| Language               | Extensions                                   | Family     | Implementation Details                                                                   |
+| ---------------------- | -------------------------------------------- | ---------- | ---------------------------------------------------------------------------------------- |
+| **TypeScript**         | `.ts`, `.mts`, `.cts`                        | JavaScript | Full AST extraction via `tree-sitter-typescript`; exports, interfaces, enums, decorators |
+| **TSX**                | `.tsx`                                       | JavaScript | TypeScript + JSX/React component detection, hooks, styled-components                     |
+| **JavaScript**         | `.js`, `.mjs`, `.cjs`                        | JavaScript | Functions, classes, imports; framework detection for React, Express, Angular             |
+| **JSX**                | `.jsx`                                       | JavaScript | JavaScript + JSX component detection                                                     |
+| **Rust**               | `.rs`                                        | Rust       | Functions, structs, traits, enums; `pub` visibility detection via `tree-sitter-rust`     |
+| **Python**             | `.py`, `.pyi`                                | Python     | Functions, classes, decorators; underscore-prefix privacy convention                     |
+| **Go**                 | `.go`                                        | Go         | Functions, methods, structs; uppercase-export convention via `tree-sitter-go`            |
+| **Java**               | `.java`                                      | Java       | Classes, interfaces, enums, methods; visibility modifiers                                |
+| **Kotlin**             | `.kt`, `.kts`                                | Kotlin     | Classes, functions, objects; visibility modifiers via `tree-sitter-kotlin-ng`            |
+| **C**                  | `.c`, `.h`                                   | C Family   | Functions, structs, enums; macro and `extern` detection via `tree-sitter-c`              |
+| **C++**                | `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hxx`, `.hh` | C Family   | Classes, templates, RAII patterns via `tree-sitter-cpp`                                  |
+| **Assembly (Generic)** | `.s`, `.asm`, `.S`                           | Low-level  | Instruction blocks, labels, directives via `tree-sitter-asm`                             |
+| **Shell / Bash**       | `.sh`, `.bash`, `.zsh`, `.fish`              | Shell      | Functions, variable assignments, command invocations via `tree-sitter-bash`              |
+| **Gradle (Groovy)**    | `.gradle`                                    | JVM Build  | Groovy-based build files via `tree-sitter-groovy`                                        |
+
+---
+
+### Build Systems & Tooling Languages
+
+These are critical for large C, C++, embedded, and retro-console codebases.
+
+| Language / Format            | Extensions                 | Purpose          | Implementation Details                                   |
+| ---------------------------- | -------------------------- | ---------------- | -------------------------------------------------------- |
+| **Makefile**                 | `Makefile`, `.mk`          | Build system     | Target graph, recipes, variables via `tree-sitter-make`  |
+| **CMake**                    | `CMakeLists.txt`, `.cmake` | Build system     | Target definitions, dependencies via `tree-sitter-cmake` |
+| **GNU Linker Scripts**       | `.ld`                      | Toolchain        | Structural parsing only (no semantic pass yet)           |
+| **GCC Attributes & Pragmas** | inline in C/C++            | Compiler control | Parsed as part of C/C++ AST                              |
+
+---
 
 ### Framework Detection (JavaScript Family)
 
-| Framework | Detection Method | Extracted Information |
-|-----------|------------------|----------------------|
-| **React** | Import from `react` | Components, hooks (useState, useEffect, etc.), forwardRef, memo |
-| **Next.js** | File path patterns (`/app/`, `/pages/`) | API routes, layouts, pages, server/client components |
-| **Express** | Import from `express` | Route handlers (GET, POST, etc.), middleware |
-| **Angular** | `@Component`, `@Injectable` decorators | Components, services, modules |
-| **Vue** | `.vue` files, composition API | SFC script extraction, Options API, Composition API, Pinia stores |
+| Framework   | Detection Method            | Extracted Information                         |
+| ----------- | --------------------------- | --------------------------------------------- |
+| **React**   | Import from `react`         | Components, hooks, forwardRef, memo           |
+| **Next.js** | `/app/`, `/pages/` patterns | API routes, layouts, server/client components |
+| **Express** | Import from `express`       | Route handlers, middleware                    |
+| **Angular** | Decorators (`@Component`)   | Components, services, modules                 |
+| **Vue**     | `.vue` files                | SFC script extraction, Composition API        |
+
+---
 
 ### Markup & Styling
 
-| Language | Extensions | Implementation Details |
-|----------|------------|------------------------|
-| **HTML** | `.html`, `.htm` | Document structure via `tree-sitter-html` |
-| **CSS** | `.css` | Stylesheet detection via `tree-sitter-css` |
-| **SCSS/SASS** | `.scss`, `.sass` | Stylesheet detection via `tree-sitter-scss` |
-| **Markdown** | `.md`, `.markdown` | Document structure via `tree-sitter-md` |
+| Language        | Extensions         | Implementation Details                           |
+| --------------- | ------------------ | ------------------------------------------------ |
+| **HTML**        | `.html`, `.htm`    | DOM structure via `tree-sitter-html`             |
+| **CSS**         | `.css`             | Stylesheet structure via `tree-sitter-css`       |
+| **SCSS / SASS** | `.scss`, `.sass`   | Nested rules via `tree-sitter-scss`              |
+| **Markdown**    | `.md`, `.markdown` | Section and block structure via `tree-sitter-md` |
+
+---
 
 ### Configuration & Data
 
-| Language | Extensions | Implementation Details |
-|----------|------------|------------------------|
-| **JSON** | `.json` | Structure parsing via `tree-sitter-json` |
-| **YAML** | `.yaml`, `.yml` | Structure parsing via `tree-sitter-yaml` |
-| **TOML** | `.toml` | Structure parsing via `tree-sitter-toml-ng` |
-| **XML** | `.xml`, `.xsd`, `.xsl`, `.xslt`, `.svg`, `.plist`, `.pom` | Structure parsing via `tree-sitter-xml` |
-| **HCL/Terraform** | `.tf`, `.hcl`, `.tfvars` | Infrastructure-as-code via `tree-sitter-hcl` |
+| Language            | Extensions                       | Implementation Details                    |
+| ------------------- | -------------------------------- | ----------------------------------------- |
+| **JSON**            | `.json`                          | Structural parsing via `tree-sitter-json` |
+| **YAML**            | `.yaml`, `.yml`                  | Structural parsing via `tree-sitter-yaml` |
+| **TOML**            | `.toml`                          | Config parsing via `tree-sitter-toml-ng`  |
+| **XML**             | `.xml`, `.svg`, `.plist`, `.pom` | Tree structure via `tree-sitter-xml`      |
+| **HCL / Terraform** | `.tf`, `.hcl`, `.tfvars`         | IaC parsing via `tree-sitter-hcl`         |
+
+---
 
 ### Single-File Components
 
-| Format | Extension | Implementation Details |
-|--------|-----------|------------------------|
-| **Vue SFC** | `.vue` | Extracts `<script>` or `<script setup>` section; detects `lang` attribute (ts/tsx/js); parses with appropriate grammar |
+| Format      | Extension | Implementation Details                        |
+| ----------- | --------- | --------------------------------------------- |
+| **Vue SFC** | `.vue`    | Script extraction with language-aware parsing |
+
+---
 
 ## Duplicate Detection & Boilerplate Patterns
 
-Semfora Engine includes semantic duplicate detection that identifies similar functions while filtering out expected boilerplate patterns.
+Semfora Engine includes semantic duplicate detection that identifies structurally similar code while filtering expected boilerplate.
 
 ### Current Boilerplate Coverage
 
-| Language | Patterns | Status |
-|----------|----------|--------|
-| **JavaScript/TypeScript** | 19 patterns | Full support |
-| **Rust** | 13 patterns | Full support |
-| **C#** | 18 patterns | Full support |
-| **Python** | 0 patterns | Planned |
-| **Go** | 0 patterns | Planned |
-| **Java** | 0 patterns | Planned |
-| **C/C++** | 0 patterns | Planned |
+| Language                | Patterns | Status          |
+| ----------------------- | -------- | --------------- |
+| JavaScript / TypeScript | 19       | Full support    |
+| Rust                    | 13       | Full support    |
+| C#                      | 18       | Full support    |
+| Python                  | 0        | Planned         |
+| Go                      | 0        | Planned         |
+| Java                    | 0        | Planned         |
+| C / C++                 | 0        | Planned         |
+| Assembly                | N/A      | Structural only |
 
-### JavaScript/TypeScript Patterns (19)
-- ReactQuery, ReactHook, EventHandler, ApiRoute, TestSetup, TypeGuard
-- ConfigExport, ReduxPattern, ValidationSchema, TestMock, NextjsDataFetching
-- ReactWrapper, ClassicReduxReducer, ApiWrapper
-- ContextProvider, SimpleContextHook, HOCWrapper, LazyComponent, SuspenseBoundary
-
-### Rust Patterns (13)
-- RustTraitImpl, RustBuilder, RustGetter, RustSetter, RustConstructor
-- RustConversion, RustDerived, RustErrorFrom, RustIterator, RustDeref
-- RustDrop, RustTest, RustSerde
-
-### C# Patterns (18)
-- **ASP.NET Core**: AspNetController, AspNetMinimalApi, AspNetMiddleware, AspNetDI
-- **Entity Framework**: EFDbContext, EFDbSet, EFFluentApi, EFMigration
-- **Testing**: XUnitTest, NUnitTest, MoqSetup
-- **LINQ**: LinqChain, LinqProjection
-- **Unity**: UnityLifecycle, UnitySerializedField, UnityScriptableObject
-- **General**: CSharpProperty, CSharpRecord
+---
 
 ### Planned Boilerplate Patterns
 
-| Language | Planned Patterns | Priority |
-|----------|------------------|----------|
-| **Python** | pytest fixtures, dataclasses, FastAPI/Flask routes, Pydantic models, Django views | High |
-| **Go** | HTTP handlers, middleware, error wrapping, builder structs, test helpers | High |
-| **Java** | Spring controllers/services, Lombok-generated, DTOs, JPA entities, JUnit tests | High |
-| **C/C++** | Getters/setters, RAII wrappers, copy/move boilerplate, operator overloads | Medium |
-| **Kotlin** | Data classes, Spring Boot, Ktor routing, Android ViewModel, coroutines | High |
+| Language     | Planned Patterns                                              | Priority |
+| ------------ | ------------------------------------------------------------- | -------- |
+| **Python**   | pytest fixtures, dataclasses, FastAPI routes, Pydantic models | High     |
+| **Go**       | HTTP handlers, middleware, error wrapping                     | High     |
+| **Java**     | Spring controllers, Lombok, DTOs, JPA entities                | High     |
+| **C / C++**  | RAII wrappers, copy/move boilerplate, driver init blocks      | High     |
+| **Kotlin**   | Data classes, coroutines, Ktor routing                        | High     |
+| **Makefile** | Repeated build targets, recursive includes                    | Medium   |
+
+---
 
 ## Language Roadmap
 
-Prioritized based on enterprise adoption potential and architectural fit with Semfora's orchestrator-first design.
+Prioritized by enterprise relevance, embedded systems reach, and large-repo payoff.
 
-### C# and .NET Ecosystem (COMPLETE)
+### Completed
 
-Full C# support implemented with 18 boilerplate patterns covering ASP.NET Core, Entity Framework, Unity, LINQ, and testing frameworks. See [C# Patterns](#c-patterns-18) above.
+* C#
+* HCL / Terraform
+* JavaScript / TypeScript
+* Rust
+* Core C / C++
 
-### HCL/Terraform (COMPLETE)
+---
 
-Full HCL support implemented for infrastructure-as-code analysis (`.tf`, `.hcl`, `.tfvars`).
+### Priority 1: Deep C / C++ Expansion
 
-### Priority 1: Kotlin
+Critical for:
 
-Complements Java support for Android and modern JVM coverage.
+* Embedded systems
+* Emulators
+* Operating systems
+* Retro-console SDKs (KallistiOS, SDL ports)
 
-| Item | Details |
-|------|---------|
-| **Extensions** | `.kt`, `.kts` |
-| **Parser** | `tree-sitter-kotlin` (already integrated) |
-| **Targets** | Data classes, coroutines, extension functions, sealed classes |
+| Focus                    | Details                                    |
+| ------------------------ | ------------------------------------------ |
+| **Assembly Integration** | SH-4, ARM, x86 inline asm correlation      |
+| **Driver Patterns**      | IRQ handlers, register maps, init/shutdown |
+| **Build Graphs**         | Makefile + CMake cross-analysis            |
 
-**Framework Patterns**: Spring Boot, Ktor routing, Android ViewModel + LiveData, coroutine scopes
+---
 
-### Priority 2: Swift
+### Priority 2: Kotlin
 
-Unlocks iOS/macOS and SwiftUI ecosystems.
+| Item    | Details                                      |
+| ------- | -------------------------------------------- |
+| Parser  | `tree-sitter-kotlin-ng`                      |
+| Targets | Coroutines, sealed classes, Android + server |
 
-| Item | Details |
-|------|---------|
-| **Extensions** | `.swift` |
-| **Parser** | `tree-sitter-swift` |
-| **Targets** | Struct vs class semantics, protocol conformance, property wrappers, async/await |
+---
 
-### Priority 3: PHP
+### Priority 3: Swift
 
-High ROI due to extreme boilerplate density in Laravel/WordPress codebases.
+| Item    | Details                         |
+| ------- | ------------------------------- |
+| Parser  | `tree-sitter-swift`             |
+| Targets | Protocols, SwiftUI, async/await |
 
-| Item | Details |
-|------|---------|
-| **Extensions** | `.php` |
-| **Parser** | `tree-sitter-php` |
-| **Targets** | Laravel controllers, service providers, middleware, Eloquent models |
+---
 
-### Priority 4: Ruby
+### Priority 4: PHP
 
-Smaller but relevant via Rails ecosystem.
+| Item    | Details            |
+| ------- | ------------------ |
+| Parser  | `tree-sitter-php`  |
+| Targets | Laravel, WordPress |
 
-| Item | Details |
-|------|---------|
-| **Extensions** | `.rb` |
-| **Parser** | `tree-sitter-ruby` |
-| **Targets** | ActiveRecord models, Rails controllers, RSpec scaffolding |
+---
 
-### Priority 5: Infra Languages (Non-Semantic)
+### Priority 5: Infra & Tooling (Structural)
 
-Structural parsing for repo comprehension without full semantic analysis.
+| Language       | Extensions   | Mode       |
+| -------------- | ------------ | ---------- |
+| Dockerfile     | `Dockerfile` | Structural |
+| PowerShell     | `.ps1`       | Structural |
+| Linker scripts | `.ld`        | Structural |
 
-| Language | Extensions | Mode |
-|----------|------------|------|
-| PowerShell | `.ps1` | Parser-only |
-| Dockerfile | `Dockerfile` | Structural |
-| Makefile | `Makefile` | Structural |
+---
 
 ## Known Unsupported Formats
 
-These formats were identified in test repositories but are not currently supported:
+| Format           | Extensions    | Reason                       |
+| ---------------- | ------------- | ---------------------------- |
+| Jest Snapshots   | `.shot`       | Test artifacts               |
+| MDX              | `.mdx`        | Hybrid JSX + Markdown        |
+| AsciiDoc         | `.adoc`       | Docs-only                    |
+| Protocol Buffers | `.proto`      | Tree-sitter version mismatch |
+| Scala            | `.scala`      | Low demand vs complexity     |
+| Elixir           | `.ex`, `.exs` | Low enterprise priority      |
 
-| Format | Extensions | Count* | Reason |
-|--------|------------|--------|--------|
-| **Jest Snapshots** | `.shot` | 5,140 | Test artifacts, not semantic code |
-| **MDX** | `.mdx` | 861 | Documentation format (Markdown + JSX) |
-| **AsciiDoc** | `.adoc` | 690 | Documentation format |
-| **Protocol Buffers** | `.proto`, `.pb` | 550 | `devgen-tree-sitter-protobuf` requires tree-sitter 0.21 (incompatible) |
-| **Scala** | `.scala` | varies | Complex AST, only if enterprise demand |
-| **Elixir** | `.ex`, `.exs` | varies | Lower priority |
-
-*Counts from typescript-eslint, terraform, spring-framework, and prometheus test repositories.
+---
 
 ## Architecture
 
@@ -292,5 +293,3 @@ src/
 | [Engineering](docs/engineering.md) | Implementation details and status |
 
 ## License
-
-MIT
