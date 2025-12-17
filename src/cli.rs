@@ -1,6 +1,6 @@
 //! CLI argument definitions using clap
 
-use clap::{Parser, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 use crate::tokens::{format_analysis_compact, format_analysis_report, TokenAnalyzer};
@@ -12,8 +12,12 @@ use crate::tokens::{format_analysis_compact, format_analysis_report, TokenAnalyz
 #[command(version)]
 #[command(author)]
 pub struct Cli {
+    /// Subcommand (setup, uninstall, config)
+    #[command(subcommand)]
+    pub command: Option<Commands>,
+
     /// Path to file to analyze (single file mode)
-    #[arg(value_name = "FILE", required_unless_present_any = ["diff", "commit", "commits", "uncommitted", "cache_info", "cache_clear", "cache_prune", "dir", "benchmark", "list_modules", "get_module", "search_symbols", "list_symbols", "get_symbol", "get_overview", "get_call_graph", "analyze", "find_duplicates", "check_duplicates", "get_source", "raw_search", "semantic_search", "file_symbols", "get_callers", "export_sqlite"])]
+    #[arg(value_name = "FILE")]
     pub file: Option<PathBuf>,
 
     /// Output format
@@ -430,4 +434,104 @@ impl Cli {
             }
         })
     }
+}
+
+// ============================================
+// Subcommands for Installer System
+// ============================================
+
+/// Available subcommands for semfora-engine
+#[derive(Subcommand, Debug)]
+pub enum Commands {
+    /// Setup semfora-engine installation and MCP client configuration
+    Setup(SetupCliArgs),
+
+    /// Uninstall semfora-engine or remove MCP configurations
+    Uninstall(UninstallCliArgs),
+
+    /// Manage semfora-engine configuration
+    Config(ConfigCliArgs),
+}
+
+/// Arguments for the setup command
+#[derive(Args, Debug)]
+pub struct SetupCliArgs {
+    /// Run in non-interactive mode (use with --clients)
+    #[arg(long)]
+    pub non_interactive: bool,
+
+    /// MCP clients to configure (comma-separated)
+    /// Available: claude-desktop, claude-code, cursor, vscode, openai-codex
+    #[arg(long, value_delimiter = ',')]
+    pub clients: Option<Vec<String>>,
+
+    /// Export MCP config to a custom path
+    #[arg(long, value_name = "PATH")]
+    pub export_config: Option<PathBuf>,
+
+    /// Override the server binary path
+    #[arg(long, value_name = "PATH")]
+    pub binary_path: Option<PathBuf>,
+
+    /// Override the cache directory
+    #[arg(long, value_name = "PATH")]
+    pub cache_dir: Option<PathBuf>,
+
+    /// Log level for MCP server (error, info, debug)
+    #[arg(long, default_value = "info")]
+    pub log_level: String,
+
+    /// Dry run - show what would be done without making changes
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// List available MCP clients
+    #[arg(long)]
+    pub list_clients: bool,
+}
+
+/// Arguments for the uninstall command
+#[derive(Args, Debug)]
+pub struct UninstallCliArgs {
+    /// What to uninstall: mcp, engine, or all
+    #[arg(value_name = "TARGET", default_value = "mcp")]
+    pub target: String,
+
+    /// Specific client to remove (only for mcp target)
+    #[arg(long, value_name = "CLIENT")]
+    pub client: Option<String>,
+
+    /// Keep cache data when removing engine
+    #[arg(long)]
+    pub keep_cache: bool,
+
+    /// Skip confirmation prompts
+    #[arg(long, short)]
+    pub force: bool,
+}
+
+/// Arguments for the config command
+#[derive(Args, Debug)]
+pub struct ConfigCliArgs {
+    /// Config operation: show, set, reset
+    #[command(subcommand)]
+    pub operation: ConfigOperation,
+}
+
+/// Config subcommand operations
+#[derive(Subcommand, Debug)]
+pub enum ConfigOperation {
+    /// Show current configuration
+    Show,
+
+    /// Set a configuration value
+    Set {
+        /// Configuration key (e.g., cache.dir, logging.level)
+        key: String,
+        /// Value to set
+        value: String,
+    },
+
+    /// Reset configuration to defaults
+    Reset,
 }

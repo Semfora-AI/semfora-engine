@@ -6,7 +6,10 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
-use semfora_engine::cli::{OperationMode, TokenAnalysisMode};
+use semfora_engine::cli::{Commands, ConfigOperation, OperationMode, TokenAnalysisMode};
+use semfora_engine::installer::{
+    self, print_available_clients, ConfigArgs, SetupArgs, UninstallArgs,
+};
 use semfora_engine::git::{
     get_changed_files, get_commit_changed_files, get_commits_since, get_file_at_ref,
     get_merge_base, get_repo_root, is_git_repo, ChangedFile, ChangeType,
@@ -38,6 +41,11 @@ fn main() -> ExitCode {
 
 fn run() -> semfora_engine::Result<String> {
     let cli = Cli::parse();
+
+    // Handle subcommands (setup, uninstall, config) first
+    if let Some(ref cmd) = cli.command {
+        return handle_subcommand(cmd);
+    }
 
     // Handle cache commands first (they don't require operation mode)
     if cli.cache_info {
@@ -151,6 +159,66 @@ fn run() -> semfora_engine::Result<String> {
         OperationMode::Uncommitted { base_ref } => run_uncommitted(&cli, &base_ref),
         OperationMode::SingleCommit { sha } => run_single_commit(&cli, &sha),
         OperationMode::AllCommits { base_ref } => run_all_commits(&cli, &base_ref),
+    }
+}
+
+/// Handle installer subcommands (setup, uninstall, config)
+fn handle_subcommand(cmd: &Commands) -> semfora_engine::Result<String> {
+    match cmd {
+        Commands::Setup(args) => {
+            // Handle --list-clients flag
+            if args.list_clients {
+                print_available_clients();
+                return Ok(String::new());
+            }
+
+            // Convert CLI args to installer args
+            let setup_args = SetupArgs {
+                non_interactive: args.non_interactive,
+                clients: args.clients.clone(),
+                export_config: args.export_config.clone(),
+                binary_path: args.binary_path.clone(),
+                cache_dir: args.cache_dir.clone(),
+                log_level: args.log_level.clone(),
+                dry_run: args.dry_run,
+            };
+
+            installer::run_setup(setup_args)?;
+            Ok(String::new())
+        }
+        Commands::Uninstall(args) => {
+            let uninstall_args = UninstallArgs {
+                target: args.target.clone(),
+                client: args.client.clone(),
+                keep_cache: args.keep_cache,
+                force: args.force,
+            };
+
+            installer::run_uninstall(uninstall_args)?;
+            Ok(String::new())
+        }
+        Commands::Config(args) => {
+            let config_args = match &args.operation {
+                ConfigOperation::Show => ConfigArgs {
+                    command: "show".to_string(),
+                    key: None,
+                    value: None,
+                },
+                ConfigOperation::Set { key, value } => ConfigArgs {
+                    command: "set".to_string(),
+                    key: Some(key.clone()),
+                    value: Some(value.clone()),
+                },
+                ConfigOperation::Reset => ConfigArgs {
+                    command: "reset".to_string(),
+                    key: None,
+                    value: None,
+                },
+            };
+
+            installer::run_config(config_args)?;
+            Ok(String::new())
+        }
     }
 }
 

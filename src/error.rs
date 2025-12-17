@@ -1,5 +1,6 @@
 //! Error types and exit codes for semfora-engine
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 use thiserror::Error;
 
@@ -32,6 +33,30 @@ pub enum McpDiffError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("IO error at {path}: {message}")]
+    IoError { path: PathBuf, message: String },
+
+    #[error("HTTP error: {0}")]
+    Http(#[from] reqwest::Error),
+
+    #[error("Serialization error: {0}")]
+    Serialization(String),
+
+    #[error("Configuration error: {message}")]
+    ConfigError { message: String },
+
+    #[error("Installation error: {message}")]
+    InstallError { message: String },
+
+    #[error("{0}")]
+    Generic(String),
+}
+
+impl From<Box<bincode::ErrorKind>> for McpDiffError {
+    fn from(err: Box<bincode::ErrorKind>) -> Self {
+        McpDiffError::Serialization(err.to_string())
+    }
 }
 
 impl McpDiffError {
@@ -54,6 +79,12 @@ impl McpDiffError {
             Self::NotGitRepo => ExitCode::from(5),
             Self::ExportError { .. } => ExitCode::from(6),
             Self::Io(_) => ExitCode::from(1),
+            Self::IoError { .. } => ExitCode::from(1),
+            Self::Http(_) => ExitCode::from(7),
+            Self::Serialization(_) => ExitCode::from(8),
+            Self::ConfigError { .. } => ExitCode::from(10),
+            Self::InstallError { .. } => ExitCode::from(11),
+            Self::Generic(_) => ExitCode::from(9),
         }
     }
 }

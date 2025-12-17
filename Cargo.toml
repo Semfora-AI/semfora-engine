@@ -21,6 +21,14 @@ path = "src/socket_server/bin.rs"
 name = "semfora-benchmark-builder"
 path = "src/benchmark_builder/bin.rs"
 
+[[bin]]
+name = "semfora-security-compiler"
+path = "src/security/compiler/bin.rs"
+
+[features]
+default = []
+embedded-patterns = []
+
 [dependencies]
 # Core parsing
 tree-sitter = "0.25"
@@ -51,10 +59,11 @@ tree-sitter-scss = "1.0"
 tree-sitter-hcl = "1.1"
 tree-sitter-xml = "0.7"
 tree-sitter-groovy = "0.1"
+# tree-sitter-dockerfile requires update to tree-sitter 0.25
 # Note: protobuf crate conflicts with tree-sitter 0.24, skipped for now
 
 # CLI & Error handling
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive", "env"] }
 thiserror = "1.0"
 
 # Serialization (for JSON output format)
@@ -101,6 +110,19 @@ uuid = { version = "1.0", features = ["v4"] }
 
 # SQLite export for call graph visualization
 rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Security pattern detection (CVE fingerprinting)
+once_cell = "1.19"
+bincode = "1.3"
+reqwest = { version = "0.12", features = ["json"] }
+
+# Installer system (setup wizard, MCP client configuration)
+dialoguer = "0.11"
+console = "0.15"
+indicatif = "0.17"
+which = "6.0"
+json5 = "0.4"
+toml = "0.8"
 
 [build-dependencies]
 cc = "1.0"

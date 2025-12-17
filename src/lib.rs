@@ -51,6 +51,7 @@ pub mod duplicate;
 pub mod error;
 pub mod extract;
 pub mod git;
+pub mod installer;
 pub mod lang;
 pub mod mcp_server;
 pub mod overlay;
@@ -58,6 +59,7 @@ pub mod ripgrep;
 pub mod risk;
 pub mod schema;
 pub mod search;
+pub mod security;
 pub mod server;
 pub mod shard;
 pub mod socket_server;
@@ -158,6 +160,11 @@ pub use duplicate::{
 pub use sqlite_export::{
     default_export_path, ExportPhase, ExportProgress, ExportStats, ProgressCallback,
     SqliteExporter,
+};
+
+// Re-export security types (CVE pattern detection)
+pub use security::{
+    CVEMatch, CVEPattern, CVEScanSummary, PatternDatabase, PatternSource, Severity,
 };
 
 // Test change to trigger semfora-ci workflow
