@@ -1228,6 +1228,12 @@ pub fn extract_module_name(file_path: &str) -> String {
         }
     }
 
+    // If still no marker found and path looks absolute, try to find project root
+    // by detecting common project subdirectories (tests/, docs/, etc.)
+    if relative_path == file_path && file_path.starts_with('/') {
+        relative_path = detect_project_relative_path(file_path);
+    }
+
     // Get the directory path (everything before the filename)
     let path = std::path::Path::new(relative_path);
     if let Some(parent) = path.parent() {
@@ -1249,6 +1255,85 @@ pub fn extract_module_name(file_path: &str) -> String {
     }
 
     stem.to_string()
+}
+
+/// Detect project root from absolute path and return relative path.
+///
+/// Looks for common project subdirectories (tests/, docs/, etc.) and
+/// assumes the directory before them is the project root.
+fn detect_project_relative_path(file_path: &str) -> &str {
+    // Common project-level directories that indicate we're at project root
+    let project_subdirs = [
+        "/tests/",
+        "/test/",
+        "/docs/",
+        "/doc/",
+        "/scripts/",
+        "/examples/",
+        "/benchmarks/",
+        "/benches/",
+        "/tickets/",
+        "/migrations/",
+        "/fixtures/",
+        "/specs/",
+        "/__tests__/",
+        "/__mocks__/",
+    ];
+
+    // Find the first project subdir in the path
+    for subdir in &project_subdirs {
+        if let Some(pos) = file_path.find(subdir) {
+            // Return from the subdir onwards (without leading /)
+            return &file_path[pos + 1..];
+        }
+    }
+
+    // No project subdir found - try to detect Python package structure
+    // Look for a directory that could be a Python package (lowercase, underscores)
+    // followed by a Python file
+    if file_path.ends_with(".py") {
+        // Split into components and look for package-like directories
+        let components: Vec<&str> = file_path.split('/').collect();
+
+        // Look for patterns like /project-name/package_name/file.py
+        // where package_name uses underscores (Python convention)
+        for (i, component) in components.iter().enumerate() {
+            // Skip empty components and root
+            if component.is_empty() || i < 2 {
+                continue;
+            }
+
+            // Python packages typically use underscores, not hyphens
+            // If we find a directory with underscores followed by .py files,
+            // that's likely our package root
+            if component.contains('_') && !component.contains('-') {
+                // Check if this could be a Python package name
+                // Return from this component onwards
+                let start_pos: usize = components[..i].iter().map(|c| c.len() + 1).sum();
+                return &file_path[start_pos..];
+            }
+        }
+    }
+
+    // Fallback: if path has many components, try to find a reasonable cut point
+    // Look for directories that look like project names (hyphenated or underscored)
+    let components: Vec<&str> = file_path.split('/').collect();
+    if components.len() > 4 {
+        // Skip typical prefix directories (home, user, Dev, etc.)
+        // Look for a directory that looks like a project name
+        for (i, component) in components.iter().enumerate().skip(3) {
+            if component.contains('-') || component.contains('_') {
+                // This looks like a project directory, return everything after it
+                let start_pos: usize = components[..=i].iter().map(|c| c.len() + 1).sum();
+                if start_pos < file_path.len() {
+                    return &file_path[start_pos..];
+                }
+            }
+        }
+    }
+
+    // Give up - return original path
+    file_path
 }
 
 #[cfg(test)]
@@ -1299,6 +1384,41 @@ mod tests {
         // Monorepo paths (packages/)
         assert_eq!(extract_module_name("/repo/packages/core/utils/format.ts"), "core.utils");
         assert_eq!(extract_module_name("packages/api/handlers/auth.ts"), "api.handlers");
+
+        // Absolute paths with project subdirectories (tests/, docs/, etc.)
+        // These should be detected as project-relative
+        assert_eq!(
+            extract_module_name("/home/user/Dev/my-project/tests/test_db.py"),
+            "tests"
+        );
+        assert_eq!(
+            extract_module_name("/home/user/projects/semfora-pm/tests/unit/test_api.py"),
+            "tests.unit"
+        );
+        assert_eq!(
+            extract_module_name("/home/user/code/my-app/docs/api.md"),
+            "docs"
+        );
+        assert_eq!(
+            extract_module_name("/home/kadajett/Dev/Semfora_org/semfora-pm/tickets/backlog.yaml"),
+            "tickets"
+        );
+
+        // Python packages with underscore naming
+        assert_eq!(
+            extract_module_name("/home/user/project/semfora_pm/db/connection.py"),
+            "semfora_pm.db"
+        );
+        assert_eq!(
+            extract_module_name("/home/user/project/my_package/utils/helpers.py"),
+            "my_package.utils"
+        );
+
+        // Fallback for hyphenated project names
+        assert_eq!(
+            extract_module_name("/home/user/Dev/my-cool-project/config/settings.toml"),
+            "config"
+        );
     }
 
     #[test]
