@@ -45,6 +45,7 @@ pub mod benchmark_builder;
 pub mod bm25;
 pub mod cache;
 pub mod cli;
+pub mod commands;
 pub mod detectors;
 pub mod drift;
 pub mod duplicate;

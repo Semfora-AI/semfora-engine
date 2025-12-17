@@ -1,0 +1,804 @@
+//! Query command handler - Query the semantic index for symbols, source, callers, etc.
+
+use std::fs;
+
+use crate::cache::{CacheDir, SymbolIndexEntry};
+use crate::cli::{OutputFormat, QueryArgs, QueryType};
+use crate::commands::CommandContext;
+use crate::error::{McpDiffError, Result};
+
+/// Run the query command
+pub fn run_query(args: &QueryArgs, ctx: &CommandContext) -> Result<String> {
+    match &args.query_type {
+        QueryType::Overview { modules, max_modules } => {
+            run_overview(*modules, *max_modules, ctx)
+        }
+        QueryType::Module { name, symbols, kind, risk, limit } => {
+            if *symbols {
+                run_list_module_symbols(name, kind.as_deref(), risk.as_deref(), *limit, ctx)
+            } else {
+                run_get_module(name, ctx)
+            }
+        }
+        QueryType::Symbol { hash, source } => run_get_symbol(hash, *source, ctx),
+        QueryType::Source { file, start, end, hash, context } => {
+            run_get_source(file, *start, *end, hash.as_deref(), *context, ctx)
+        }
+        QueryType::Callers { hash, depth, source, limit } => {
+            run_get_callers(hash, *depth, *source, *limit, ctx)
+        }
+        QueryType::Callgraph { module, symbol, export, stats_only, limit } => {
+            run_get_callgraph(module.as_deref(), symbol.as_deref(), export.as_deref(), *stats_only, *limit, ctx)
+        }
+        QueryType::File { path, source, kind } => {
+            run_file_symbols(path, *source, kind.as_deref(), ctx)
+        }
+        QueryType::Languages => run_list_languages(ctx),
+    }
+}
+
+/// Get repository overview
+fn run_overview(include_modules: bool, max_modules: usize, ctx: &CommandContext) -> Result<String> {
+    let repo_dir = std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
+        path: format!("current directory: {}", e),
+    })?;
+    let cache = CacheDir::for_repo(&repo_dir)?;
+
+    if !cache.exists() {
+        return Err(McpDiffError::GitError {
+            message: "No index found. Run `semfora index generate` first.".to_string(),
+        });
+    }
+
+    // Read overview
+    let overview_path = cache.repo_overview_path();
+    if !overview_path.exists() {
+        return Err(McpDiffError::FileNotFound {
+            path: "repo_overview.toon not found in cache".to_string(),
+        });
+    }
+
+    let content = fs::read_to_string(&overview_path)?;
+
+    match ctx.format {
+        OutputFormat::Json => {
+            // Return as-is for JSON
+            Ok(content)
+        }
+        OutputFormat::Toon => {
+            // Parse and format as TOON
+            let overview: serde_json::Value = serde_json::from_str(&content)
+                .map_err(|e| McpDiffError::GitError { message: format!("Parse error: {}", e) })?;
+
+            let mut output = String::new();
+            output.push_str("_type: repo_overview\n\n");
+
+            if let Some(stats) = overview.get("stats") {
+                output.push_str("stats:\n");
+                if let Some(files) = stats.get("files") {
+                    output.push_str(&format!("  files: {}\n", files));
+                }
+                if let Some(symbols) = stats.get("symbols") {
+                    output.push_str(&format!("  symbols: {}\n", symbols));
+                }
+                if let Some(functions) = stats.get("functions") {
+                    output.push_str(&format!("  functions: {}\n", functions));
+                }
+            }
+
+            if include_modules {
+                if let Some(modules) = overview.get("modules").and_then(|m| m.as_array()) {
+                    output.push_str(&format!("\nmodules[{}]:\n", modules.len().min(max_modules)));
+                    for module in modules.iter().take(max_modules) {
+                        if let Some(name) = module.get("name").and_then(|n| n.as_str()) {
+                            let count = module.get("symbol_count").and_then(|c| c.as_u64()).unwrap_or(0);
+                            output.push_str(&format!("  - {} ({})\n", name, count));
+                        }
+                    }
+                }
+            }
+
+            Ok(output)
+        }
+    }
+}
+
+/// Get a specific module's details
+fn run_get_module(name: &str, ctx: &CommandContext) -> Result<String> {
+    let repo_dir = std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
+        path: format!("current directory: {}", e),
+    })?;
+    let cache = CacheDir::for_repo(&repo_dir)?;
+
+    let module_file_path = cache.module_path(name);
+    if !module_file_path.exists() {
+        return Err(McpDiffError::FileNotFound {
+            path: format!("Module '{}' not found", name),
+        });
+    }
+
+    let content = fs::read_to_string(&module_file_path)?;
+
+    match ctx.format {
+        OutputFormat::Json => Ok(content),
+        OutputFormat::Toon => {
+            let module: serde_json::Value = serde_json::from_str(&content)
+                .map_err(|e| McpDiffError::GitError { message: format!("Parse error: {}", e) })?;
+
+            let mut output = String::new();
+            output.push_str(&format!("_type: module\nname: {}\n\n", name));
+
+            if let Some(symbols) = module.get("symbols").and_then(|s| s.as_array()) {
+                output.push_str(&format!("symbols[{}]:\n", symbols.len()));
+                for sym in symbols.iter().take(50) {
+                    let sym_name = sym.get("symbol").or_else(|| sym.get("s")).and_then(|s| s.as_str()).unwrap_or("?");
+                    let kind = sym.get("kind").or_else(|| sym.get("k")).and_then(|k| k.as_str()).unwrap_or("?");
+                    let file = sym.get("file").or_else(|| sym.get("f")).and_then(|f| f.as_str()).unwrap_or("?");
+                    let lines = sym.get("lines").or_else(|| sym.get("l")).and_then(|l| l.as_str()).unwrap_or("?");
+                    output.push_str(&format!("  {} ({}) - {}:{}\n", sym_name, kind, file, lines));
+                }
+            }
+
+            Ok(output)
+        }
+    }
+}
+
+/// List symbols in a module
+fn run_list_module_symbols(
+    module_name: &str,
+    kind_filter: Option<&str>,
+    risk_filter: Option<&str>,
+    limit: usize,
+    ctx: &CommandContext,
+) -> Result<String> {
+    let repo_dir = std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
+        path: format!("current directory: {}", e),
+    })?;
+    let cache = CacheDir::for_repo(&repo_dir)?;
+
+    // Read and parse module file
+    let module_file_path = cache.module_path(module_name);
+    if !module_file_path.exists() {
+        return Err(McpDiffError::FileNotFound {
+            path: format!("Module '{}' not found", module_name),
+        });
+    }
+
+    let content = fs::read_to_string(&module_file_path)?;
+    let module: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| McpDiffError::GitError { message: format!("Parse error: {}", e) })?;
+
+    let mut symbols: Vec<SymbolIndexEntry> = Vec::new();
+
+    if let Some(sym_array) = module.get("symbols").and_then(|s| s.as_array()) {
+        for sym in sym_array {
+            let entry: SymbolIndexEntry = serde_json::from_value(sym.clone())
+                .unwrap_or_else(|_| SymbolIndexEntry {
+                    symbol: sym.get("symbol").or_else(|| sym.get("s")).and_then(|s| s.as_str()).unwrap_or("?").to_string(),
+                    hash: sym.get("hash").or_else(|| sym.get("h")).and_then(|h| h.as_str()).unwrap_or("").to_string(),
+                    semantic_hash: String::new(),
+                    kind: sym.get("kind").or_else(|| sym.get("k")).and_then(|k| k.as_str()).unwrap_or("?").to_string(),
+                    module: module_name.to_string(),
+                    file: sym.get("file").or_else(|| sym.get("f")).and_then(|f| f.as_str()).unwrap_or("?").to_string(),
+                    lines: sym.get("lines").or_else(|| sym.get("l")).and_then(|l| l.as_str()).unwrap_or("?").to_string(),
+                    risk: sym.get("risk").or_else(|| sym.get("r")).and_then(|r| r.as_str()).unwrap_or("low").to_string(),
+                    cognitive_complexity: sym.get("cc").and_then(|c| c.as_u64()).unwrap_or(0) as usize,
+                    max_nesting: sym.get("nest").and_then(|n| n.as_u64()).unwrap_or(0) as usize,
+                });
+
+            // Apply filters
+            if let Some(kf) = kind_filter {
+                if !entry.kind.eq_ignore_ascii_case(kf) {
+                    continue;
+                }
+            }
+            if let Some(rf) = risk_filter {
+                if !entry.risk.eq_ignore_ascii_case(rf) {
+                    continue;
+                }
+            }
+
+            symbols.push(entry);
+            if symbols.len() >= limit {
+                break;
+            }
+        }
+    }
+
+    let mut output = String::new();
+
+    match ctx.format {
+        OutputFormat::Json => {
+            let json = serde_json::json!({
+                "module": module_name,
+                "symbols": symbols,
+                "count": symbols.len()
+            });
+            output = serde_json::to_string_pretty(&json).unwrap_or_default();
+        }
+        OutputFormat::Toon => {
+            output.push_str(&format!("module: {}\n", module_name));
+            output.push_str(&format!("symbols[{}]:\n", symbols.len()));
+            for sym in &symbols {
+                output.push_str(&format!(
+                    "  {} ({}) [{}] {}:{}\n",
+                    sym.symbol, sym.kind, sym.risk, sym.file, sym.lines
+                ));
+            }
+        }
+    }
+
+    Ok(output)
+}
+
+/// Get a specific symbol by hash
+fn run_get_symbol(hash: &str, include_source: bool, ctx: &CommandContext) -> Result<String> {
+    let repo_dir = std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
+        path: format!("current directory: {}", e),
+    })?;
+    let cache = CacheDir::for_repo(&repo_dir)?;
+
+    // Handle comma-separated hashes for batch queries
+    let hashes: Vec<&str> = hash.split(',').map(|s| s.trim()).collect();
+
+    let mut results: Vec<SymbolIndexEntry> = Vec::new();
+    for h in &hashes {
+        if let Some(symbol) = load_symbol_from_cache(&cache, h)? {
+            results.push(symbol);
+        }
+    }
+
+    if results.is_empty() {
+        return Err(McpDiffError::FileNotFound {
+            path: format!("Symbol(s) not found: {}", hash),
+        });
+    }
+
+    let mut output = String::new();
+
+    match ctx.format {
+        OutputFormat::Json => {
+            let json = if results.len() == 1 {
+                serde_json::to_value(&results[0]).unwrap_or_default()
+            } else {
+                serde_json::json!({ "symbols": results })
+            };
+            output = serde_json::to_string_pretty(&json).unwrap_or_default();
+        }
+        OutputFormat::Toon => {
+            for symbol in &results {
+                output.push_str(&format!("## {} ({})\n", symbol.symbol, symbol.kind));
+                output.push_str(&format!("hash: {}\n", symbol.hash));
+                output.push_str(&format!("file: {}\n", symbol.file));
+                output.push_str(&format!("lines: {}\n", symbol.lines));
+                output.push_str(&format!("module: {}\n", symbol.module));
+                output.push_str(&format!("risk: {}\n", symbol.risk));
+
+                if include_source {
+                    if let Some(source) = get_source_for_symbol(&cache, &symbol.file, &symbol.lines, 3) {
+                        output.push_str("\n__source__:\n");
+                        output.push_str(&source);
+                    }
+                }
+                output.push('\n');
+            }
+        }
+    }
+
+    Ok(output)
+}
+
+/// Get source code for a file or symbol
+fn run_get_source(
+    file: &str,
+    start: Option<usize>,
+    end: Option<usize>,
+    hash: Option<&str>,
+    context: usize,
+    ctx: &CommandContext,
+) -> Result<String> {
+    let repo_dir = std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
+        path: format!("current directory: {}", e),
+    })?;
+
+    // If hash is provided, look up line range from symbol
+    let (actual_start, actual_end) = if let Some(h) = hash {
+        let cache = CacheDir::for_repo(&repo_dir)?;
+        if let Some(symbol) = load_symbol_from_cache(&cache, h)? {
+            let parts: Vec<&str> = symbol.lines.split('-').collect();
+            let s: usize = parts.first().and_then(|p| p.parse().ok()).unwrap_or(1);
+            let e: usize = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(s);
+            (s, e)
+        } else {
+            return Err(McpDiffError::FileNotFound {
+                path: format!("Symbol not found: {}", h),
+            });
+        }
+    } else {
+        (start.unwrap_or(1), end.unwrap_or(start.unwrap_or(1) + 50))
+    };
+
+    let file_path = repo_dir.join(file);
+    if !file_path.exists() {
+        return Err(McpDiffError::FileNotFound {
+            path: file.to_string(),
+        });
+    }
+
+    let content = fs::read_to_string(&file_path)?;
+    let lines: Vec<&str> = content.lines().collect();
+
+    // Calculate range with context
+    let start_with_ctx = actual_start.saturating_sub(context + 1);
+    let end_with_ctx = (actual_end + context).min(lines.len());
+
+    let mut output = String::new();
+
+    match ctx.format {
+        OutputFormat::Json => {
+            let source_lines: Vec<serde_json::Value> = lines
+                .iter()
+                .enumerate()
+                .skip(start_with_ctx)
+                .take(end_with_ctx - start_with_ctx)
+                .map(|(i, line)| {
+                    let line_num = i + 1;
+                    serde_json::json!({
+                        "line": line_num,
+                        "content": line,
+                        "in_range": line_num >= actual_start && line_num <= actual_end
+                    })
+                })
+                .collect();
+
+            let json = serde_json::json!({
+                "file": file,
+                "start": actual_start,
+                "end": actual_end,
+                "context": context,
+                "lines": source_lines
+            });
+            output = serde_json::to_string_pretty(&json).unwrap_or_default();
+        }
+        OutputFormat::Toon => {
+            output.push_str(&format!("file: {}\n", file));
+            output.push_str(&format!("range: {}-{}\n", actual_start, actual_end));
+            output.push_str("---\n");
+
+            for (i, line) in lines.iter().enumerate().skip(start_with_ctx).take(end_with_ctx - start_with_ctx) {
+                let line_num = i + 1;
+                let prefix = if line_num >= actual_start && line_num <= actual_end {
+                    ">"
+                } else {
+                    " "
+                };
+                output.push_str(&format!("{} {:>4} | {}\n", prefix, line_num, line));
+            }
+        }
+    }
+
+    Ok(output)
+}
+
+/// Get callers of a symbol
+fn run_get_callers(
+    hash: &str,
+    depth: usize,
+    include_source: bool,
+    limit: usize,
+    ctx: &CommandContext,
+) -> Result<String> {
+    let repo_dir = std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
+        path: format!("current directory: {}", e),
+    })?;
+    let cache = CacheDir::for_repo(&repo_dir)?;
+
+    // Load call graph
+    let call_graph_path = cache.call_graph_path();
+    if !call_graph_path.exists() {
+        return Err(McpDiffError::FileNotFound {
+            path: "Call graph not found. Run `semfora index generate` first.".to_string(),
+        });
+    }
+
+    let cg_content = fs::read_to_string(&call_graph_path)?;
+    let call_graph: serde_json::Value = serde_json::from_str(&cg_content)
+        .map_err(|e| McpDiffError::GitError { message: format!("Parse error: {}", e) })?;
+
+    // Find callers (reverse lookup)
+    let mut callers = Vec::new();
+    if let Some(edges) = call_graph.get("edges").and_then(|e| e.as_array()) {
+        for edge in edges {
+            let callee = edge.get("callee").and_then(|c| c.as_str()).unwrap_or("");
+            if callee.contains(hash) || hash.contains(callee) {
+                if let Some(caller) = edge.get("caller").and_then(|c| c.as_str()) {
+                    callers.push(caller.to_string());
+                }
+            }
+            if callers.len() >= limit {
+                break;
+            }
+        }
+    }
+
+    let mut output = String::new();
+
+    match ctx.format {
+        OutputFormat::Json => {
+            let json = serde_json::json!({
+                "symbol_hash": hash,
+                "depth": depth,
+                "callers": callers,
+                "count": callers.len()
+            });
+            output = serde_json::to_string_pretty(&json).unwrap_or_default();
+        }
+        OutputFormat::Toon => {
+            output.push_str(&format!("symbol: {}\n", hash));
+            output.push_str(&format!("callers[{}]:\n", callers.len()));
+            for caller in &callers {
+                output.push_str(&format!("  - {}\n", caller));
+
+                if include_source {
+                    if let Some(symbol) = load_symbol_from_cache(&cache, caller)? {
+                        if let Some(source) = get_source_for_symbol(&cache, &symbol.file, &symbol.lines, 1) {
+                            output.push_str(&format!("    # {}:{}\n", symbol.file, symbol.lines));
+                            for line in source.lines().take(5) {
+                                output.push_str(&format!("    {}\n", line));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(output)
+}
+
+/// Get call graph
+fn run_get_callgraph(
+    module: Option<&str>,
+    symbol: Option<&str>,
+    export: Option<&str>,
+    stats_only: bool,
+    limit: usize,
+    ctx: &CommandContext,
+) -> Result<String> {
+    let repo_dir = std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
+        path: format!("current directory: {}", e),
+    })?;
+    let cache = CacheDir::for_repo(&repo_dir)?;
+
+    // Handle SQLite export
+    if let Some(export_path) = export {
+        return run_export_sqlite(export_path, &cache, ctx);
+    }
+
+    let call_graph_path = cache.call_graph_path();
+    if !call_graph_path.exists() {
+        return Err(McpDiffError::FileNotFound {
+            path: "Call graph not found. Run `semfora index generate` first.".to_string(),
+        });
+    }
+
+    let content = fs::read_to_string(&call_graph_path)?;
+    let call_graph: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| McpDiffError::GitError { message: format!("Parse error: {}", e) })?;
+
+    let edges = call_graph.get("edges").and_then(|e| e.as_array());
+
+    if stats_only {
+        let edge_count = edges.map(|e| e.len()).unwrap_or(0);
+        let mut output = String::new();
+
+        match ctx.format {
+            OutputFormat::Json => {
+                let json = serde_json::json!({
+                    "total_edges": edge_count,
+                    "module_filter": module,
+                    "symbol_filter": symbol
+                });
+                output = serde_json::to_string_pretty(&json).unwrap_or_default();
+            }
+            OutputFormat::Toon => {
+                output.push_str("_type: call_graph_stats\n");
+                output.push_str(&format!("total_edges: {}\n", edge_count));
+            }
+        }
+
+        return Ok(output);
+    }
+
+    // Filter and return edges
+    let filtered_edges: Vec<_> = edges
+        .map(|e| {
+            e.iter()
+                .filter(|edge| {
+                    let caller = edge.get("caller").and_then(|c| c.as_str()).unwrap_or("");
+                    let callee = edge.get("callee").and_then(|c| c.as_str()).unwrap_or("");
+
+                    let module_match = module
+                        .map(|m| caller.contains(m) || callee.contains(m))
+                        .unwrap_or(true);
+
+                    let symbol_match = symbol
+                        .map(|s| caller.contains(s) || callee.contains(s))
+                        .unwrap_or(true);
+
+                    module_match && symbol_match
+                })
+                .take(limit)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let mut output = String::new();
+
+    match ctx.format {
+        OutputFormat::Json => {
+            let json = serde_json::json!({
+                "edges": filtered_edges,
+                "count": filtered_edges.len()
+            });
+            output = serde_json::to_string_pretty(&json).unwrap_or_default();
+        }
+        OutputFormat::Toon => {
+            output.push_str(&format!("edges[{}]:\n", filtered_edges.len()));
+            for edge in &filtered_edges {
+                let caller = edge.get("caller").and_then(|c| c.as_str()).unwrap_or("?");
+                let callee = edge.get("callee").and_then(|c| c.as_str()).unwrap_or("?");
+                output.push_str(&format!("  {} -> {}\n", caller, callee));
+            }
+        }
+    }
+
+    Ok(output)
+}
+
+/// Export call graph to SQLite
+fn run_export_sqlite(path: &str, cache: &CacheDir, _ctx: &CommandContext) -> Result<String> {
+    use crate::sqlite_export::{default_export_path, SqliteExporter};
+
+    let output_path = if path.is_empty() {
+        default_export_path(cache)
+    } else {
+        std::path::PathBuf::from(path)
+    };
+
+    eprintln!("Exporting call graph to: {}", output_path.display());
+
+    let exporter = SqliteExporter::new();
+    let stats = exporter.export(cache, &output_path, None)?;
+
+    Ok(format!(
+        "Export complete:\n  Path: {}\n  Nodes: {}\n  Edges: {}\n  Size: {} bytes",
+        output_path.display(),
+        stats.nodes_inserted,
+        stats.edges_inserted,
+        stats.file_size_bytes
+    ))
+}
+
+/// Get all symbols in a file
+fn run_file_symbols(path: &str, include_source: bool, kind_filter: Option<&str>, ctx: &CommandContext) -> Result<String> {
+    let repo_dir = std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
+        path: format!("current directory: {}", e),
+    })?;
+    let cache = CacheDir::for_repo(&repo_dir)?;
+
+    // Search through modules to find symbols in this file
+    let symbols = find_symbols_in_file(&cache, path, kind_filter)?;
+
+    let mut output = String::new();
+
+    match ctx.format {
+        OutputFormat::Json => {
+            let json = serde_json::json!({
+                "file": path,
+                "symbols": symbols,
+                "count": symbols.len()
+            });
+            output = serde_json::to_string_pretty(&json).unwrap_or_default();
+        }
+        OutputFormat::Toon => {
+            output.push_str(&format!("file: {}\n", path));
+            output.push_str(&format!("symbols[{}]:\n", symbols.len()));
+
+            for sym in &symbols {
+                output.push_str(&format!("  {} ({}) L{}\n", sym.symbol, sym.kind, sym.lines));
+                output.push_str(&format!("    hash: {}\n", sym.hash));
+
+                if include_source {
+                    if let Some(source) = get_source_for_symbol(&cache, path, &sym.lines, 1) {
+                        output.push_str("    source:\n");
+                        for line in source.lines().take(5) {
+                            output.push_str(&format!("      {}\n", line));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(output)
+}
+
+/// List supported languages
+fn run_list_languages(ctx: &CommandContext) -> Result<String> {
+    // All supported languages with their extensions
+    let languages = vec![
+        ("TypeScript", vec!["ts", "mts", "cts"]),
+        ("Tsx", vec!["tsx"]),
+        ("JavaScript", vec!["js", "mjs", "cjs"]),
+        ("Jsx", vec!["jsx"]),
+        ("Rust", vec!["rs"]),
+        ("Python", vec!["py", "pyi"]),
+        ("Go", vec!["go"]),
+        ("Java", vec!["java"]),
+        ("C", vec!["c", "h"]),
+        ("Cpp", vec!["cpp", "cc", "cxx", "hpp", "hxx", "hh"]),
+        ("CSharp", vec!["cs"]),
+        ("Kotlin", vec!["kt", "kts"]),
+        ("Html", vec!["html", "htm"]),
+        ("Css", vec!["css"]),
+        ("Scss", vec!["scss", "sass"]),
+        ("Json", vec!["json"]),
+        ("Yaml", vec!["yaml", "yml"]),
+        ("Toml", vec!["toml"]),
+        ("Xml", vec!["xml", "xsd", "xsl", "xslt", "svg", "plist", "pom"]),
+        ("Hcl", vec!["tf", "hcl", "tfvars"]),
+        ("Markdown", vec!["md", "markdown"]),
+        ("Vue", vec!["vue"]),
+        ("Bash", vec!["sh", "bash", "zsh", "fish"]),
+        ("Gradle", vec!["gradle"]),
+        ("Dockerfile", vec!["dockerfile"]),
+    ];
+
+    let mut output = String::new();
+
+    match ctx.format {
+        OutputFormat::Json => {
+            let json = serde_json::json!({
+                "languages": languages.iter().map(|(name, exts)| serde_json::json!({
+                    "name": name,
+                    "extensions": exts
+                })).collect::<Vec<_>>()
+            });
+            output = serde_json::to_string_pretty(&json).unwrap_or_default();
+        }
+        OutputFormat::Toon => {
+            output.push_str(&format!("languages[{}]:\n", languages.len()));
+            for (name, exts) in &languages {
+                output.push_str(&format!("  {}: {}\n", name, exts.join(", ")));
+            }
+        }
+    }
+
+    Ok(output)
+}
+
+// ============================================
+// Helper Functions
+// ============================================
+
+/// Load a symbol from the cache by hash
+fn load_symbol_from_cache(cache: &CacheDir, hash: &str) -> Result<Option<SymbolIndexEntry>> {
+    // Try to find the symbol in the symbol shard
+    let symbol_path = cache.symbol_path(hash);
+    if symbol_path.exists() {
+        let content = fs::read_to_string(&symbol_path)?;
+        let symbol: SymbolIndexEntry = serde_json::from_str(&content)
+            .map_err(|e| McpDiffError::GitError { message: format!("Parse error: {}", e) })?;
+        return Ok(Some(symbol));
+    }
+
+    // Fall back to searching through modules
+    let modules_dir = cache.modules_dir();
+    if modules_dir.exists() {
+        for entry in fs::read_dir(&modules_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().map(|e| e == "toon" || e == "json").unwrap_or(false) {
+                let content = fs::read_to_string(&path)?;
+                if let Ok(module) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(symbols) = module.get("symbols").and_then(|s| s.as_array()) {
+                        for sym in symbols {
+                            let sym_hash = sym.get("hash").or_else(|| sym.get("h")).and_then(|h| h.as_str()).unwrap_or("");
+                            if sym_hash == hash || sym_hash.contains(hash) || hash.contains(sym_hash) {
+                                let entry = SymbolIndexEntry {
+                                    symbol: sym.get("symbol").or_else(|| sym.get("s")).and_then(|s| s.as_str()).unwrap_or("?").to_string(),
+                                    hash: sym_hash.to_string(),
+                                    semantic_hash: String::new(),
+                                    kind: sym.get("kind").or_else(|| sym.get("k")).and_then(|k| k.as_str()).unwrap_or("?").to_string(),
+                                    module: path.file_stem().and_then(|s| s.to_str()).unwrap_or("?").to_string(),
+                                    file: sym.get("file").or_else(|| sym.get("f")).and_then(|f| f.as_str()).unwrap_or("?").to_string(),
+                                    lines: sym.get("lines").or_else(|| sym.get("l")).and_then(|l| l.as_str()).unwrap_or("?").to_string(),
+                                    risk: sym.get("risk").or_else(|| sym.get("r")).and_then(|r| r.as_str()).unwrap_or("low").to_string(),
+                                    cognitive_complexity: sym.get("cc").and_then(|c| c.as_u64()).unwrap_or(0) as usize,
+                                    max_nesting: sym.get("nest").and_then(|n| n.as_u64()).unwrap_or(0) as usize,
+                                };
+                                return Ok(Some(entry));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// Find all symbols in a specific file
+fn find_symbols_in_file(cache: &CacheDir, file_path: &str, kind_filter: Option<&str>) -> Result<Vec<SymbolIndexEntry>> {
+    let mut symbols = Vec::new();
+
+    let modules_dir = cache.modules_dir();
+    if !modules_dir.exists() {
+        return Ok(symbols);
+    }
+
+    for entry in fs::read_dir(&modules_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().map(|e| e == "toon" || e == "json").unwrap_or(false) {
+            let content = fs::read_to_string(&path)?;
+            if let Ok(module) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(sym_array) = module.get("symbols").and_then(|s| s.as_array()) {
+                    for sym in sym_array {
+                        let sym_file = sym.get("file").or_else(|| sym.get("f")).and_then(|f| f.as_str()).unwrap_or("");
+                        if sym_file == file_path || sym_file.ends_with(file_path) || file_path.ends_with(sym_file) {
+                            let kind = sym.get("kind").or_else(|| sym.get("k")).and_then(|k| k.as_str()).unwrap_or("?");
+
+                            if let Some(kf) = kind_filter {
+                                if !kind.eq_ignore_ascii_case(kf) {
+                                    continue;
+                                }
+                            }
+
+                            symbols.push(SymbolIndexEntry {
+                                symbol: sym.get("symbol").or_else(|| sym.get("s")).and_then(|s| s.as_str()).unwrap_or("?").to_string(),
+                                hash: sym.get("hash").or_else(|| sym.get("h")).and_then(|h| h.as_str()).unwrap_or("").to_string(),
+                                semantic_hash: String::new(),
+                                kind: kind.to_string(),
+                                module: path.file_stem().and_then(|s| s.to_str()).unwrap_or("?").to_string(),
+                                file: sym_file.to_string(),
+                                lines: sym.get("lines").or_else(|| sym.get("l")).and_then(|l| l.as_str()).unwrap_or("?").to_string(),
+                                risk: sym.get("risk").or_else(|| sym.get("r")).and_then(|r| r.as_str()).unwrap_or("low").to_string(),
+                                cognitive_complexity: sym.get("cc").and_then(|c| c.as_u64()).unwrap_or(0) as usize,
+                                max_nesting: sym.get("nest").and_then(|n| n.as_u64()).unwrap_or(0) as usize,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(symbols)
+}
+
+/// Helper to get source for a symbol
+fn get_source_for_symbol(cache: &CacheDir, file: &str, lines: &str, context: usize) -> Option<String> {
+    let parts: Vec<&str> = lines.split('-').collect();
+    let start: usize = parts.first()?.parse().ok()?;
+    let end: usize = parts.get(1).unwrap_or(&parts[0]).parse().ok()?;
+
+    let file_path = cache.repo_root.join(file);
+    let content = fs::read_to_string(&file_path).ok()?;
+    let all_lines: Vec<&str> = content.lines().collect();
+
+    let start_with_ctx = start.saturating_sub(context + 1);
+    let end_with_ctx = (end + context).min(all_lines.len());
+
+    let mut snippet = String::new();
+    for (i, line) in all_lines.iter().enumerate().skip(start_with_ctx).take(end_with_ctx - start_with_ctx) {
+        let line_num = i + 1;
+        let prefix = if line_num >= start && line_num <= end { ">" } else { " " };
+        snippet.push_str(&format!("{} {:>4} | {}\n", prefix, line_num, line));
+    }
+
+    Some(snippet)
+}
