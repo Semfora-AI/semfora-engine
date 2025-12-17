@@ -21,7 +21,7 @@ pub struct Cli {
     pub command: Commands,
 
     /// Output format (applies to all commands)
-    #[arg(short, long, default_value = "toon", value_enum, global = true)]
+    #[arg(short, long, default_value = "text", value_enum, global = true)]
     pub format: OutputFormat,
 
     /// Show verbose output
@@ -705,10 +705,13 @@ pub enum TokenAnalysisMode {
 /// Output format options
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
 pub enum OutputFormat {
-    /// TOON (Token-Oriented Object Notation) - default, token-efficient format
+    /// Human-readable text with visual formatting (default for terminal)
     #[default]
+    #[value(alias = "pretty")]
+    Text,
+    /// TOON (Token-Oriented Object Notation) - token-efficient format for AI consumption
     Toon,
-    /// JSON - standard JSON output
+    /// JSON - standard JSON output for machine parsing
     Json,
 }
 
@@ -749,6 +752,78 @@ impl SearchArgs {
             SearchMode::SemanticOnly
         } else {
             SearchMode::Hybrid // Default: run both
+        }
+    }
+
+    /// Create SearchArgs for symbol-only search (used by MCP search_symbols)
+    pub fn for_symbols(query: String, module: Option<String>, kind: Option<String>, risk: Option<String>, limit: usize) -> Self {
+        Self {
+            query,
+            symbols: true,
+            related: false,
+            raw: false,
+            kind,
+            module,
+            risk,
+            include_source: false,
+            limit,
+            file_types: None,
+            case_sensitive: false,
+            merge_threshold: 3,
+        }
+    }
+
+    /// Create SearchArgs for semantic-only search (used by MCP semantic_search)
+    pub fn for_semantic(query: String, module: Option<String>, kind: Option<String>, include_source: bool, limit: usize) -> Self {
+        Self {
+            query,
+            symbols: false,
+            related: true,
+            raw: false,
+            kind,
+            module,
+            risk: None,
+            include_source,
+            limit,
+            file_types: None,
+            case_sensitive: false,
+            merge_threshold: 3,
+        }
+    }
+
+    /// Create SearchArgs for raw regex search (used by MCP raw_search)
+    pub fn for_raw(pattern: String, file_types: Option<String>, case_sensitive: bool, limit: usize, merge_threshold: usize) -> Self {
+        Self {
+            query: pattern,
+            symbols: false,
+            related: false,
+            raw: true,
+            kind: None,
+            module: None,
+            risk: None,
+            include_source: false,
+            limit,
+            file_types,
+            case_sensitive,
+            merge_threshold,
+        }
+    }
+
+    /// Create SearchArgs for hybrid search with source (used by MCP search_and_get_symbols)
+    pub fn for_hybrid_with_source(query: String, module: Option<String>, kind: Option<String>, risk: Option<String>, limit: usize) -> Self {
+        Self {
+            query,
+            symbols: false,
+            related: false,
+            raw: false,
+            kind,
+            module,
+            risk,
+            include_source: true,
+            limit,
+            file_types: None,
+            case_sensitive: false,
+            merge_threshold: 3,
         }
     }
 }

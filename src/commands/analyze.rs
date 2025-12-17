@@ -131,6 +131,30 @@ fn run_single_file(ctx: &CommandContext, args: &AnalyzeArgs, file_path: &Path) -
     }
 
     let output = match ctx.format {
+        OutputFormat::Text => {
+            // Human-readable text format
+            let mut text = String::new();
+            text.push_str("═══════════════════════════════════════════\n");
+            text.push_str("  SEMANTIC ANALYSIS\n");
+            text.push_str("═══════════════════════════════════════════\n\n");
+            text.push_str(&format!("file: {}\n", file_path.display()));
+            text.push_str(&format!("language: {} ({})\n", lang.name(), lang.family().name()));
+            if let Some(ref sym) = summary.symbol {
+                text.push_str(&format!("symbol: {}\n", sym));
+            }
+            if let Some(ref kind) = summary.symbol_kind {
+                text.push_str(&format!("kind: {:?}\n", kind));
+            }
+            if let Some(start) = summary.start_line {
+                if let Some(end) = summary.end_line {
+                    text.push_str(&format!("lines: {}-{}\n", start, end));
+                }
+            }
+            text.push('\n');
+            // Add the toon output as well for full detail
+            text.push_str(&toon_output);
+            text
+        }
         OutputFormat::Toon => toon_output,
         OutputFormat::Json => json_pretty,
     };

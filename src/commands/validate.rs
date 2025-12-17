@@ -93,31 +93,36 @@ fn run_find_duplicates(args: &ValidateArgs, cache: &CacheDir, ctx: &CommandConte
 
     let mut output = String::new();
 
+    let json_value = serde_json::json!({
+        "_type": "duplicate_analysis",
+        "threshold": args.threshold,
+        "boilerplate_excluded": exclude_boilerplate,
+        "total_signatures": signatures.len(),
+        "filter": args.target,
+        "clusters": clusters.len(),
+        "total_duplicates": clusters.iter().map(|c| c.duplicates.len()).sum::<usize>(),
+        "cluster_details": clusters.iter().take(args.limit.min(50)).map(|c| serde_json::json!({
+            "primary": c.primary.name,
+            "primary_file": c.primary.file,
+            "primary_hash": c.primary.hash,
+            "duplicate_count": c.duplicates.len(),
+            "duplicates": c.duplicates.iter().take(5).map(|d| serde_json::json!({
+                "name": d.symbol.name,
+                "file": d.symbol.file,
+                "similarity": d.similarity,
+                "kind": format!("{:?}", d.kind)
+            })).collect::<Vec<_>>()
+        })).collect::<Vec<_>>()
+    });
+
     match ctx.format {
         OutputFormat::Json => {
-            let json = serde_json::json!({
-                "threshold": args.threshold,
-                "boilerplate_excluded": exclude_boilerplate,
-                "total_signatures": signatures.len(),
-                "filter": args.target,
-                "clusters": clusters.len(),
-                "total_duplicates": clusters.iter().map(|c| c.duplicates.len()).sum::<usize>(),
-                "cluster_details": clusters.iter().take(args.limit.min(50)).map(|c| serde_json::json!({
-                    "primary": c.primary.name,
-                    "primary_file": c.primary.file,
-                    "primary_hash": c.primary.hash,
-                    "duplicate_count": c.duplicates.len(),
-                    "duplicates": c.duplicates.iter().take(5).map(|d| serde_json::json!({
-                        "name": d.symbol.name,
-                        "file": d.symbol.file,
-                        "similarity": d.similarity,
-                        "kind": format!("{:?}", d.kind)
-                    })).collect::<Vec<_>>()
-                })).collect::<Vec<_>>()
-            });
-            output = serde_json::to_string_pretty(&json).unwrap_or_default();
+            output = serde_json::to_string_pretty(&json_value).unwrap_or_default();
         }
         OutputFormat::Toon => {
+            output = super::encode_toon(&json_value);
+        }
+        OutputFormat::Text => {
             output.push_str("═══════════════════════════════════════════\n");
             if let Some(ref target) = args.target {
                 output.push_str(&format!("  DUPLICATE ANALYSIS: {}\n", target));
@@ -195,25 +200,30 @@ fn run_check_duplicates(hash: &str, threshold: f64, cache: &CacheDir, ctx: &Comm
 
     let mut output = String::new();
 
+    let json_value = serde_json::json!({
+        "_type": "check_duplicates",
+        "symbol": target_sig.name,
+        "hash": target_sig.symbol_hash,
+        "file": target_sig.file,
+        "threshold": threshold,
+        "duplicates": duplicates.iter().map(|dup| serde_json::json!({
+            "name": dup.symbol.name,
+            "hash": dup.symbol.hash,
+            "file": dup.symbol.file,
+            "similarity": dup.similarity,
+            "kind": format!("{:?}", dup.kind)
+        })).collect::<Vec<_>>(),
+        "count": duplicates.len()
+    });
+
     match ctx.format {
         OutputFormat::Json => {
-            let json = serde_json::json!({
-                "symbol": target_sig.name,
-                "hash": target_sig.symbol_hash,
-                "file": target_sig.file,
-                "threshold": threshold,
-                "duplicates": duplicates.iter().map(|dup| serde_json::json!({
-                    "name": dup.symbol.name,
-                    "hash": dup.symbol.hash,
-                    "file": dup.symbol.file,
-                    "similarity": dup.similarity,
-                    "kind": format!("{:?}", dup.kind)
-                })).collect::<Vec<_>>(),
-                "count": duplicates.len()
-            });
-            output = serde_json::to_string_pretty(&json).unwrap_or_default();
+            output = serde_json::to_string_pretty(&json_value).unwrap_or_default();
         }
         OutputFormat::Toon => {
+            output = super::encode_toon(&json_value);
+        }
+        OutputFormat::Text => {
             output.push_str(&format!("symbol: {}\n", target_sig.name));
             output.push_str(&format!("hash: {}\n", target_sig.symbol_hash));
             output.push_str(&format!("file: {}\n", target_sig.file));

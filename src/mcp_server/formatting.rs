@@ -16,7 +16,7 @@ use crate::utils::truncate_to_char_boundary;
 use crate::{encode_toon, CacheDir, Lang, MergedBlock, RipgrepSearchResult, SemanticSummary, SymbolIndexEntry};
 
 use super::helpers::parse_and_extract;
-use super::GetSymbolSourceRequest;
+use super::GetSourceRequest;
 
 // ============================================================================
 // Analysis Helpers
@@ -143,7 +143,7 @@ pub(super) fn get_supported_languages() -> String {
 /// Resolve line range from request (either direct or via symbol hash lookup)
 pub(super) async fn resolve_line_range(
     file_path: &Path,
-    request: &GetSymbolSourceRequest,
+    request: &GetSourceRequest,
 ) -> Result<(usize, usize), String> {
     if let Some(ref hash) = request.symbol_hash {
         // Look up line range from symbol shard
@@ -427,12 +427,14 @@ pub(super) fn format_module_symbols(module: &str, results: &[SymbolIndexEntry], 
 // ============================================================================
 
 /// Format call graph with pagination
+/// If hash_to_name is provided, displays "name (hash)" instead of just hash
 pub(super) fn format_call_graph_paginated(
     edges: &[(String, Vec<String>)],
     total_edges: usize,
     filtered_count: usize,
     offset: usize,
     limit: usize,
+    hash_to_name: Option<&std::collections::HashMap<String, String>>,
 ) -> String {
     let mut output = String::new();
     output.push_str("_type: call_graph\n");
@@ -459,22 +461,41 @@ pub(super) fn format_call_graph_paginated(
 
     output.push_str("\n");
 
+    // Helper to format a hash with optional name
+    let format_symbol = |hash: &str| -> String {
+        if let Some(names) = hash_to_name {
+            if let Some(name) = names.get(hash) {
+                return format!("{} ({})", name, hash);
+            }
+        }
+        hash.to_string()
+    };
+
     for (caller, callees) in edges {
+        let caller_display = format_symbol(caller);
         let callees_str = callees.iter()
-            .map(|c| format!("\"{}\"", c))
+            .map(|c| {
+                if c.starts_with("ext:") {
+                    format!("\"{}\"", c) // External calls stay as-is
+                } else {
+                    format!("\"{}\"", format_symbol(c))
+                }
+            })
             .collect::<Vec<_>>()
             .join(",");
-        output.push_str(&format!("{}: [{}]\n", caller, callees_str));
+        output.push_str(&format!("{}: [{}]\n", caller_display, callees_str));
     }
 
     output
 }
 
 /// Format call graph summary (statistics only, no edges)
+/// If hash_to_name is provided, displays "name (hash)" for top callers/callees
 pub(super) fn format_call_graph_summary(
     edges: &[(String, Vec<String>)],
     total_edges: usize,
     filtered_count: usize,
+    hash_to_name: Option<&std::collections::HashMap<String, String>>,
 ) -> String {
     use std::collections::HashMap;
 
@@ -493,6 +514,16 @@ pub(super) fn format_call_graph_summary(
     output.push_str(&format!("avg_calls_per_symbol: {:.1}\n", avg_calls));
     output.push_str(&format!("max_calls_in_symbol: {}\n", max_calls));
 
+    // Helper to format a hash with optional name
+    let format_symbol = |hash: &str| -> String {
+        if let Some(names) = hash_to_name {
+            if let Some(name) = names.get(hash) {
+                return format!("{} ({})", name, hash);
+            }
+        }
+        hash.to_string()
+    };
+
     // Top callers (symbols that make the most calls)
     let mut callers_by_count: Vec<_> = edges.iter()
         .map(|(caller, callees)| (caller.clone(), callees.len()))
@@ -501,7 +532,7 @@ pub(super) fn format_call_graph_summary(
 
     output.push_str("\ntop_callers[10]:\n");
     for (caller, count) in callers_by_count.iter().take(10) {
-        output.push_str(&format!("  - {} (calls: {})\n", caller, count));
+        output.push_str(&format!("  - {} (calls: {})\n", format_symbol(caller), count));
     }
 
     // Top callees (most called symbols)
@@ -516,7 +547,12 @@ pub(super) fn format_call_graph_summary(
 
     output.push_str("\ntop_callees[10]:\n");
     for (callee, count) in callees_by_count.iter().take(10) {
-        output.push_str(&format!("  - {} (called: {} times)\n", callee, count));
+        let callee_display = if callee.starts_with("ext:") {
+            callee.clone()
+        } else {
+            format_symbol(callee)
+        };
+        output.push_str(&format!("  - {} (called: {} times)\n", callee_display, count));
     }
 
     // Leaf functions (call nothing)

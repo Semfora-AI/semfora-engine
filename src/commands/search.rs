@@ -37,19 +37,24 @@ fn run_hybrid_search(args: &SearchArgs, ctx: &CommandContext) -> Result<String> 
     // Try to get semantic matches
     let semantic_results = get_semantic_matches(&cache, args);
 
+    let json_value = serde_json::json!({
+        "_type": "hybrid_search",
+        "query": args.query,
+        "symbol_matches": symbol_results.as_ref().map(|r| &r.results).unwrap_or(&vec![]),
+        "symbol_count": symbol_results.as_ref().map(|r| r.results.len()).unwrap_or(0),
+        "related_code": semantic_results.as_ref().map(|r| &r.results).unwrap_or(&vec![]),
+        "related_count": semantic_results.as_ref().map(|r| r.results.len()).unwrap_or(0),
+        "suggested_queries": semantic_results.as_ref().map(|r| &r.suggestions).unwrap_or(&vec![]),
+    });
+
     match ctx.format {
         OutputFormat::Json => {
-            let json = serde_json::json!({
-                "query": args.query,
-                "symbol_matches": symbol_results.as_ref().map(|r| &r.results).unwrap_or(&vec![]),
-                "symbol_count": symbol_results.as_ref().map(|r| r.results.len()).unwrap_or(0),
-                "related_code": semantic_results.as_ref().map(|r| &r.results).unwrap_or(&vec![]),
-                "related_count": semantic_results.as_ref().map(|r| r.results.len()).unwrap_or(0),
-                "suggested_queries": semantic_results.as_ref().map(|r| &r.suggestions).unwrap_or(&vec![]),
-            });
-            output = serde_json::to_string_pretty(&json).unwrap_or_default();
+            output = serde_json::to_string_pretty(&json_value).unwrap_or_default();
         }
         OutputFormat::Toon => {
+            output = super::encode_toon(&json_value);
+        }
+        OutputFormat::Text => {
             output.push_str(&format!("query: \"{}\"\n\n", args.query));
 
             // Symbol matches section
@@ -163,18 +168,23 @@ fn run_symbol_search(args: &SearchArgs, ctx: &CommandContext) -> Result<String> 
         // Ripgrep fallback results
         let ripgrep_results = search_result.ripgrep_results.unwrap_or_default();
 
+        let json_value = serde_json::json!({
+            "_type": "symbol_search",
+            "query": args.query,
+            "results": ripgrep_results,
+            "count": ripgrep_results.len(),
+            "fallback": true,
+            "note": "Using ripgrep fallback (no semantic index). Run `semfora index generate` to create index."
+        });
+
         match ctx.format {
             OutputFormat::Json => {
-                let json = serde_json::json!({
-                    "query": args.query,
-                    "results": ripgrep_results,
-                    "count": ripgrep_results.len(),
-                    "fallback": true,
-                    "note": "Using ripgrep fallback (no semantic index). Run `semfora index generate` to create index."
-                });
-                output = serde_json::to_string_pretty(&json).unwrap_or_default();
+                output = serde_json::to_string_pretty(&json_value).unwrap_or_default();
             }
             OutputFormat::Toon => {
+                output = super::encode_toon(&json_value);
+            }
+            OutputFormat::Text => {
                 output.push_str("_note: Using ripgrep fallback (no semantic index)\n");
                 output.push_str(&format!("query: \"{}\"\n", args.query));
                 output.push_str(&format!("results[{}]:\n", ripgrep_results.len()));
@@ -198,16 +208,21 @@ fn run_symbol_search(args: &SearchArgs, ctx: &CommandContext) -> Result<String> 
         // Normal indexed search results
         let results = search_result.indexed_results.unwrap_or_default();
 
+        let json_value = serde_json::json!({
+            "_type": "symbol_search",
+            "query": args.query,
+            "results": results,
+            "count": results.len()
+        });
+
         match ctx.format {
             OutputFormat::Json => {
-                let json = serde_json::json!({
-                    "query": args.query,
-                    "results": results,
-                    "count": results.len()
-                });
-                output = serde_json::to_string_pretty(&json).unwrap_or_default();
+                output = serde_json::to_string_pretty(&json_value).unwrap_or_default();
             }
             OutputFormat::Toon => {
+                output = super::encode_toon(&json_value);
+            }
+            OutputFormat::Text => {
                 output.push_str(&format!("query: \"{}\"\n", args.query));
                 output.push_str(&format!("results[{}]:\n", results.len()));
                 for entry in &results {
@@ -259,26 +274,34 @@ fn run_semantic_search(args: &SearchArgs, ctx: &CommandContext) -> Result<String
 
     let mut output = String::new();
 
+    let suggestions = index.suggest_related_terms(&args.query, 5);
+
+    let json_value = serde_json::json!({
+        "_type": "semantic_search",
+        "query": args.query,
+        "results": results.iter().map(|r| serde_json::json!({
+            "symbol": r.symbol,
+            "kind": r.kind,
+            "hash": r.hash,
+            "file": r.file,
+            "lines": r.lines,
+            "module": r.module,
+            "risk": r.risk,
+            "score": r.score,
+            "matched_terms": r.matched_terms
+        })).collect::<Vec<_>>(),
+        "count": results.len(),
+        "related_terms": suggestions
+    });
+
     match ctx.format {
         OutputFormat::Json => {
-            let json = serde_json::json!({
-                "query": args.query,
-                "results": results.iter().map(|r| serde_json::json!({
-                    "symbol": r.symbol,
-                    "kind": r.kind,
-                    "hash": r.hash,
-                    "file": r.file,
-                    "lines": r.lines,
-                    "module": r.module,
-                    "risk": r.risk,
-                    "score": r.score,
-                    "matched_terms": r.matched_terms
-                })).collect::<Vec<_>>(),
-                "count": results.len()
-            });
-            output = serde_json::to_string_pretty(&json).unwrap_or_default();
+            output = serde_json::to_string_pretty(&json_value).unwrap_or_default();
         }
         OutputFormat::Toon => {
+            output = super::encode_toon(&json_value);
+        }
+        OutputFormat::Text => {
             output.push_str(&format!("query: \"{}\"\n", args.query));
             output.push_str(&format!("results[{}]:\n", results.len()));
 
@@ -301,7 +324,6 @@ fn run_semantic_search(args: &SearchArgs, ctx: &CommandContext) -> Result<String
                 }
             }
 
-            let suggestions = index.suggest_related_terms(&args.query, 5);
             if !suggestions.is_empty() {
                 output.push_str(&format!(
                     "\n---\nrelated_terms: {}\n",
@@ -339,25 +361,30 @@ fn run_raw_search(args: &SearchArgs, ctx: &CommandContext) -> Result<String> {
     if args.merge_threshold > 0 {
         match searcher.search_merged(&repo_dir, &options) {
             Ok(blocks) => {
+                let json_value = serde_json::json!({
+                    "_type": "raw_search",
+                    "pattern": args.query,
+                    "blocks": blocks.iter().map(|b| serde_json::json!({
+                        "file": b.file.strip_prefix(&repo_dir).unwrap_or(&b.file).to_string_lossy(),
+                        "start_line": b.start_line,
+                        "end_line": b.end_line,
+                        "lines": b.lines.iter().map(|l| serde_json::json!({
+                            "line": l.line,
+                            "content": l.content,
+                            "is_match": l.is_match
+                        })).collect::<Vec<_>>()
+                    })).collect::<Vec<_>>(),
+                    "count": blocks.len()
+                });
+
                 match ctx.format {
                     OutputFormat::Json => {
-                        let json = serde_json::json!({
-                            "pattern": args.query,
-                            "blocks": blocks.iter().map(|b| serde_json::json!({
-                                "file": b.file.strip_prefix(&repo_dir).unwrap_or(&b.file).to_string_lossy(),
-                                "start_line": b.start_line,
-                                "end_line": b.end_line,
-                                "lines": b.lines.iter().map(|l| serde_json::json!({
-                                    "line": l.line,
-                                    "content": l.content,
-                                    "is_match": l.is_match
-                                })).collect::<Vec<_>>()
-                            })).collect::<Vec<_>>(),
-                            "count": blocks.len()
-                        });
-                        output = serde_json::to_string_pretty(&json).unwrap_or_default();
+                        output = serde_json::to_string_pretty(&json_value).unwrap_or_default();
                     }
                     OutputFormat::Toon => {
+                        output = super::encode_toon(&json_value);
+                    }
+                    OutputFormat::Text => {
                         output.push_str(&format!("pattern: \"{}\"\n", args.query));
                         output.push_str(&format!("blocks[{}]:\n", blocks.len()));
                         for block in &blocks {
@@ -390,21 +417,26 @@ fn run_raw_search(args: &SearchArgs, ctx: &CommandContext) -> Result<String> {
     } else {
         match searcher.search(&repo_dir, &options) {
             Ok(matches) => {
+                let json_value = serde_json::json!({
+                    "_type": "raw_search",
+                    "pattern": args.query,
+                    "matches": matches.iter().map(|m| serde_json::json!({
+                        "file": m.file.strip_prefix(&repo_dir).unwrap_or(&m.file).to_string_lossy(),
+                        "line": m.line,
+                        "column": m.column,
+                        "content": m.content.trim()
+                    })).collect::<Vec<_>>(),
+                    "count": matches.len()
+                });
+
                 match ctx.format {
                     OutputFormat::Json => {
-                        let json = serde_json::json!({
-                            "pattern": args.query,
-                            "matches": matches.iter().map(|m| serde_json::json!({
-                                "file": m.file.strip_prefix(&repo_dir).unwrap_or(&m.file).to_string_lossy(),
-                                "line": m.line,
-                                "column": m.column,
-                                "content": m.content.trim()
-                            })).collect::<Vec<_>>(),
-                            "count": matches.len()
-                        });
-                        output = serde_json::to_string_pretty(&json).unwrap_or_default();
+                        output = serde_json::to_string_pretty(&json_value).unwrap_or_default();
                     }
                     OutputFormat::Toon => {
+                        output = super::encode_toon(&json_value);
+                    }
+                    OutputFormat::Text => {
                         output.push_str(&format!("pattern: \"{}\"\n", args.query));
                         output.push_str(&format!("matches[{}]:\n", matches.len()));
                         for m in &matches {

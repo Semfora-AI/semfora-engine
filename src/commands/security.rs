@@ -157,28 +157,33 @@ fn run_cve_scan(
 
     let mut output = String::new();
 
+    let json_value = serde_json::json!({
+        "_type": "cve_scan",
+        "functions_scanned": signatures_to_scan.len(),
+        "patterns_checked": pattern_db.len(),
+        "matches": all_matches.iter().map(|m| serde_json::json!({
+            "function": m.function,
+            "file": m.file,
+            "line": m.line,
+            "cve_id": m.cve_id,
+            "severity": format!("{:?}", m.severity),
+            "cwe_ids": m.cwe_ids,
+            "similarity": m.similarity,
+            "description": m.description,
+            "remediation": m.remediation
+        })).collect::<Vec<_>>(),
+        "count": all_matches.len(),
+        "threshold": min_similarity
+    });
+
     match ctx.format {
         OutputFormat::Json => {
-            let json = serde_json::json!({
-                "functions_scanned": signatures_to_scan.len(),
-                "patterns_checked": pattern_db.len(),
-                "matches": all_matches.iter().map(|m| serde_json::json!({
-                    "function": m.function,
-                    "file": m.file,
-                    "line": m.line,
-                    "cve_id": m.cve_id,
-                    "severity": format!("{:?}", m.severity),
-                    "cwe_ids": m.cwe_ids,
-                    "similarity": m.similarity,
-                    "description": m.description,
-                    "remediation": m.remediation
-                })).collect::<Vec<_>>(),
-                "count": all_matches.len(),
-                "threshold": min_similarity
-            });
-            output = serde_json::to_string_pretty(&json).unwrap_or_default();
+            output = serde_json::to_string_pretty(&json_value).unwrap_or_default();
         }
         OutputFormat::Toon => {
+            output = super::encode_toon(&json_value);
+        }
+        OutputFormat::Text => {
             output.push_str("═══════════════════════════════════════════\n");
             output.push_str("  CVE VULNERABILITY SCAN\n");
             output.push_str("═══════════════════════════════════════════\n\n");
@@ -232,19 +237,24 @@ fn run_update_patterns(
 
         match update_patterns_from_file(path) {
             Ok(result) => {
+                let json_value = serde_json::json!({
+                    "_type": "pattern_update",
+                    "success": true,
+                    "updated": result.updated,
+                    "previous_version": result.previous_version,
+                    "current_version": result.current_version,
+                    "pattern_count": result.pattern_count,
+                    "message": result.message
+                });
+
                 match ctx.format {
                     OutputFormat::Json => {
-                        let json = serde_json::json!({
-                            "success": true,
-                            "updated": result.updated,
-                            "previous_version": result.previous_version,
-                            "current_version": result.current_version,
-                            "pattern_count": result.pattern_count,
-                            "message": result.message
-                        });
-                        output = serde_json::to_string_pretty(&json).unwrap_or_default();
+                        output = serde_json::to_string_pretty(&json_value).unwrap_or_default();
                     }
                     OutputFormat::Toon => {
+                        output = super::encode_toon(&json_value);
+                    }
+                    OutputFormat::Text => {
                         output.push_str("Security patterns updated successfully.\n\n");
                         output.push_str(&format!("version: {}\n", result.current_version));
                         output.push_str(&format!("patterns: {}\n", result.pattern_count));
@@ -253,15 +263,20 @@ fn run_update_patterns(
                 }
             }
             Err(e) => {
+                let json_value = serde_json::json!({
+                    "_type": "pattern_update",
+                    "success": false,
+                    "error": e.to_string()
+                });
+
                 match ctx.format {
                     OutputFormat::Json => {
-                        let json = serde_json::json!({
-                            "success": false,
-                            "error": e.to_string()
-                        });
-                        output = serde_json::to_string_pretty(&json).unwrap_or_default();
+                        output = serde_json::to_string_pretty(&json_value).unwrap_or_default();
                     }
                     OutputFormat::Toon => {
+                        output = super::encode_toon(&json_value);
+                    }
+                    OutputFormat::Text => {
                         output.push_str(&format!("Failed to update patterns: {}\n", e));
                     }
                 }
@@ -284,19 +299,24 @@ fn run_update_patterns(
 
         match rt.block_on(fetch_pattern_updates(url, force)) {
             Ok(result) => {
+                let json_value = serde_json::json!({
+                    "_type": "pattern_update",
+                    "success": true,
+                    "updated": result.updated,
+                    "previous_version": result.previous_version,
+                    "current_version": result.current_version,
+                    "pattern_count": result.pattern_count,
+                    "message": result.message
+                });
+
                 match ctx.format {
                     OutputFormat::Json => {
-                        let json = serde_json::json!({
-                            "success": true,
-                            "updated": result.updated,
-                            "previous_version": result.previous_version,
-                            "current_version": result.current_version,
-                            "pattern_count": result.pattern_count,
-                            "message": result.message
-                        });
-                        output = serde_json::to_string_pretty(&json).unwrap_or_default();
+                        output = serde_json::to_string_pretty(&json_value).unwrap_or_default();
                     }
                     OutputFormat::Toon => {
+                        output = super::encode_toon(&json_value);
+                    }
+                    OutputFormat::Text => {
                         output.push_str("Security patterns updated successfully.\n\n");
                         output.push_str(&format!("version: {}\n", result.current_version));
                         output.push_str(&format!("patterns: {}\n", result.pattern_count));
@@ -305,15 +325,20 @@ fn run_update_patterns(
                 }
             }
             Err(e) => {
+                let json_value = serde_json::json!({
+                    "_type": "pattern_update",
+                    "success": false,
+                    "error": e.to_string()
+                });
+
                 match ctx.format {
                     OutputFormat::Json => {
-                        let json = serde_json::json!({
-                            "success": false,
-                            "error": e.to_string()
-                        });
-                        output = serde_json::to_string_pretty(&json).unwrap_or_default();
+                        output = serde_json::to_string_pretty(&json_value).unwrap_or_default();
                     }
                     OutputFormat::Toon => {
+                        output = super::encode_toon(&json_value);
+                    }
+                    OutputFormat::Text => {
                         output.push_str(&format!("Failed to update patterns: {}\n", e));
                     }
                 }
@@ -330,20 +355,25 @@ fn run_pattern_stats(ctx: &CommandContext) -> Result<String> {
 
     let mut output = String::new();
 
+    let json_value = serde_json::json!({
+        "_type": "pattern_stats",
+        "loaded": stats.loaded,
+        "version": stats.version,
+        "generated_at": stats.generated_at,
+        "pattern_count": stats.pattern_count,
+        "cwe_count": stats.cwe_count,
+        "language_count": stats.language_count,
+        "source": format!("{:?}", stats.source)
+    });
+
     match ctx.format {
         OutputFormat::Json => {
-            let json = serde_json::json!({
-                "loaded": stats.loaded,
-                "version": stats.version,
-                "generated_at": stats.generated_at,
-                "pattern_count": stats.pattern_count,
-                "cwe_count": stats.cwe_count,
-                "language_count": stats.language_count,
-                "source": format!("{:?}", stats.source)
-            });
-            output = serde_json::to_string_pretty(&json).unwrap_or_default();
+            output = serde_json::to_string_pretty(&json_value).unwrap_or_default();
         }
         OutputFormat::Toon => {
+            output = super::encode_toon(&json_value);
+        }
+        OutputFormat::Text => {
             output.push_str("═══════════════════════════════════════════\n");
             output.push_str("  SECURITY PATTERN STATISTICS\n");
             output.push_str("═══════════════════════════════════════════\n\n");

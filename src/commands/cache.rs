@@ -21,31 +21,36 @@ fn run_cache_info(ctx: &CommandContext) -> Result<String> {
 
     let mut output = String::new();
 
+    let total_size: u64 = cached_repos.iter().map(|(_, _, s)| *s).sum();
+    let repos: Vec<serde_json::Value> = cached_repos
+        .iter()
+        .map(|(hash, path, size)| {
+            serde_json::json!({
+                "hash": hash,
+                "path": path.to_string_lossy(),
+                "size_bytes": size,
+                "size_mb": *size as f64 / (1024.0 * 1024.0)
+            })
+        })
+        .collect();
+
+    let json_value = serde_json::json!({
+        "_type": "cache_info",
+        "cache_base": base_dir.to_string_lossy(),
+        "cached_repos": cached_repos.len(),
+        "total_size_bytes": total_size,
+        "total_size_mb": total_size as f64 / (1024.0 * 1024.0),
+        "repos": repos
+    });
+
     match ctx.format {
         OutputFormat::Json => {
-            let total_size: u64 = cached_repos.iter().map(|(_, _, s)| *s).sum();
-            let repos: Vec<serde_json::Value> = cached_repos
-                .iter()
-                .map(|(hash, path, size)| {
-                    serde_json::json!({
-                        "hash": hash,
-                        "path": path.to_string_lossy(),
-                        "size_bytes": size,
-                        "size_mb": *size as f64 / (1024.0 * 1024.0)
-                    })
-                })
-                .collect();
-
-            let json = serde_json::json!({
-                "cache_base": base_dir.to_string_lossy(),
-                "cached_repos": cached_repos.len(),
-                "total_size_bytes": total_size,
-                "total_size_mb": total_size as f64 / (1024.0 * 1024.0),
-                "repos": repos
-            });
-            output = serde_json::to_string_pretty(&json).unwrap_or_default();
+            output = serde_json::to_string_pretty(&json_value).unwrap_or_default();
         }
         OutputFormat::Toon => {
+            output = super::encode_toon(&json_value);
+        }
+        OutputFormat::Text => {
             output.push_str("═══════════════════════════════════════════════════════\n");
             output.push_str("  SEMFORA CACHE INFO\n");
             output.push_str("═══════════════════════════════════════════════════════\n\n");
@@ -56,7 +61,6 @@ fn run_cache_info(ctx: &CommandContext) -> Result<String> {
             if cached_repos.is_empty() {
                 output.push_str("No cached repositories found.\n");
             } else {
-                let total_size: u64 = cached_repos.iter().map(|(_, _, s)| *s).sum();
                 output.push_str(&format!(
                     "total_size: {} bytes ({:.2} MB)\n\n",
                     total_size,
@@ -90,36 +94,40 @@ fn run_cache_clear(ctx: &CommandContext) -> Result<String> {
 
     let mut output = String::new();
 
+    let json_value = if cache.exists() {
+        let size = cache.size();
+        cache.clear()?;
+        serde_json::json!({
+            "_type": "cache_clear",
+            "cleared": true,
+            "path": current_dir.to_string_lossy(),
+            "freed_bytes": size,
+            "freed_mb": size as f64 / (1024.0 * 1024.0)
+        })
+    } else {
+        serde_json::json!({
+            "_type": "cache_clear",
+            "cleared": false,
+            "path": current_dir.to_string_lossy(),
+            "message": "No cache exists for this directory"
+        })
+    };
+
     match ctx.format {
         OutputFormat::Json => {
-            if cache.exists() {
-                let size = cache.size();
-                cache.clear()?;
-                let json = serde_json::json!({
-                    "cleared": true,
-                    "path": current_dir.to_string_lossy(),
-                    "freed_bytes": size,
-                    "freed_mb": size as f64 / (1024.0 * 1024.0)
-                });
-                output = serde_json::to_string_pretty(&json).unwrap_or_default();
-            } else {
-                let json = serde_json::json!({
-                    "cleared": false,
-                    "path": current_dir.to_string_lossy(),
-                    "message": "No cache exists for this directory"
-                });
-                output = serde_json::to_string_pretty(&json).unwrap_or_default();
-            }
+            output = serde_json::to_string_pretty(&json_value).unwrap_or_default();
         }
         OutputFormat::Toon => {
-            if cache.exists() {
-                let size = cache.size();
-                cache.clear()?;
+            output = super::encode_toon(&json_value);
+        }
+        OutputFormat::Text => {
+            if json_value.get("cleared").and_then(|v| v.as_bool()).unwrap_or(false) {
+                let freed = json_value.get("freed_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
                 output.push_str(&format!("Cache cleared for: {}\n", current_dir.display()));
                 output.push_str(&format!(
                     "Freed: {} bytes ({:.2} MB)\n",
-                    size,
-                    size as f64 / (1024.0 * 1024.0)
+                    freed,
+                    freed as f64 / (1024.0 * 1024.0)
                 ));
             } else {
                 output.push_str(&format!("No cache exists for: {}\n", current_dir.display()));
@@ -136,15 +144,20 @@ fn run_cache_prune(days: u32, ctx: &CommandContext) -> Result<String> {
 
     let mut output = String::new();
 
+    let json_value = serde_json::json!({
+        "_type": "cache_prune",
+        "days": days,
+        "pruned_count": pruned_count
+    });
+
     match ctx.format {
         OutputFormat::Json => {
-            let json = serde_json::json!({
-                "days": days,
-                "pruned_count": pruned_count
-            });
-            output = serde_json::to_string_pretty(&json).unwrap_or_default();
+            output = serde_json::to_string_pretty(&json_value).unwrap_or_default();
         }
         OutputFormat::Toon => {
+            output = super::encode_toon(&json_value);
+        }
+        OutputFormat::Text => {
             output.push_str(&format!("Pruning caches older than {} days...\n", days));
             if pruned_count == 0 {
                 output.push_str("No caches pruned.\n");

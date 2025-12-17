@@ -26,19 +26,24 @@ fn run_detect_tests(project_dir: &PathBuf, ctx: &CommandContext) -> Result<Strin
 
     let mut output = String::new();
 
+    let json_value = serde_json::json!({
+        "_type": "test_detect",
+        "path": project_dir.to_string_lossy(),
+        "frameworks": frameworks.iter().map(|(fw, path)| serde_json::json!({
+            "name": format!("{:?}", fw),
+            "path": path.to_string_lossy()
+        })).collect::<Vec<_>>(),
+        "count": frameworks.len()
+    });
+
     match ctx.format {
         OutputFormat::Json => {
-            let json = serde_json::json!({
-                "path": project_dir.to_string_lossy(),
-                "frameworks": frameworks.iter().map(|(fw, path)| serde_json::json!({
-                    "name": format!("{:?}", fw),
-                    "path": path.to_string_lossy()
-                })).collect::<Vec<_>>(),
-                "count": frameworks.len()
-            });
-            output = serde_json::to_string_pretty(&json).unwrap_or_default();
+            output = serde_json::to_string_pretty(&json_value).unwrap_or_default();
         }
         OutputFormat::Toon => {
+            output = super::encode_toon(&json_value);
+        }
+        OutputFormat::Text => {
             output.push_str(&format!("path: {}\n", project_dir.display()));
             output.push_str(&format!("frameworks_detected: {}\n\n", frameworks.len()));
 
@@ -51,7 +56,7 @@ fn run_detect_tests(project_dir: &PathBuf, ctx: &CommandContext) -> Result<Strin
                 output.push_str("  - go test (Go)\n");
             } else {
                 for (fw, path) in &frameworks {
-                    output.push_str(&format!("---\n"));
+                    output.push_str("---\n");
                     output.push_str(&format!("framework: {:?}\n", fw));
                     output.push_str(&format!("path: {}\n", path.display()));
                 }
@@ -93,26 +98,31 @@ fn run_execute_tests(args: &TestArgs, project_dir: &PathBuf, ctx: &CommandContex
 
     let mut output = String::new();
 
+    let json_value = serde_json::json!({
+        "_type": "test_results",
+        "framework": format!("{:?}", results.framework),
+        "passed": results.passed,
+        "failed": results.failed,
+        "skipped": results.skipped,
+        "total": results.total,
+        "duration_ms": results.duration_ms,
+        "success": results.failed == 0,
+        "failures": results.failures.iter().map(|f| serde_json::json!({
+            "name": f.name,
+            "message": f.message,
+            "file": f.file,
+            "line": f.line
+        })).collect::<Vec<_>>()
+    });
+
     match ctx.format {
         OutputFormat::Json => {
-            let json = serde_json::json!({
-                "framework": format!("{:?}", results.framework),
-                "passed": results.passed,
-                "failed": results.failed,
-                "skipped": results.skipped,
-                "total": results.total,
-                "duration_ms": results.duration_ms,
-                "success": results.failed == 0,
-                "failures": results.failures.iter().map(|f| serde_json::json!({
-                    "name": f.name,
-                    "message": f.message,
-                    "file": f.file,
-                    "line": f.line
-                })).collect::<Vec<_>>()
-            });
-            output = serde_json::to_string_pretty(&json).unwrap_or_default();
+            output = serde_json::to_string_pretty(&json_value).unwrap_or_default();
         }
         OutputFormat::Toon => {
+            output = super::encode_toon(&json_value);
+        }
+        OutputFormat::Text => {
             let status = if results.failed == 0 { "✓ PASSED" } else { "✗ FAILED" };
 
             output.push_str("═══════════════════════════════════════════\n");

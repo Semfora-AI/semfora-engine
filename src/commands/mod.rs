@@ -26,6 +26,7 @@ pub mod query;
 pub mod search;
 pub mod security;
 pub mod test;
+pub mod toon_parser;
 pub mod validate;
 
 // Re-export command handlers for easy access
@@ -44,7 +45,7 @@ use crate::cli::OutputFormat;
 /// Shared context passed to all command handlers
 #[derive(Debug, Clone)]
 pub struct CommandContext {
-    /// Output format (toon or json)
+    /// Output format (text, toon, or json)
     pub format: OutputFormat,
     /// Show verbose output
     pub verbose: bool,
@@ -55,11 +56,16 @@ pub struct CommandContext {
 impl Default for CommandContext {
     fn default() -> Self {
         Self {
-            format: OutputFormat::Toon,
+            format: OutputFormat::Text,
             verbose: false,
             progress: false,
         }
     }
+}
+
+/// Encode a JSON value as proper TOON using the rtoon library
+pub fn encode_toon(value: &serde_json::Value) -> String {
+    rtoon::encode_default(value).unwrap_or_else(|e| format!("TOON encoding error: {}", e))
 }
 
 impl CommandContext {

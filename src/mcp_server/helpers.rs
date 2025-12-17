@@ -885,6 +885,44 @@ pub fn filter_repo_overview(content: &str, max_modules: usize, exclude_test_dirs
 }
 
 // ============================================================================
+// String Similarity Helpers
+// ============================================================================
+
+/// Simple Levenshtein distance for fuzzy matching suggestions
+pub fn levenshtein_distance(a: &str, b: &str) -> usize {
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    let a_len = a_chars.len();
+    let b_len = b_chars.len();
+
+    if a_len == 0 {
+        return b_len;
+    }
+    if b_len == 0 {
+        return a_len;
+    }
+
+    // Use two rows instead of full matrix for space efficiency
+    let mut prev_row: Vec<usize> = (0..=b_len).collect();
+    let mut curr_row: Vec<usize> = vec![0; b_len + 1];
+
+    for (i, a_char) in a_chars.iter().enumerate() {
+        curr_row[0] = i + 1;
+
+        for (j, b_char) in b_chars.iter().enumerate() {
+            let cost = if a_char == b_char { 0 } else { 1 };
+            curr_row[j + 1] = (prev_row[j + 1] + 1) // deletion
+                .min(curr_row[j] + 1) // insertion
+                .min(prev_row[j] + cost); // substitution
+        }
+
+        std::mem::swap(&mut prev_row, &mut curr_row);
+    }
+
+    prev_row[b_len]
+}
+
+// ============================================================================
 // Symbol Validation Helpers
 // ============================================================================
 

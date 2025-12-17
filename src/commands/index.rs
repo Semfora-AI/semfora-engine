@@ -135,20 +135,25 @@ fn run_full_index(
 
     let mut output = String::new();
 
+    let json_value = serde_json::json!({
+        "_type": "index_generate",
+        "action": "generate",
+        "path": repo_dir.to_string_lossy(),
+        "files_found": files.len(),
+        "files_processed": summaries.len(),
+        "errors": errors,
+        "modules": stats.modules_written,
+        "symbols": stats.symbols_written
+    });
+
     match ctx.format {
         OutputFormat::Json => {
-            let json = serde_json::json!({
-                "action": "generate",
-                "path": repo_dir.to_string_lossy(),
-                "files_found": files.len(),
-                "files_processed": summaries.len(),
-                "errors": errors,
-                "modules": stats.modules_written,
-                "symbols": stats.symbols_written
-            });
-            output = serde_json::to_string_pretty(&json).unwrap_or_default();
+            output = serde_json::to_string_pretty(&json_value).unwrap_or_default();
         }
         OutputFormat::Toon => {
+            output = super::encode_toon(&json_value);
+        }
+        OutputFormat::Text => {
             output.push_str("Index generation complete:\n");
             output.push_str(&format!("  path: {}\n", repo_dir.display()));
             output.push_str(&format!("  files_found: {}\n", files.len()));
@@ -206,17 +211,22 @@ fn run_check(auto_refresh: bool, max_age: u64, ctx: &CommandContext) -> Result<S
 
     let mut output = String::new();
 
+    let json_value = serde_json::json!({
+        "_type": "index_check",
+        "path": repo_dir.to_string_lossy(),
+        "indexed_at": indexed_at,
+        "is_stale": is_stale,
+        "max_age_seconds": max_age
+    });
+
     match ctx.format {
         OutputFormat::Json => {
-            let json = serde_json::json!({
-                "path": repo_dir.to_string_lossy(),
-                "indexed_at": indexed_at,
-                "is_stale": is_stale,
-                "max_age_seconds": max_age
-            });
-            output = serde_json::to_string_pretty(&json).unwrap_or_default();
+            output = serde_json::to_string_pretty(&json_value).unwrap_or_default();
         }
         OutputFormat::Toon => {
+            output = super::encode_toon(&json_value);
+        }
+        OutputFormat::Text => {
             output.push_str(&format!("path: {}\n", repo_dir.display()));
             output.push_str(&format!("indexed_at: {}\n", indexed_at));
             output.push_str(&format!("status: {}\n", if is_stale { "STALE" } else { "FRESH" }));
@@ -257,17 +267,22 @@ fn run_export(path: Option<String>, ctx: &CommandContext) -> Result<String> {
 
     let mut output = String::new();
 
+    let json_value = serde_json::json!({
+        "_type": "index_export",
+        "path": output_path.to_string_lossy(),
+        "nodes": stats.nodes_inserted,
+        "edges": stats.edges_inserted,
+        "file_size": stats.file_size_bytes
+    });
+
     match ctx.format {
         OutputFormat::Json => {
-            let json = serde_json::json!({
-                "path": output_path.to_string_lossy(),
-                "nodes": stats.nodes_inserted,
-                "edges": stats.edges_inserted,
-                "file_size": stats.file_size_bytes
-            });
-            output = serde_json::to_string_pretty(&json).unwrap_or_default();
+            output = serde_json::to_string_pretty(&json_value).unwrap_or_default();
         }
         OutputFormat::Toon => {
+            output = super::encode_toon(&json_value);
+        }
+        OutputFormat::Text => {
             output.push_str("Export complete:\n");
             output.push_str(&format!("  path: {}\n", output_path.display()));
             output.push_str(&format!("  nodes: {}\n", stats.nodes_inserted));

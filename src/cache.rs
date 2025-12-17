@@ -3304,21 +3304,29 @@ mod tests {
     }
 
     /// TDD: test_test_file_inclusion_flag
-    /// Verifies --allow-tests flag exists in CLI
+    /// Verifies --allow-tests flag exists in CLI analyze subcommand
     #[test]
     fn test_test_file_inclusion_flag() {
-        use crate::cli::Cli;
+        use crate::cli::{Cli, Commands};
         use clap::Parser;
 
-        // Test that --allow-tests flag is recognized
-        let args = vec!["semfora-engine", "--allow-tests", "test.rs"];
+        // Test that --allow-tests flag is recognized under analyze subcommand
+        let args = vec!["semfora-engine", "analyze", "--allow-tests", "test.rs"];
         let cli = Cli::try_parse_from(args).expect("Should parse with --allow-tests");
-        assert!(cli.allow_tests, "--allow-tests should be true");
+        if let Commands::Analyze(analyze_args) = cli.command {
+            assert!(analyze_args.allow_tests, "--allow-tests should be true");
+        } else {
+            panic!("Expected Analyze command");
+        }
 
         // Without the flag, default is false
-        let args = vec!["semfora-engine", "test.rs"];
+        let args = vec!["semfora-engine", "analyze", "test.rs"];
         let cli = Cli::try_parse_from(args).expect("Should parse without --allow-tests");
-        assert!(!cli.allow_tests, "Default should be false");
+        if let Commands::Analyze(analyze_args) = cli.command {
+            assert!(!analyze_args.allow_tests, "Default should be false");
+        } else {
+            panic!("Expected Analyze command");
+        }
     }
 
     // ========================================================================

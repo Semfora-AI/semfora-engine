@@ -4,6 +4,7 @@ use std::fs;
 
 use crate::cache::{CacheDir, SymbolIndexEntry};
 use crate::cli::{OutputFormat, QueryArgs, QueryType};
+use crate::commands::toon_parser::read_cached_file;
 use crate::commands::CommandContext;
 use crate::error::{McpDiffError, Result};
 
@@ -60,47 +61,135 @@ fn run_overview(include_modules: bool, max_modules: usize, ctx: &CommandContext)
 
     let content = fs::read_to_string(&overview_path)?;
 
+    // The repo_overview.toon is stored in TOON format
+    // Filter modules based on flags
+    let filtered_content = filter_overview_content(&content, include_modules, max_modules);
+
     match ctx.format {
         OutputFormat::Json => {
-            // Return as-is for JSON
-            Ok(content)
+            // Convert TOON to JSON structure
+            let json = toon_to_json_overview(&filtered_content);
+            Ok(serde_json::to_string_pretty(&json).unwrap_or_default())
         }
         OutputFormat::Toon => {
-            // Parse and format as TOON
-            let overview: serde_json::Value = serde_json::from_str(&content)
-                .map_err(|e| McpDiffError::GitError { message: format!("Parse error: {}", e) })?;
-
+            // Return TOON as-is (it's already in TOON format)
+            Ok(filtered_content)
+        }
+        OutputFormat::Text => {
+            // Human-readable text format with header
             let mut output = String::new();
-            output.push_str("_type: repo_overview\n\n");
-
-            if let Some(stats) = overview.get("stats") {
-                output.push_str("stats:\n");
-                if let Some(files) = stats.get("files") {
-                    output.push_str(&format!("  files: {}\n", files));
-                }
-                if let Some(symbols) = stats.get("symbols") {
-                    output.push_str(&format!("  symbols: {}\n", symbols));
-                }
-                if let Some(functions) = stats.get("functions") {
-                    output.push_str(&format!("  functions: {}\n", functions));
-                }
-            }
-
-            if include_modules {
-                if let Some(modules) = overview.get("modules").and_then(|m| m.as_array()) {
-                    output.push_str(&format!("\nmodules[{}]:\n", modules.len().min(max_modules)));
-                    for module in modules.iter().take(max_modules) {
-                        if let Some(name) = module.get("name").and_then(|n| n.as_str()) {
-                            let count = module.get("symbol_count").and_then(|c| c.as_u64()).unwrap_or(0);
-                            output.push_str(&format!("  - {} ({})\n", name, count));
-                        }
-                    }
-                }
-            }
-
+            output.push_str("═══════════════════════════════════════════\n");
+            output.push_str("  REPOSITORY OVERVIEW\n");
+            output.push_str("═══════════════════════════════════════════\n\n");
+            output.push_str(&filtered_content);
             Ok(output)
         }
     }
+}
+
+/// Filter overview content based on module flags
+fn filter_overview_content(content: &str, include_modules: bool, max_modules: usize) -> String {
+    if include_modules && max_modules > 0 {
+        // Return all content, just limit modules
+        let mut output = String::new();
+        let mut in_modules = false;
+        let mut module_count = 0;
+
+        for line in content.lines() {
+            if line.starts_with("modules[") {
+                in_modules = true;
+                output.push_str(line);
+                output.push('\n');
+            } else if in_modules && line.starts_with("  ") {
+                module_count += 1;
+                if module_count <= max_modules {
+                    output.push_str(line);
+                    output.push('\n');
+                }
+            } else if in_modules && !line.starts_with("  ") {
+                in_modules = false;
+                output.push_str(line);
+                output.push('\n');
+            } else {
+                output.push_str(line);
+                output.push('\n');
+            }
+        }
+        output
+    } else if !include_modules {
+        // Strip modules section entirely
+        let mut output = String::new();
+        let mut in_modules = false;
+
+        for line in content.lines() {
+            if line.starts_with("modules[") {
+                in_modules = true;
+            } else if in_modules && !line.starts_with("  ") {
+                in_modules = false;
+                output.push_str(line);
+                output.push('\n');
+            } else if !in_modules {
+                output.push_str(line);
+                output.push('\n');
+            }
+        }
+        output
+    } else {
+        content.to_string()
+    }
+}
+
+/// Convert TOON overview content to JSON
+fn toon_to_json_overview(content: &str) -> serde_json::Value {
+    let mut result = serde_json::Map::new();
+    result.insert("_type".to_string(), serde_json::json!("repo_overview"));
+
+    let mut modules = Vec::new();
+
+    for line in content.lines() {
+        let line = line.trim();
+
+        if line.starts_with("_type:") {
+            // Skip, already added
+        } else if line.starts_with("schema_version:") {
+            if let Some(val) = line.strip_prefix("schema_version:") {
+                result.insert("schema_version".to_string(), serde_json::json!(val.trim().trim_matches('"')));
+            }
+        } else if line.starts_with("framework:") {
+            if let Some(val) = line.strip_prefix("framework:") {
+                result.insert("framework".to_string(), serde_json::json!(val.trim().trim_matches('"')));
+            }
+        } else if line.starts_with("patterns[") {
+            // Parse patterns array
+            if let Some(colon_idx) = line.find(':') {
+                let patterns_str = &line[colon_idx + 1..];
+                let patterns: Vec<String> = patterns_str
+                    .split(',')
+                    .map(|s| s.trim().trim_matches('"').to_string())
+                    .collect();
+                result.insert("patterns".to_string(), serde_json::json!(patterns));
+            }
+        } else if line.starts_with("modules[") {
+            // We'll collect modules separately
+        } else if line.starts_with("  ") && line.contains(',') {
+            // Module line: name,purpose,files,risk
+            let parts: Vec<&str> = line.trim().split(',').collect();
+            if parts.len() >= 4 {
+                modules.push(serde_json::json!({
+                    "name": parts[0].trim().trim_matches('"'),
+                    "purpose": parts[1].trim().trim_matches('"'),
+                    "files": parts[2].trim().parse::<i32>().unwrap_or(0),
+                    "risk": parts[3].trim().trim_matches('"')
+                }));
+            }
+        }
+    }
+
+    if !modules.is_empty() {
+        result.insert("modules".to_string(), serde_json::json!(modules));
+    }
+
+    serde_json::Value::Object(result)
 }
 
 /// Get a specific module's details
@@ -117,21 +206,23 @@ fn run_get_module(name: &str, ctx: &CommandContext) -> Result<String> {
         });
     }
 
-    let content = fs::read_to_string(&module_file_path)?;
+    // Use toon_parser to handle TOON format
+    let cached = read_cached_file(&module_file_path)?;
 
     match ctx.format {
-        OutputFormat::Json => Ok(content),
-        OutputFormat::Toon => {
-            let module: serde_json::Value = serde_json::from_str(&content)
-                .map_err(|e| McpDiffError::GitError { message: format!("Parse error: {}", e) })?;
-
+        OutputFormat::Json => Ok(cached.as_json()),
+        OutputFormat::Toon => Ok(cached.as_toon()),
+        OutputFormat::Text => {
+            // Human-readable text format
             let mut output = String::new();
-            output.push_str(&format!("_type: module\nname: {}\n\n", name));
+            output.push_str("═══════════════════════════════════════════\n");
+            output.push_str(&format!("  MODULE: {}\n", name));
+            output.push_str("═══════════════════════════════════════════\n\n");
 
-            if let Some(symbols) = module.get("symbols").and_then(|s| s.as_array()) {
+            if let Some(symbols) = cached.json.get("symbols").and_then(|s| s.as_array()) {
                 output.push_str(&format!("symbols[{}]:\n", symbols.len()));
                 for sym in symbols.iter().take(50) {
-                    let sym_name = sym.get("symbol").or_else(|| sym.get("s")).and_then(|s| s.as_str()).unwrap_or("?");
+                    let sym_name = sym.get("symbol").or_else(|| sym.get("s")).or_else(|| sym.get("name")).and_then(|s| s.as_str()).unwrap_or("?");
                     let kind = sym.get("kind").or_else(|| sym.get("k")).and_then(|k| k.as_str()).unwrap_or("?");
                     let file = sym.get("file").or_else(|| sym.get("f")).and_then(|f| f.as_str()).unwrap_or("?");
                     let lines = sym.get("lines").or_else(|| sym.get("l")).and_then(|l| l.as_str()).unwrap_or("?");
@@ -157,7 +248,7 @@ fn run_list_module_symbols(
     })?;
     let cache = CacheDir::for_repo(&repo_dir)?;
 
-    // Read and parse module file
+    // Read and parse module file using toon_parser
     let module_file_path = cache.module_path(module_name);
     if !module_file_path.exists() {
         return Err(McpDiffError::FileNotFound {
@@ -165,27 +256,13 @@ fn run_list_module_symbols(
         });
     }
 
-    let content = fs::read_to_string(&module_file_path)?;
-    let module: serde_json::Value = serde_json::from_str(&content)
-        .map_err(|e| McpDiffError::GitError { message: format!("Parse error: {}", e) })?;
+    let cached = read_cached_file(&module_file_path)?;
 
     let mut symbols: Vec<SymbolIndexEntry> = Vec::new();
 
-    if let Some(sym_array) = module.get("symbols").and_then(|s| s.as_array()) {
+    if let Some(sym_array) = cached.json.get("symbols").and_then(|s| s.as_array()) {
         for sym in sym_array {
-            let entry: SymbolIndexEntry = serde_json::from_value(sym.clone())
-                .unwrap_or_else(|_| SymbolIndexEntry {
-                    symbol: sym.get("symbol").or_else(|| sym.get("s")).and_then(|s| s.as_str()).unwrap_or("?").to_string(),
-                    hash: sym.get("hash").or_else(|| sym.get("h")).and_then(|h| h.as_str()).unwrap_or("").to_string(),
-                    semantic_hash: String::new(),
-                    kind: sym.get("kind").or_else(|| sym.get("k")).and_then(|k| k.as_str()).unwrap_or("?").to_string(),
-                    module: module_name.to_string(),
-                    file: sym.get("file").or_else(|| sym.get("f")).and_then(|f| f.as_str()).unwrap_or("?").to_string(),
-                    lines: sym.get("lines").or_else(|| sym.get("l")).and_then(|l| l.as_str()).unwrap_or("?").to_string(),
-                    risk: sym.get("risk").or_else(|| sym.get("r")).and_then(|r| r.as_str()).unwrap_or("low").to_string(),
-                    cognitive_complexity: sym.get("cc").and_then(|c| c.as_u64()).unwrap_or(0) as usize,
-                    max_nesting: sym.get("nest").and_then(|n| n.as_u64()).unwrap_or(0) as usize,
-                });
+            let entry = symbol_from_json(sym, module_name);
 
             // Apply filters
             if let Some(kf) = kind_filter {
@@ -206,19 +283,26 @@ fn run_list_module_symbols(
         }
     }
 
+    let json_value = serde_json::json!({
+        "_type": "module_symbols",
+        "module": module_name,
+        "symbols": symbols,
+        "count": symbols.len()
+    });
+
     let mut output = String::new();
 
     match ctx.format {
         OutputFormat::Json => {
-            let json = serde_json::json!({
-                "module": module_name,
-                "symbols": symbols,
-                "count": symbols.len()
-            });
-            output = serde_json::to_string_pretty(&json).unwrap_or_default();
+            output = serde_json::to_string_pretty(&json_value).unwrap_or_default();
         }
         OutputFormat::Toon => {
-            output.push_str(&format!("module: {}\n", module_name));
+            output = super::encode_toon(&json_value);
+        }
+        OutputFormat::Text => {
+            output.push_str("═══════════════════════════════════════════\n");
+            output.push_str(&format!("  MODULE SYMBOLS: {}\n", module_name));
+            output.push_str("═══════════════════════════════════════════\n\n");
             output.push_str(&format!("symbols[{}]:\n", symbols.len()));
             for sym in &symbols {
                 output.push_str(&format!(
@@ -255,18 +339,34 @@ fn run_get_symbol(hash: &str, include_source: bool, ctx: &CommandContext) -> Res
         });
     }
 
+    let json_value = if results.len() == 1 {
+        let mut val = serde_json::to_value(&results[0]).unwrap_or_default();
+        if let Some(obj) = val.as_object_mut() {
+            obj.insert("_type".to_string(), serde_json::json!("symbol"));
+        }
+        val
+    } else {
+        serde_json::json!({
+            "_type": "symbols",
+            "symbols": results,
+            "count": results.len()
+        })
+    };
+
     let mut output = String::new();
 
     match ctx.format {
         OutputFormat::Json => {
-            let json = if results.len() == 1 {
-                serde_json::to_value(&results[0]).unwrap_or_default()
-            } else {
-                serde_json::json!({ "symbols": results })
-            };
-            output = serde_json::to_string_pretty(&json).unwrap_or_default();
+            output = serde_json::to_string_pretty(&json_value).unwrap_or_default();
         }
         OutputFormat::Toon => {
+            output = super::encode_toon(&json_value);
+        }
+        OutputFormat::Text => {
+            output.push_str("═══════════════════════════════════════════\n");
+            output.push_str("  SYMBOL DETAILS\n");
+            output.push_str("═══════════════════════════════════════════\n\n");
+
             for symbol in &results {
                 output.push_str(&format!("## {} ({})\n", symbol.symbol, symbol.kind));
                 output.push_str(&format!("hash: {}\n", symbol.hash));
@@ -333,35 +433,40 @@ fn run_get_source(
     let start_with_ctx = actual_start.saturating_sub(context + 1);
     let end_with_ctx = (actual_end + context).min(lines.len());
 
+    let source_lines: Vec<serde_json::Value> = lines
+        .iter()
+        .enumerate()
+        .skip(start_with_ctx)
+        .take(end_with_ctx - start_with_ctx)
+        .map(|(i, line)| {
+            let line_num = i + 1;
+            serde_json::json!({
+                "line": line_num,
+                "content": line,
+                "in_range": line_num >= actual_start && line_num <= actual_end
+            })
+        })
+        .collect();
+
+    let json_value = serde_json::json!({
+        "_type": "source",
+        "file": file,
+        "start": actual_start,
+        "end": actual_end,
+        "context": context,
+        "lines": source_lines
+    });
+
     let mut output = String::new();
 
     match ctx.format {
         OutputFormat::Json => {
-            let source_lines: Vec<serde_json::Value> = lines
-                .iter()
-                .enumerate()
-                .skip(start_with_ctx)
-                .take(end_with_ctx - start_with_ctx)
-                .map(|(i, line)| {
-                    let line_num = i + 1;
-                    serde_json::json!({
-                        "line": line_num,
-                        "content": line,
-                        "in_range": line_num >= actual_start && line_num <= actual_end
-                    })
-                })
-                .collect();
-
-            let json = serde_json::json!({
-                "file": file,
-                "start": actual_start,
-                "end": actual_end,
-                "context": context,
-                "lines": source_lines
-            });
-            output = serde_json::to_string_pretty(&json).unwrap_or_default();
+            output = serde_json::to_string_pretty(&json_value).unwrap_or_default();
         }
         OutputFormat::Toon => {
+            output = super::encode_toon(&json_value);
+        }
+        OutputFormat::Text => {
             output.push_str(&format!("file: {}\n", file));
             output.push_str(&format!("range: {}-{}\n", actual_start, actual_end));
             output.push_str("---\n");
@@ -394,47 +499,53 @@ fn run_get_callers(
     })?;
     let cache = CacheDir::for_repo(&repo_dir)?;
 
-    // Load call graph
-    let call_graph_path = cache.call_graph_path();
-    if !call_graph_path.exists() {
+    // Load call graph using TOON parser
+    let call_graph = cache.load_call_graph()?;
+    if call_graph.is_empty() {
         return Err(McpDiffError::FileNotFound {
-            path: "Call graph not found. Run `semfora index generate` first.".to_string(),
+            path: "Call graph not found or empty. Run `semfora index generate` first.".to_string(),
         });
     }
 
-    let cg_content = fs::read_to_string(&call_graph_path)?;
-    let call_graph: serde_json::Value = serde_json::from_str(&cg_content)
-        .map_err(|e| McpDiffError::GitError { message: format!("Parse error: {}", e) })?;
-
     // Find callers (reverse lookup)
+    // TOON format: caller_hash -> [callee1, callee2, ...]
+    // We need to find all callers where our hash appears in their callee list
     let mut callers = Vec::new();
-    if let Some(edges) = call_graph.get("edges").and_then(|e| e.as_array()) {
-        for edge in edges {
-            let callee = edge.get("callee").and_then(|c| c.as_str()).unwrap_or("");
-            if callee.contains(hash) || hash.contains(callee) {
-                if let Some(caller) = edge.get("caller").and_then(|c| c.as_str()) {
-                    callers.push(caller.to_string());
-                }
-            }
-            if callers.len() >= limit {
-                break;
-            }
+    let hash_lower = hash.to_lowercase();
+    for (caller, callees) in &call_graph {
+        // Check if our target hash is in this caller's callee list
+        let is_caller = callees.iter().any(|callee| {
+            callee.to_lowercase().contains(&hash_lower) || hash_lower.contains(&callee.to_lowercase())
+        });
+        if is_caller {
+            callers.push(caller.clone());
+        }
+        if callers.len() >= limit {
+            break;
         }
     }
+
+    let json_value = serde_json::json!({
+        "_type": "callers",
+        "symbol_hash": hash,
+        "depth": depth,
+        "callers": callers,
+        "count": callers.len()
+    });
 
     let mut output = String::new();
 
     match ctx.format {
         OutputFormat::Json => {
-            let json = serde_json::json!({
-                "symbol_hash": hash,
-                "depth": depth,
-                "callers": callers,
-                "count": callers.len()
-            });
-            output = serde_json::to_string_pretty(&json).unwrap_or_default();
+            output = serde_json::to_string_pretty(&json_value).unwrap_or_default();
         }
         OutputFormat::Toon => {
+            output = super::encode_toon(&json_value);
+        }
+        OutputFormat::Text => {
+            output.push_str("═══════════════════════════════════════════\n");
+            output.push_str("  CALLERS\n");
+            output.push_str("═══════════════════════════════════════════\n\n");
             output.push_str(&format!("symbol: {}\n", hash));
             output.push_str(&format!("callers[{}]:\n", callers.len()));
             for caller in &callers {
@@ -476,35 +587,48 @@ fn run_get_callgraph(
         return run_export_sqlite(export_path, &cache, ctx);
     }
 
-    let call_graph_path = cache.call_graph_path();
-    if !call_graph_path.exists() {
+    // Load call graph using TOON parser
+    let call_graph = cache.load_call_graph()?;
+    if call_graph.is_empty() {
         return Err(McpDiffError::FileNotFound {
-            path: "Call graph not found. Run `semfora index generate` first.".to_string(),
+            path: "Call graph not found or empty. Run `semfora index generate` first.".to_string(),
         });
     }
 
-    let content = fs::read_to_string(&call_graph_path)?;
-    let call_graph: serde_json::Value = serde_json::from_str(&content)
-        .map_err(|e| McpDiffError::GitError { message: format!("Parse error: {}", e) })?;
-
-    let edges = call_graph.get("edges").and_then(|e| e.as_array());
+    // Total edge count (each entry is caller -> [callees], count total callee references)
+    let total_edges = call_graph.len();
+    let total_calls: usize = call_graph.values().map(|v| v.len()).sum();
 
     if stats_only {
-        let edge_count = edges.map(|e| e.len()).unwrap_or(0);
+        let json_value = serde_json::json!({
+            "_type": "call_graph_stats",
+            "total_callers": total_edges,
+            "total_call_edges": total_calls,
+            "module_filter": module,
+            "symbol_filter": symbol
+        });
+
         let mut output = String::new();
 
         match ctx.format {
             OutputFormat::Json => {
-                let json = serde_json::json!({
-                    "total_edges": edge_count,
-                    "module_filter": module,
-                    "symbol_filter": symbol
-                });
-                output = serde_json::to_string_pretty(&json).unwrap_or_default();
+                output = serde_json::to_string_pretty(&json_value).unwrap_or_default();
             }
             OutputFormat::Toon => {
-                output.push_str("_type: call_graph_stats\n");
-                output.push_str(&format!("total_edges: {}\n", edge_count));
+                output = super::encode_toon(&json_value);
+            }
+            OutputFormat::Text => {
+                output.push_str("═══════════════════════════════════════════\n");
+                output.push_str("  CALL GRAPH STATISTICS\n");
+                output.push_str("═══════════════════════════════════════════\n\n");
+                output.push_str(&format!("total_callers: {}\n", total_edges));
+                output.push_str(&format!("total_call_edges: {}\n", total_calls));
+                if let Some(m) = module {
+                    output.push_str(&format!("module_filter: {}\n", m));
+                }
+                if let Some(s) = symbol {
+                    output.push_str(&format!("symbol_filter: {}\n", s));
+                }
             }
         }
 
@@ -512,44 +636,61 @@ fn run_get_callgraph(
     }
 
     // Filter and return edges
-    let filtered_edges: Vec<_> = edges
-        .map(|e| {
-            e.iter()
-                .filter(|edge| {
-                    let caller = edge.get("caller").and_then(|c| c.as_str()).unwrap_or("");
-                    let callee = edge.get("callee").and_then(|c| c.as_str()).unwrap_or("");
+    // TOON format: caller_hash -> [callee1, callee2, ...]
+    let filtered_edges: Vec<(&String, &Vec<String>)> = call_graph
+        .iter()
+        .filter(|(caller, callees)| {
+            let module_match = module
+                .map(|m| caller.contains(m) || callees.iter().any(|c| c.contains(m)))
+                .unwrap_or(true);
 
-                    let module_match = module
-                        .map(|m| caller.contains(m) || callee.contains(m))
-                        .unwrap_or(true);
+            let symbol_match = symbol
+                .map(|s| caller.contains(s) || callees.iter().any(|c| c.contains(s)))
+                .unwrap_or(true);
 
-                    let symbol_match = symbol
-                        .map(|s| caller.contains(s) || callee.contains(s))
-                        .unwrap_or(true);
-
-                    module_match && symbol_match
-                })
-                .take(limit)
-                .collect::<Vec<_>>()
+            module_match && symbol_match
         })
-        .unwrap_or_default();
+        .take(limit)
+        .collect();
+
+    let edges_json: Vec<serde_json::Value> = filtered_edges
+        .iter()
+        .map(|(caller, callees)| {
+            serde_json::json!({
+                "caller": caller,
+                "callees": callees
+            })
+        })
+        .collect();
+
+    let json_value = serde_json::json!({
+        "_type": "call_graph",
+        "edges": edges_json,
+        "count": filtered_edges.len()
+    });
 
     let mut output = String::new();
 
     match ctx.format {
         OutputFormat::Json => {
-            let json = serde_json::json!({
-                "edges": filtered_edges,
-                "count": filtered_edges.len()
-            });
-            output = serde_json::to_string_pretty(&json).unwrap_or_default();
+            output = serde_json::to_string_pretty(&json_value).unwrap_or_default();
         }
         OutputFormat::Toon => {
+            output = super::encode_toon(&json_value);
+        }
+        OutputFormat::Text => {
+            output.push_str("═══════════════════════════════════════════\n");
+            output.push_str("  CALL GRAPH\n");
+            output.push_str("═══════════════════════════════════════════\n\n");
             output.push_str(&format!("edges[{}]:\n", filtered_edges.len()));
-            for edge in &filtered_edges {
-                let caller = edge.get("caller").and_then(|c| c.as_str()).unwrap_or("?");
-                let callee = edge.get("callee").and_then(|c| c.as_str()).unwrap_or("?");
-                output.push_str(&format!("  {} -> {}\n", caller, callee));
+            for (caller, callees) in &filtered_edges {
+                // Show caller -> [callees] format
+                let callees_str = if callees.len() > 3 {
+                    format!("[{}, ... +{} more]", callees[..3].join(", "), callees.len() - 3)
+                } else {
+                    format!("[{}]", callees.join(", "))
+                };
+                output.push_str(&format!("  {} -> {}\n", caller, callees_str));
             }
         }
     }
@@ -591,19 +732,26 @@ fn run_file_symbols(path: &str, include_source: bool, kind_filter: Option<&str>,
     // Search through modules to find symbols in this file
     let symbols = find_symbols_in_file(&cache, path, kind_filter)?;
 
+    let json_value = serde_json::json!({
+        "_type": "file_symbols",
+        "file": path,
+        "symbols": symbols,
+        "count": symbols.len()
+    });
+
     let mut output = String::new();
 
     match ctx.format {
         OutputFormat::Json => {
-            let json = serde_json::json!({
-                "file": path,
-                "symbols": symbols,
-                "count": symbols.len()
-            });
-            output = serde_json::to_string_pretty(&json).unwrap_or_default();
+            output = serde_json::to_string_pretty(&json_value).unwrap_or_default();
         }
         OutputFormat::Toon => {
-            output.push_str(&format!("file: {}\n", path));
+            output = super::encode_toon(&json_value);
+        }
+        OutputFormat::Text => {
+            output.push_str("═══════════════════════════════════════════\n");
+            output.push_str(&format!("  FILE: {}\n", path));
+            output.push_str("═══════════════════════════════════════════\n\n");
             output.push_str(&format!("symbols[{}]:\n", symbols.len()));
 
             for sym in &symbols {
@@ -656,19 +804,28 @@ fn run_list_languages(ctx: &CommandContext) -> Result<String> {
         ("Dockerfile", vec!["dockerfile"]),
     ];
 
+    let json_value = serde_json::json!({
+        "_type": "languages",
+        "languages": languages.iter().map(|(name, exts)| serde_json::json!({
+            "name": name,
+            "extensions": exts
+        })).collect::<Vec<_>>(),
+        "count": languages.len()
+    });
+
     let mut output = String::new();
 
     match ctx.format {
         OutputFormat::Json => {
-            let json = serde_json::json!({
-                "languages": languages.iter().map(|(name, exts)| serde_json::json!({
-                    "name": name,
-                    "extensions": exts
-                })).collect::<Vec<_>>()
-            });
-            output = serde_json::to_string_pretty(&json).unwrap_or_default();
+            output = serde_json::to_string_pretty(&json_value).unwrap_or_default();
         }
         OutputFormat::Toon => {
+            output = super::encode_toon(&json_value);
+        }
+        OutputFormat::Text => {
+            output.push_str("═══════════════════════════════════════════\n");
+            output.push_str("  SUPPORTED LANGUAGES\n");
+            output.push_str("═══════════════════════════════════════════\n\n");
             output.push_str(&format!("languages[{}]:\n", languages.len()));
             for (name, exts) in &languages {
                 output.push_str(&format!("  {}: {}\n", name, exts.join(", ")));
@@ -683,15 +840,33 @@ fn run_list_languages(ctx: &CommandContext) -> Result<String> {
 // Helper Functions
 // ============================================
 
+/// Convert a JSON symbol object to SymbolIndexEntry
+///
+/// Handles both full JSON keys and abbreviated TOON keys (s, h, k, f, l, r)
+fn symbol_from_json(sym: &serde_json::Value, module_name: &str) -> SymbolIndexEntry {
+    SymbolIndexEntry {
+        symbol: sym.get("symbol").or_else(|| sym.get("s")).or_else(|| sym.get("name")).and_then(|s| s.as_str()).unwrap_or("?").to_string(),
+        hash: sym.get("hash").or_else(|| sym.get("h")).and_then(|h| h.as_str()).unwrap_or("").to_string(),
+        semantic_hash: String::new(),
+        kind: sym.get("kind").or_else(|| sym.get("k")).and_then(|k| k.as_str()).unwrap_or("?").to_string(),
+        module: module_name.to_string(),
+        file: sym.get("file").or_else(|| sym.get("f")).and_then(|f| f.as_str()).unwrap_or("?").to_string(),
+        lines: sym.get("lines").or_else(|| sym.get("l")).and_then(|l| l.as_str()).unwrap_or("?").to_string(),
+        risk: sym.get("risk").or_else(|| sym.get("r")).and_then(|r| r.as_str()).unwrap_or("low").to_string(),
+        cognitive_complexity: sym.get("cc").and_then(|c| c.as_u64()).unwrap_or(0) as usize,
+        max_nesting: sym.get("nest").and_then(|n| n.as_u64()).unwrap_or(0) as usize,
+    }
+}
+
 /// Load a symbol from the cache by hash
 fn load_symbol_from_cache(cache: &CacheDir, hash: &str) -> Result<Option<SymbolIndexEntry>> {
     // Try to find the symbol in the symbol shard
     let symbol_path = cache.symbol_path(hash);
     if symbol_path.exists() {
-        let content = fs::read_to_string(&symbol_path)?;
-        let symbol: SymbolIndexEntry = serde_json::from_str(&content)
-            .map_err(|e| McpDiffError::GitError { message: format!("Parse error: {}", e) })?;
-        return Ok(Some(symbol));
+        // Symbol shards are also in TOON format
+        let cached = read_cached_file(&symbol_path)?;
+        let entry = symbol_from_json(&cached.json, "");
+        return Ok(Some(entry));
     }
 
     // Fall back to searching through modules
@@ -701,25 +876,14 @@ fn load_symbol_from_cache(cache: &CacheDir, hash: &str) -> Result<Option<SymbolI
             let entry = entry?;
             let path = entry.path();
             if path.extension().map(|e| e == "toon" || e == "json").unwrap_or(false) {
-                let content = fs::read_to_string(&path)?;
-                if let Ok(module) = serde_json::from_str::<serde_json::Value>(&content) {
-                    if let Some(symbols) = module.get("symbols").and_then(|s| s.as_array()) {
+                // Use toon_parser to handle both formats
+                if let Ok(cached) = read_cached_file(&path) {
+                    if let Some(symbols) = cached.json.get("symbols").and_then(|s| s.as_array()) {
                         for sym in symbols {
                             let sym_hash = sym.get("hash").or_else(|| sym.get("h")).and_then(|h| h.as_str()).unwrap_or("");
                             if sym_hash == hash || sym_hash.contains(hash) || hash.contains(sym_hash) {
-                                let entry = SymbolIndexEntry {
-                                    symbol: sym.get("symbol").or_else(|| sym.get("s")).and_then(|s| s.as_str()).unwrap_or("?").to_string(),
-                                    hash: sym_hash.to_string(),
-                                    semantic_hash: String::new(),
-                                    kind: sym.get("kind").or_else(|| sym.get("k")).and_then(|k| k.as_str()).unwrap_or("?").to_string(),
-                                    module: path.file_stem().and_then(|s| s.to_str()).unwrap_or("?").to_string(),
-                                    file: sym.get("file").or_else(|| sym.get("f")).and_then(|f| f.as_str()).unwrap_or("?").to_string(),
-                                    lines: sym.get("lines").or_else(|| sym.get("l")).and_then(|l| l.as_str()).unwrap_or("?").to_string(),
-                                    risk: sym.get("risk").or_else(|| sym.get("r")).and_then(|r| r.as_str()).unwrap_or("low").to_string(),
-                                    cognitive_complexity: sym.get("cc").and_then(|c| c.as_u64()).unwrap_or(0) as usize,
-                                    max_nesting: sym.get("nest").and_then(|n| n.as_u64()).unwrap_or(0) as usize,
-                                };
-                                return Ok(Some(entry));
+                                let module_name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
+                                return Ok(Some(symbol_from_json(sym, module_name)));
                             }
                         }
                     }
@@ -744,9 +908,10 @@ fn find_symbols_in_file(cache: &CacheDir, file_path: &str, kind_filter: Option<&
         let entry = entry?;
         let path = entry.path();
         if path.extension().map(|e| e == "toon" || e == "json").unwrap_or(false) {
-            let content = fs::read_to_string(&path)?;
-            if let Ok(module) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(sym_array) = module.get("symbols").and_then(|s| s.as_array()) {
+            // Use toon_parser to handle both formats
+            if let Ok(cached) = read_cached_file(&path) {
+                if let Some(sym_array) = cached.json.get("symbols").and_then(|s| s.as_array()) {
+                    let module_name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
                     for sym in sym_array {
                         let sym_file = sym.get("file").or_else(|| sym.get("f")).and_then(|f| f.as_str()).unwrap_or("");
                         if sym_file == file_path || sym_file.ends_with(file_path) || file_path.ends_with(sym_file) {
@@ -758,18 +923,7 @@ fn find_symbols_in_file(cache: &CacheDir, file_path: &str, kind_filter: Option<&
                                 }
                             }
 
-                            symbols.push(SymbolIndexEntry {
-                                symbol: sym.get("symbol").or_else(|| sym.get("s")).and_then(|s| s.as_str()).unwrap_or("?").to_string(),
-                                hash: sym.get("hash").or_else(|| sym.get("h")).and_then(|h| h.as_str()).unwrap_or("").to_string(),
-                                semantic_hash: String::new(),
-                                kind: kind.to_string(),
-                                module: path.file_stem().and_then(|s| s.to_str()).unwrap_or("?").to_string(),
-                                file: sym_file.to_string(),
-                                lines: sym.get("lines").or_else(|| sym.get("l")).and_then(|l| l.as_str()).unwrap_or("?").to_string(),
-                                risk: sym.get("risk").or_else(|| sym.get("r")).and_then(|r| r.as_str()).unwrap_or("low").to_string(),
-                                cognitive_complexity: sym.get("cc").and_then(|c| c.as_u64()).unwrap_or(0) as usize,
-                                max_nesting: sym.get("nest").and_then(|n| n.as_u64()).unwrap_or(0) as usize,
-                            });
+                            symbols.push(symbol_from_json(sym, module_name));
                         }
                     }
                 }

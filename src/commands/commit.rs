@@ -108,27 +108,32 @@ pub fn run_commit(args: &CommitArgs, ctx: &CommandContext) -> Result<String> {
     // Format output
     let mut output = String::new();
 
+    // Build JSON value for all formats
+    let json_value = serde_json::json!({
+        "_type": "prep_commit",
+        "_note": "Information for commit message. This tool DOES NOT commit.",
+        "git_context": {
+            "branch": branch,
+            "remote": remote,
+            "last_commit": last_commit_hash,
+            "last_message": last_commit_message
+        },
+        "summary": {
+            "staged_files": staged_files.len(),
+            "unstaged_files": unstaged_files.len()
+        },
+        "staged_changes": staged_files,
+        "unstaged_changes": unstaged_files
+    });
+
     match ctx.format {
         OutputFormat::Json => {
-            let json = serde_json::json!({
-                "type": "prep_commit",
-                "note": "Information for commit message. This tool DOES NOT commit.",
-                "git_context": {
-                    "branch": branch,
-                    "remote": remote,
-                    "last_commit": last_commit_hash,
-                    "last_message": last_commit_message
-                },
-                "summary": {
-                    "staged_files": staged_files.len(),
-                    "unstaged_files": unstaged_files.len()
-                },
-                "staged_changes": staged_files,
-                "unstaged_changes": unstaged_files
-            });
-            output = serde_json::to_string_pretty(&json).unwrap_or_default();
+            output = serde_json::to_string_pretty(&json_value).unwrap_or_default();
         }
         OutputFormat::Toon => {
+            output = super::encode_toon(&json_value);
+        }
+        OutputFormat::Text => {
             output.push_str("_type: prep_commit\n");
             output.push_str("_note: Information for commit message. This tool DOES NOT commit.\n\n");
 

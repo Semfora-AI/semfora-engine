@@ -1198,31 +1198,37 @@ pub fn extract_module_name(file_path: &str) -> String {
     ];
     let mut relative_path = file_path;
 
+    // Case-insensitive matching for cross-platform compatibility
+    // (e.g., Unity uses /Packages/ while we list /packages/)
+    let file_path_lower = file_path.to_lowercase();
     for marker in &source_markers {
-        if let Some(pos) = file_path.find(marker) {
+        let marker_lower = marker.to_lowercase();
+        if let Some(pos) = file_path_lower.find(&marker_lower) {
             relative_path = &file_path[pos + marker.len()..];
             break;
         }
     }
 
     // Also handle relative paths starting with src/ (matching absolute markers)
+    // Case-insensitive for cross-platform compatibility
     if relative_path == file_path {
-        for prefix in &[
+        let prefixes = [
             "src/",
             "lib/",
             "app/",
             "pages/",
-            "Assets/Scripts/",
-            "Assets/",
-            "Source/",
-            "Content/",
+            "assets/scripts/",
+            "assets/",
+            "source/",
+            "content/",
             "scripts/",
             "addons/",
             "packages/",
             "modules/",
-        ] {
-            if let Some(stripped) = file_path.strip_prefix(prefix) {
-                relative_path = stripped;
+        ];
+        for prefix in &prefixes {
+            if file_path_lower.starts_with(prefix) {
+                relative_path = &file_path[prefix.len()..];
                 break;
             }
         }
