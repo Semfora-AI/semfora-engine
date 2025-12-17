@@ -23,6 +23,9 @@ jobs:
         with:
           fetch-depth: 0  # Full history for diff analysis
 
+      - name: Fetch base branch
+        run: git fetch origin ${{ github.base_ref }}:${{ github.base_ref }}
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -96,7 +99,7 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: macos-arm64
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             artifact: macos-x86_64
           - os: windows-latest
