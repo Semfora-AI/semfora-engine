@@ -6,7 +6,7 @@
 //! - symbols/{hash}.toon - Individual symbol details
 //! - graphs/*.toon - Dependency and call graphs
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -19,15 +19,292 @@ use crate::bm25::{Bm25Document, Bm25Index, extract_terms_from_symbol};
 use crate::cache::{CacheDir, IndexingStatus, SourceFileInfo};
 use crate::duplicate::FunctionSignature;
 use crate::error::Result;
+use crate::module_registry::ModuleRegistrySqlite;
 use crate::schema::{RepoOverview, RiskLevel, SemanticSummary, SymbolId, SymbolInfo, SymbolKind, SCHEMA_VERSION};
-use crate::toon::{encode_toon, generate_repo_overview, is_meaningful_call};
+use crate::toon::{encode_toon, generate_repo_overview_with_modules, is_meaningful_call};
+
+// ============================================================================
+// Module Registry - Conflict-Aware Module Name Stripping
+// ============================================================================
+
+/// Registry that maps full module paths to optimally shortened names.
+///
+/// The algorithm iteratively strips the first path component from ALL module
+/// names until doing so would create a duplicate (conflict).
+///
+/// Example:
+/// ```text
+/// Input:  src.game.player, src.game.enemy, src.map.player
+/// Strip 1: game.player, game.enemy, map.player (no conflict, accept)
+/// Strip 2: player, enemy, player (conflict! stop)
+/// Result: game.player, game.enemy, map.player
+/// ```
+#[derive(Debug, Clone)]
+pub struct ModuleRegistry {
+    /// Full module path → shortened name
+    full_to_short: HashMap<String, String>,
+
+    /// Shortened name → full module path (for conflict detection)
+    short_to_full: HashMap<String, String>,
+
+    /// Current global strip depth applied to all modules
+    strip_depth: usize,
+}
+
+impl ModuleRegistry {
+    /// Create a new empty registry
+    pub fn new() -> Self {
+        Self {
+            full_to_short: HashMap::new(),
+            short_to_full: HashMap::new(),
+            strip_depth: 0,
+        }
+    }
+
+    /// Build a registry from a list of full module paths
+    pub fn from_full_paths(full_paths: &[String]) -> Self {
+        let (short_names, strip_depth) = compute_optimal_names(full_paths);
+
+        let mut registry = Self {
+            full_to_short: HashMap::new(),
+            short_to_full: HashMap::new(),
+            strip_depth,
+        };
+
+        for (full, short) in full_paths.iter().zip(short_names.iter()) {
+            registry.full_to_short.insert(full.clone(), short.clone());
+            registry.short_to_full.insert(short.clone(), full.clone());
+        }
+
+        registry
+    }
+
+    /// Get the shortened name for a full module path
+    pub fn get_short(&self, full_path: &str) -> Option<&String> {
+        self.full_to_short.get(full_path)
+    }
+
+    /// Get the full path for a shortened name
+    #[allow(dead_code)]
+    pub fn get_full(&self, short_name: &str) -> Option<&String> {
+        self.short_to_full.get(short_name)
+    }
+
+    /// Get the current strip depth
+    #[allow(dead_code)]
+    pub fn strip_depth(&self) -> usize {
+        self.strip_depth
+    }
+
+    /// Check if a shortened name already exists (would cause conflict)
+    #[allow(dead_code)]
+    pub fn has_conflict(&self, short_name: &str) -> bool {
+        self.short_to_full.contains_key(short_name)
+    }
+
+    /// Get all shortened module names
+    pub fn short_names(&self) -> impl Iterator<Item = &String> {
+        self.short_to_full.keys()
+    }
+
+    /// Number of modules in the registry
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.full_to_short.len()
+    }
+
+    /// Check if registry is empty
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.full_to_short.is_empty()
+    }
+}
+
+impl Default for ModuleRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Compute optimal shortened names for a list of full module paths.
+///
+/// Returns the shortened names (same order as input) and the strip depth used.
+///
+/// Algorithm: Iteratively strip the first component from ALL multi-component names
+/// until doing so would create a duplicate. Single-component modules are preserved
+/// as-is since they're already minimal and can't be stripped further.
+///
+/// This handles the case where a codebase has files in the root (creating "root"
+/// modules) alongside deeply nested modules - the single-component modules won't
+/// block stripping for the multi-component ones.
+fn compute_optimal_names(full_paths: &[String]) -> (Vec<String>, usize) {
+    if full_paths.is_empty() {
+        return (Vec::new(), 0);
+    }
+
+    // Separate single-component modules (can't be stripped) from multi-component
+    // Single-component = no dots in the path
+    let mut result = vec![String::new(); full_paths.len()];
+    let mut multi_indices: Vec<usize> = Vec::new();
+    let mut multi_paths: Vec<String> = Vec::new();
+    let mut single_names: HashSet<String> = HashSet::new();
+
+    for (i, path) in full_paths.iter().enumerate() {
+        if path.contains('.') {
+            // Multi-component - will be processed by stripping algorithm
+            multi_indices.push(i);
+            multi_paths.push(path.clone());
+        } else {
+            // Single-component - preserve as-is (already minimal)
+            result[i] = path.clone();
+            single_names.insert(path.clone());
+        }
+    }
+
+    // If no multi-component modules, nothing to strip
+    if multi_paths.is_empty() {
+        return (result, 0);
+    }
+
+    // Run the stripping algorithm on multi-component modules only
+    let mut current_names = multi_paths;
+    let mut strip_depth = 0;
+
+    loop {
+        // Try stripping one more level from each name
+        let stripped: Vec<Option<String>> = current_names
+            .iter()
+            .map(|name| strip_first_component(name))
+            .collect();
+
+        // If any name can't be stripped (became single component), stop
+        if stripped.iter().any(|s| s.is_none()) {
+            break;
+        }
+
+        let stripped: Vec<String> = stripped.into_iter().flatten().collect();
+
+        // Check for conflicts among multi-component names
+        let unique: HashSet<&String> = stripped.iter().collect();
+        if unique.len() < stripped.len() {
+            // Conflict detected among multi-component names
+            break;
+        }
+
+        // Check for conflicts with single-component names
+        let conflicts_with_single = stripped.iter().any(|s| single_names.contains(s));
+        if conflicts_with_single {
+            // Stripping would conflict with an existing single-component name
+            break;
+        }
+
+        // No conflict - accept this stripping level
+        current_names = stripped;
+        strip_depth += 1;
+    }
+
+    // Put the stripped multi-component names back in their original positions
+    for (idx, stripped_name) in multi_indices.iter().zip(current_names.iter()) {
+        result[*idx] = stripped_name.clone();
+    }
+
+    (result, strip_depth)
+}
+
+/// Public wrapper for `compute_optimal_names` - exposed for integration testing.
+///
+/// This function is used by integration tests to verify the module naming algorithm
+/// works correctly without needing to go through the full index generation pipeline.
+#[doc(hidden)]
+pub fn compute_optimal_names_public(full_paths: &[String]) -> (Vec<String>, usize) {
+    compute_optimal_names(full_paths)
+}
+
+/// Strip the first component from a dotted module path.
+///
+/// Returns None if the path has only one component.
+///
+/// Examples:
+/// - "src.game.player" -> Some("game.player")
+/// - "player" -> None
+fn strip_first_component(name: &str) -> Option<String> {
+    let parts: Vec<&str> = name.split('.').collect();
+    if parts.len() <= 1 {
+        return None;
+    }
+    Some(parts[1..].join("."))
+}
+
+/// Strip the first n components from a dotted module path.
+///
+/// Returns the original name if n is 0 or greater than component count.
+#[allow(dead_code)]
+fn strip_n_components(name: &str, n: usize) -> String {
+    if n == 0 {
+        return name.to_string();
+    }
+    let parts: Vec<&str> = name.split('.').collect();
+    if n >= parts.len() {
+        return name.to_string();
+    }
+    parts[n..].join(".")
+}
+
+/// Compute the full module path from a file path.
+///
+/// This returns the raw dotted path based on directory structure,
+/// WITHOUT any hardcoded marker stripping. The conflict-aware algorithm
+/// will determine optimal stripping.
+///
+/// Example: "/home/user/project/src/game/player.rs" -> "src.game.player"
+pub fn compute_full_module_path(file_path: &str) -> String {
+    let path = std::path::Path::new(file_path);
+
+    // Get the parent directory path
+    let parent = match path.parent() {
+        Some(p) => p,
+        None => return "root".to_string(),
+    };
+
+    // Convert path to components, filtering out empty and common root paths
+    let components: Vec<&str> = parent
+        .components()
+        .filter_map(|c| {
+            match c {
+                std::path::Component::Normal(s) => s.to_str(),
+                _ => None,
+            }
+        })
+        .collect();
+
+    if components.is_empty() {
+        // File is in root directory - use filename without extension
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("root");
+
+        // Skip generic names
+        if matches!(stem, "index" | "mod" | "lib" | "main" | "__init__") {
+            return "root".to_string();
+        }
+        return stem.to_string();
+    }
+
+    // Join components with dots
+    components.join(".")
+}
 
 /// Write sharded IR output for a repository
 pub struct ShardWriter {
     /// Cache directory manager
     cache: CacheDir,
 
-    /// Summaries organized by module
+    /// Repository root path (for computing relative module paths)
+    repo_root: String,
+
+    /// Summaries organized by FULL module path (before optimal stripping)
+    /// Keys are raw dotted paths like "src.game.player"
     modules: HashMap<String, Vec<SemanticSummary>>,
 
     /// All summaries for graph building
@@ -38,6 +315,9 @@ pub struct ShardWriter {
 
     /// Indexing progress
     progress: IndexingStatus,
+
+    /// Module name registry (computed at write time)
+    module_registry: Option<ModuleRegistry>,
 }
 
 impl ShardWriter {
@@ -46,12 +326,19 @@ impl ShardWriter {
         let cache = CacheDir::for_repo(repo_path)?;
         cache.init()?;
 
+        let repo_root = repo_path
+            .to_string_lossy()
+            .trim_end_matches('/')
+            .to_string();
+
         Ok(Self {
             cache,
+            repo_root,
             modules: HashMap::new(),
             all_summaries: Vec::new(),
             overview: None,
             progress: IndexingStatus::default(),
+            module_registry: None,
         })
     }
 
@@ -62,18 +349,20 @@ impl ShardWriter {
 
         Ok(Self {
             cache,
+            repo_root: String::new(), // Will use extract_module_name fallback
             modules: HashMap::new(),
             all_summaries: Vec::new(),
             overview: None,
             progress: IndexingStatus::default(),
+            module_registry: None,
         })
     }
 
     /// Add summaries to be sharded
     pub fn add_summaries(&mut self, summaries: Vec<SemanticSummary>) {
-        // Organize by module
+        // Organize by full module path (relative to repo root)
         for summary in &summaries {
-            let module_name = extract_module_name(&summary.file);
+            let module_name = self.compute_module_path(&summary.file);
             self.modules
                 .entry(module_name)
                 .or_insert_with(Vec::new)
@@ -83,14 +372,140 @@ impl ShardWriter {
         self.all_summaries.extend(summaries);
     }
 
+    /// Compute the full module path for a file (relative to repo root).
+    ///
+    /// This returns the raw dotted path WITHOUT hardcoded marker stripping.
+    /// The conflict-aware algorithm will determine optimal stripping at write time.
+    fn compute_module_path(&self, file_path: &str) -> String {
+        // Strip repo root prefix if present
+        let relative = if !self.repo_root.is_empty() && file_path.starts_with(&self.repo_root) {
+            file_path[self.repo_root.len()..].trim_start_matches('/')
+        } else {
+            file_path
+        };
+
+        let path = std::path::Path::new(relative);
+
+        // Get parent directory (module path is based on directory structure)
+        let parent = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => {
+                // File in root - use filename without extension
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("root");
+
+                // Skip generic names
+                if matches!(stem, "index" | "mod" | "lib" | "main" | "__init__") {
+                    return "root".to_string();
+                }
+                return stem.to_string();
+            }
+        };
+
+        // Convert path components to dotted notation
+        let components: Vec<&str> = parent
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(s) => s.to_str(),
+                _ => None,
+            })
+            .collect();
+
+        if components.is_empty() {
+            return "root".to_string();
+        }
+
+        components.join(".")
+    }
+
+    /// Compute the module registry with optimal names.
+    ///
+    /// This builds a registry that maps full module paths to optimally
+    /// shortened names using conflict-aware stripping.
+    fn compute_module_registry(&mut self) {
+        let full_paths: Vec<String> = self.modules.keys().cloned().collect();
+        self.module_registry = Some(ModuleRegistry::from_full_paths(&full_paths));
+    }
+
+    /// Persist the module registry to SQLite for incremental indexing support.
+    ///
+    /// The SQLite file is stored in the cache directory alongside other index files.
+    /// This enables O(1) lookups during future incremental indexing operations.
+    fn persist_module_registry(&self) -> Result<()> {
+        let Some(ref registry) = self.module_registry else {
+            return Ok(()); // Nothing to persist
+        };
+
+        let mut sqlite_reg = ModuleRegistrySqlite::open(&self.cache)?;
+
+        // Build entries: (full_path, short_name, file_path)
+        let entries: Vec<(String, String, String)> = self
+            .modules
+            .iter()
+            .map(|(full_path, summaries)| {
+                let short_name = registry
+                    .get_short(full_path)
+                    .cloned()
+                    .unwrap_or_else(|| full_path.clone());
+                let file_path = summaries
+                    .first()
+                    .map(|s| s.file.clone())
+                    .unwrap_or_default();
+                (full_path.clone(), short_name, file_path)
+            })
+            .collect();
+
+        sqlite_reg.bulk_insert(&entries, registry.strip_depth())?;
+
+        Ok(())
+    }
+
+    /// Get the optimal (shortened) name for a full module path.
+    ///
+    /// Falls back to the full path if no registry is available.
+    fn get_optimal_module_name(&self, full_path: &str) -> String {
+        if let Some(ref registry) = self.module_registry {
+            registry
+                .get_short(full_path)
+                .cloned()
+                .unwrap_or_else(|| full_path.to_string())
+        } else {
+            full_path.to_string()
+        }
+    }
+
+    /// Create a mapping from file paths to optimal module names.
+    ///
+    /// This is used for consistent module naming across overview and shards.
+    fn build_file_to_module_map(&self) -> HashMap<String, String> {
+        let mut map = HashMap::new();
+
+        for (full_module_path, summaries) in &self.modules {
+            let optimal_name = self.get_optimal_module_name(full_module_path);
+            for summary in summaries {
+                map.insert(summary.file.clone(), optimal_name.clone());
+            }
+        }
+
+        map
+    }
+
     /// Generate and write all shards
     pub fn write_all(&mut self, dir_path: &str) -> Result<ShardStats> {
         let mut stats = ShardStats::default();
 
+        // Compute optimal module names using conflict-aware stripping
+        self.compute_module_registry();
+
+        // Persist registry to SQLite (Phase 2 - enables incremental indexing)
+        self.persist_module_registry()?;
+
         // Generate overview first (fast, gives agents something to work with)
         self.write_repo_overview(dir_path, &mut stats)?;
 
-        // Write module shards
+        // Write module shards (using optimal names from registry)
         self.write_module_shards(&mut stats)?;
 
         // Write symbol shards
@@ -113,7 +528,14 @@ impl ShardWriter {
 
     /// Write the repository overview
     fn write_repo_overview(&mut self, dir_path: &str, stats: &mut ShardStats) -> Result<()> {
-        let overview = generate_repo_overview(&self.all_summaries, dir_path);
+        // Build file-to-module mapping for consistent naming with module shards
+        let file_to_module = self.build_file_to_module_map();
+
+        let overview = generate_repo_overview_with_modules(
+            &self.all_summaries,
+            dir_path,
+            Some(&file_to_module),
+        );
         self.overview = Some(overview.clone());
 
         // Create TOON output with metadata
@@ -131,10 +553,15 @@ impl ShardWriter {
     }
 
     /// Write per-module shards
+    ///
+    /// Uses the module registry to get optimal (shortened) names for shards.
     fn write_module_shards(&self, stats: &mut ShardStats) -> Result<()> {
-        for (module_name, summaries) in &self.modules {
-            let toon = encode_module_shard(module_name, summaries, &self.cache.repo_root);
-            let path = self.cache.module_path(module_name);
+        for (full_module_path, summaries) in &self.modules {
+            // Get the optimal shortened name from the registry
+            let optimal_name = self.get_optimal_module_name(full_module_path);
+
+            let toon = encode_module_shard(&optimal_name, summaries, &self.cache.repo_root);
+            let path = self.cache.module_path(&optimal_name);
 
             let mut file = fs::File::create(&path)?;
             file.write_all(toon.as_bytes())?;
@@ -320,8 +747,16 @@ impl ShardWriter {
         let path = self.cache.signature_index_path();
         let mut file = fs::File::create(&path)?;
 
+        // Build file-to-module mapping for proper module names from registry
+        let file_to_module = self.build_file_to_module_map();
+
         for summary in &self.all_summaries {
             let namespace = SymbolId::namespace_from_path(&summary.file);
+            // Get the optimal module name from registry, fallback to extraction
+            let module_name = file_to_module
+                .get(&summary.file)
+                .cloned()
+                .unwrap_or_else(|| extract_module_name(&summary.file));
 
             // If we have symbols in the new multi-symbol format, use those
             if !summary.symbols.is_empty() {
@@ -339,6 +774,7 @@ impl ShardWriter {
                         symbol_info,
                         &symbol_id.hash,
                         &summary.file,
+                        &module_name,
                         None, // Use default boilerplate config
                     );
 
@@ -377,6 +813,7 @@ impl ShardWriter {
                         &symbol_info,
                         &symbol_id.hash,
                         &summary.file,
+                        &module_name,
                         None,
                     );
 
@@ -1198,34 +1635,46 @@ pub fn extract_module_name(file_path: &str) -> String {
     ];
     let mut relative_path = file_path;
 
+    // Case-insensitive matching for cross-platform compatibility
+    // (e.g., Unity uses /Packages/ while we list /packages/)
+    let file_path_lower = file_path.to_lowercase();
     for marker in &source_markers {
-        if let Some(pos) = file_path.find(marker) {
+        let marker_lower = marker.to_lowercase();
+        if let Some(pos) = file_path_lower.find(&marker_lower) {
             relative_path = &file_path[pos + marker.len()..];
             break;
         }
     }
 
     // Also handle relative paths starting with src/ (matching absolute markers)
+    // Case-insensitive for cross-platform compatibility
     if relative_path == file_path {
-        for prefix in &[
+        let prefixes = [
             "src/",
             "lib/",
             "app/",
             "pages/",
-            "Assets/Scripts/",
-            "Assets/",
-            "Source/",
-            "Content/",
+            "assets/scripts/",
+            "assets/",
+            "source/",
+            "content/",
             "scripts/",
             "addons/",
             "packages/",
             "modules/",
-        ] {
-            if let Some(stripped) = file_path.strip_prefix(prefix) {
-                relative_path = stripped;
+        ];
+        for prefix in &prefixes {
+            if file_path_lower.starts_with(prefix) {
+                relative_path = &file_path[prefix.len()..];
                 break;
             }
         }
+    }
+
+    // If still no marker found and path looks absolute, try to find project root
+    // by detecting common project subdirectories (tests/, docs/, etc.)
+    if relative_path == file_path && file_path.starts_with('/') {
+        relative_path = detect_project_relative_path(file_path);
     }
 
     // Get the directory path (everything before the filename)
@@ -1249,6 +1698,85 @@ pub fn extract_module_name(file_path: &str) -> String {
     }
 
     stem.to_string()
+}
+
+/// Detect project root from absolute path and return relative path.
+///
+/// Looks for common project subdirectories (tests/, docs/, etc.) and
+/// assumes the directory before them is the project root.
+fn detect_project_relative_path(file_path: &str) -> &str {
+    // Common project-level directories that indicate we're at project root
+    let project_subdirs = [
+        "/tests/",
+        "/test/",
+        "/docs/",
+        "/doc/",
+        "/scripts/",
+        "/examples/",
+        "/benchmarks/",
+        "/benches/",
+        "/tickets/",
+        "/migrations/",
+        "/fixtures/",
+        "/specs/",
+        "/__tests__/",
+        "/__mocks__/",
+    ];
+
+    // Find the first project subdir in the path
+    for subdir in &project_subdirs {
+        if let Some(pos) = file_path.find(subdir) {
+            // Return from the subdir onwards (without leading /)
+            return &file_path[pos + 1..];
+        }
+    }
+
+    // No project subdir found - try to detect Python package structure
+    // Look for a directory that could be a Python package (lowercase, underscores)
+    // followed by a Python file
+    if file_path.ends_with(".py") {
+        // Split into components and look for package-like directories
+        let components: Vec<&str> = file_path.split('/').collect();
+
+        // Look for patterns like /project-name/package_name/file.py
+        // where package_name uses underscores (Python convention)
+        for (i, component) in components.iter().enumerate() {
+            // Skip empty components and root
+            if component.is_empty() || i < 2 {
+                continue;
+            }
+
+            // Python packages typically use underscores, not hyphens
+            // If we find a directory with underscores followed by .py files,
+            // that's likely our package root
+            if component.contains('_') && !component.contains('-') {
+                // Check if this could be a Python package name
+                // Return from this component onwards
+                let start_pos: usize = components[..i].iter().map(|c| c.len() + 1).sum();
+                return &file_path[start_pos..];
+            }
+        }
+    }
+
+    // Fallback: if path has many components, try to find a reasonable cut point
+    // Look for directories that look like project names (hyphenated or underscored)
+    let components: Vec<&str> = file_path.split('/').collect();
+    if components.len() > 4 {
+        // Skip typical prefix directories (home, user, Dev, etc.)
+        // Look for a directory that looks like a project name
+        for (i, component) in components.iter().enumerate().skip(3) {
+            if component.contains('-') || component.contains('_') {
+                // This looks like a project directory, return everything after it
+                let start_pos: usize = components[..=i].iter().map(|c| c.len() + 1).sum();
+                if start_pos < file_path.len() {
+                    return &file_path[start_pos..];
+                }
+            }
+        }
+    }
+
+    // Give up - return original path
+    file_path
 }
 
 #[cfg(test)]
@@ -1299,6 +1827,41 @@ mod tests {
         // Monorepo paths (packages/)
         assert_eq!(extract_module_name("/repo/packages/core/utils/format.ts"), "core.utils");
         assert_eq!(extract_module_name("packages/api/handlers/auth.ts"), "api.handlers");
+
+        // Absolute paths with project subdirectories (tests/, docs/, etc.)
+        // These should be detected as project-relative
+        assert_eq!(
+            extract_module_name("/home/user/Dev/my-project/tests/test_db.py"),
+            "tests"
+        );
+        assert_eq!(
+            extract_module_name("/home/user/projects/semfora-pm/tests/unit/test_api.py"),
+            "tests.unit"
+        );
+        assert_eq!(
+            extract_module_name("/home/user/code/my-app/docs/api.md"),
+            "docs"
+        );
+        assert_eq!(
+            extract_module_name("/home/kadajett/Dev/Semfora_org/semfora-pm/tickets/backlog.yaml"),
+            "tickets"
+        );
+
+        // Python packages with underscore naming
+        assert_eq!(
+            extract_module_name("/home/user/project/semfora_pm/db/connection.py"),
+            "semfora_pm.db"
+        );
+        assert_eq!(
+            extract_module_name("/home/user/project/my_package/utils/helpers.py"),
+            "my_package.utils"
+        );
+
+        // Fallback for hyphenated project names
+        assert_eq!(
+            extract_module_name("/home/user/Dev/my-cool-project/config/settings.toml"),
+            "config"
+        );
     }
 
     #[test]
@@ -1312,5 +1875,556 @@ mod tests {
         };
 
         assert_eq!(stats.total_bytes(), 1100);
+    }
+
+    // ========================================================================
+    // Conflict-Aware Module Name Stripping Tests
+    // ========================================================================
+
+    #[test]
+    fn test_strip_first_component() {
+        // Normal stripping
+        assert_eq!(strip_first_component("src.game.player"), Some("game.player".to_string()));
+        assert_eq!(strip_first_component("game.player"), Some("player".to_string()));
+        assert_eq!(strip_first_component("a.b.c.d"), Some("b.c.d".to_string()));
+
+        // Single component can't be stripped
+        assert_eq!(strip_first_component("player"), None);
+        assert_eq!(strip_first_component("root"), None);
+
+        // Empty string
+        assert_eq!(strip_first_component(""), None);
+    }
+
+    #[test]
+    fn test_strip_n_components() {
+        // Strip 0 returns original
+        assert_eq!(strip_n_components("src.game.player", 0), "src.game.player");
+
+        // Strip 1
+        assert_eq!(strip_n_components("src.game.player", 1), "game.player");
+
+        // Strip 2
+        assert_eq!(strip_n_components("src.game.player", 2), "player");
+
+        // Strip more than available returns original (no panic)
+        assert_eq!(strip_n_components("src.game.player", 5), "src.game.player");
+
+        // Single component
+        assert_eq!(strip_n_components("root", 0), "root");
+        assert_eq!(strip_n_components("root", 1), "root");
+    }
+
+    #[test]
+    fn test_compute_optimal_names_no_conflict() {
+        // All unique after full stripping - algorithm strips as much as possible
+        let paths = vec![
+            "src.game.player".to_string(),
+            "src.game.enemy".to_string(),
+            "src.utils.format".to_string(),
+        ];
+
+        let (result, depth) = compute_optimal_names(&paths);
+
+        // Strips all the way to single final components since no conflicts
+        // src.game.player -> game.player -> player (unique, keep stripping)
+        assert_eq!(depth, 2);
+        assert_eq!(result, vec!["player", "enemy", "format"]);
+    }
+
+    #[test]
+    fn test_compute_optimal_names_with_conflict() {
+        // Conflict at final level
+        let paths = vec![
+            "src.game.player".to_string(),
+            "src.game.enemy".to_string(),
+            "src.map.player".to_string(), // Conflicts with game.player at "player" level
+        ];
+
+        let (result, depth) = compute_optimal_names(&paths);
+
+        // Should strip "src." but stop before stripping "game."/"map." due to conflict
+        assert_eq!(depth, 1);
+        assert_eq!(result, vec!["game.player", "game.enemy", "map.player"]);
+    }
+
+    #[test]
+    fn test_compute_optimal_names_immediate_conflict() {
+        // Conflict at first strip level
+        let paths = vec![
+            "src.player".to_string(),
+            "lib.player".to_string(), // Would conflict if we strip src./lib.
+        ];
+
+        let (result, depth) = compute_optimal_names(&paths);
+
+        // Can't strip anything - immediate conflict
+        assert_eq!(depth, 0);
+        assert_eq!(result, vec!["src.player", "lib.player"]);
+    }
+
+    #[test]
+    fn test_compute_optimal_names_single_component_does_not_block() {
+        // Single-component modules should NOT block stripping for multi-component ones
+        let paths = vec![
+            "root".to_string(),         // Single component - preserved as-is
+            "src.game.player".to_string(),
+            "src.game.enemy".to_string(),
+        ];
+
+        let (result, depth) = compute_optimal_names(&paths);
+
+        // Single-component is preserved, multi-component modules are stripped
+        // "player" and "enemy" are unique so they get fully stripped
+        assert_eq!(result[0], "root");  // Unchanged
+        assert_eq!(result[1], "player"); // Stripped from src.game.player
+        assert_eq!(result[2], "enemy");  // Stripped from src.game.enemy
+        assert_eq!(depth, 2);  // Multi-component modules got stripped twice
+    }
+
+    #[test]
+    fn test_compute_optimal_names_mixed_single_multi_with_conflict() {
+        // Single-component + multi-component with conflict at final level
+        let paths = vec![
+            "main".to_string(),             // Single component
+            "src.game.player".to_string(),
+            "src.map.player".to_string(),   // Conflicts with game.player at "player" level
+        ];
+
+        let (result, depth) = compute_optimal_names(&paths);
+
+        // Single-component preserved, multi-component stripped until conflict
+        assert_eq!(result[0], "main");       // Unchanged
+        assert_eq!(result[1], "game.player"); // Stripped to game.player (conflict prevents further)
+        assert_eq!(result[2], "map.player");  // Stripped to map.player (conflict prevents further)
+        assert_eq!(depth, 1);  // Only stripped "src." due to conflict at next level
+    }
+
+    #[test]
+    fn test_compute_optimal_names_all_single_component() {
+        // All single-component - nothing to strip
+        let paths = vec![
+            "root".to_string(),
+            "main".to_string(),
+            "lib".to_string(),
+        ];
+
+        let (result, depth) = compute_optimal_names(&paths);
+
+        assert_eq!(result, paths);  // All unchanged
+        assert_eq!(depth, 0);       // No stripping occurred
+    }
+
+    #[test]
+    fn test_compute_optimal_names_empty() {
+        let paths: Vec<String> = vec![];
+        let (result, depth) = compute_optimal_names(&paths);
+
+        assert_eq!(depth, 0);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_compute_optimal_names_deep_strip() {
+        // All modules share deep common prefix
+        let paths = vec![
+            "home.user.project.src.api.users".to_string(),
+            "home.user.project.src.api.auth".to_string(),
+            "home.user.project.src.utils.helpers".to_string(),
+        ];
+
+        let (result, depth) = compute_optimal_names(&paths);
+
+        // Strips all the way to final single component since all are unique
+        // home.user.project.src.api.users -> ... -> users
+        assert_eq!(depth, 5);
+        assert_eq!(result, vec!["users", "auth", "helpers"]);
+    }
+
+    #[test]
+    fn test_module_registry_basic() {
+        // Use paths that will have conflicts to test partial stripping
+        let paths = vec![
+            "src.game.player".to_string(),
+            "src.game.enemy".to_string(),
+            "src.map.player".to_string(), // Conflicts with game.player at final level
+        ];
+
+        let registry = ModuleRegistry::from_full_paths(&paths);
+
+        // With conflict, stops at game.player/map.player level
+        assert_eq!(registry.get_short("src.game.player"), Some(&"game.player".to_string()));
+        assert_eq!(registry.get_short("src.game.enemy"), Some(&"game.enemy".to_string()));
+        assert_eq!(registry.get_short("src.map.player"), Some(&"map.player".to_string()));
+
+        // Reverse lookup
+        assert_eq!(registry.get_full("game.player"), Some(&"src.game.player".to_string()));
+
+        // Non-existent
+        assert_eq!(registry.get_short("nonexistent"), None);
+
+        // Stats
+        assert_eq!(registry.len(), 3);
+        assert!(!registry.is_empty());
+    }
+
+    #[test]
+    fn test_module_registry_conflict_detection() {
+        let paths = vec![
+            "src.game.player".to_string(),
+            "src.map.player".to_string(),
+        ];
+
+        let registry = ModuleRegistry::from_full_paths(&paths);
+
+        // Both should be preserved with parent prefix
+        assert_eq!(registry.get_short("src.game.player"), Some(&"game.player".to_string()));
+        assert_eq!(registry.get_short("src.map.player"), Some(&"map.player".to_string()));
+
+        // "player" alone would conflict
+        assert!(registry.has_conflict("game.player"));
+        assert!(registry.has_conflict("map.player"));
+        assert!(!registry.has_conflict("nonexistent"));
+    }
+
+    #[test]
+    fn test_compute_full_module_path() {
+        // Basic path
+        assert_eq!(
+            compute_full_module_path("src/game/player.rs"),
+            "src.game"
+        );
+
+        // Deeper path
+        assert_eq!(
+            compute_full_module_path("src/server/api/handlers/users.ts"),
+            "src.server.api.handlers"
+        );
+
+        // Root file with generic name
+        assert_eq!(compute_full_module_path("main.rs"), "root");
+        assert_eq!(compute_full_module_path("index.ts"), "root");
+
+        // Root file with specific name
+        assert_eq!(compute_full_module_path("utils.ts"), "utils");
+    }
+
+    // ========================================================================
+    // detect_project_relative_path() tests
+    // ========================================================================
+
+    #[test]
+    fn test_detect_project_relative_path_tests_dir() {
+        // Should find /tests/ and return from there
+        assert_eq!(
+            detect_project_relative_path("/home/user/project/tests/test_main.py"),
+            "tests/test_main.py"
+        );
+        assert_eq!(
+            detect_project_relative_path("/home/kadajett/Dev/semfora/tests/unit/test_api.py"),
+            "tests/unit/test_api.py"
+        );
+    }
+
+    #[test]
+    fn test_detect_project_relative_path_docs_dir() {
+        assert_eq!(
+            detect_project_relative_path("/home/user/project/docs/api.md"),
+            "docs/api.md"
+        );
+        assert_eq!(
+            detect_project_relative_path("/home/user/code/my-app/doc/README.md"),
+            "doc/README.md"
+        );
+    }
+
+    #[test]
+    fn test_detect_project_relative_path_scripts_dir() {
+        assert_eq!(
+            detect_project_relative_path("/home/user/project/scripts/build.sh"),
+            "scripts/build.sh"
+        );
+    }
+
+    #[test]
+    fn test_detect_project_relative_path_examples_dir() {
+        assert_eq!(
+            detect_project_relative_path("/home/user/project/examples/demo.rs"),
+            "examples/demo.rs"
+        );
+    }
+
+    #[test]
+    fn test_detect_project_relative_path_benchmarks_dir() {
+        assert_eq!(
+            detect_project_relative_path("/home/user/project/benchmarks/perf_test.rs"),
+            "benchmarks/perf_test.rs"
+        );
+        assert_eq!(
+            detect_project_relative_path("/home/user/project/benches/criterion.rs"),
+            "benches/criterion.rs"
+        );
+    }
+
+    #[test]
+    fn test_detect_project_relative_path_jest_dirs() {
+        assert_eq!(
+            detect_project_relative_path("/home/user/project/__tests__/unit.test.ts"),
+            "__tests__/unit.test.ts"
+        );
+        assert_eq!(
+            detect_project_relative_path("/home/user/project/__mocks__/api.ts"),
+            "__mocks__/api.ts"
+        );
+    }
+
+    #[test]
+    fn test_detect_project_relative_path_python_package() {
+        // Python packages with underscores
+        assert_eq!(
+            detect_project_relative_path("/home/user/project/my_package/utils/helpers.py"),
+            "my_package/utils/helpers.py"
+        );
+        assert_eq!(
+            detect_project_relative_path("/home/user/Dev/semfora_pm/db/connection.py"),
+            "semfora_pm/db/connection.py"
+        );
+    }
+
+    #[test]
+    fn test_detect_project_relative_path_hyphenated_project() {
+        // Project directories with hyphens
+        assert_eq!(
+            detect_project_relative_path("/home/user/Dev/my-cool-project/config/settings.toml"),
+            "config/settings.toml"
+        );
+    }
+
+    #[test]
+    fn test_detect_project_relative_path_fallback() {
+        // Short paths should return as-is
+        let short = "main.rs";
+        assert_eq!(detect_project_relative_path(short), short);
+    }
+
+    // ========================================================================
+    // extract_call_from_initializer() tests
+    // ========================================================================
+
+    #[test]
+    fn test_extract_call_simple_function() {
+        // Simple function call
+        assert_eq!(
+            extract_call_from_initializer("useState()"),
+            Some("useState".to_string())
+        );
+        assert_eq!(
+            extract_call_from_initializer("getData()"),
+            Some("getData".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_call_with_arguments() {
+        // Function call with arguments
+        assert_eq!(
+            extract_call_from_initializer("useState(false)"),
+            Some("useState".to_string())
+        );
+        assert_eq!(
+            extract_call_from_initializer("fetchUser(userId)"),
+            Some("fetchUser".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_call_method_call() {
+        // Method calls extract the last part - but common names like "get", "query" may be filtered as noise
+        // The function uses rsplit('.') to get the last part, then filters noise
+
+        // "get" is in the noise list, so axios.get returns None
+        assert_eq!(
+            extract_call_from_initializer("axios.get('/users')"),
+            None
+        );
+
+        // More specific method names that aren't noise should work
+        assert_eq!(
+            extract_call_from_initializer("client.fetchUser()"),
+            Some("fetchUser".to_string())
+        );
+        assert_eq!(
+            extract_call_from_initializer("api.createOrder()"),
+            Some("createOrder".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_call_skip_literals() {
+        // String literals
+        assert_eq!(extract_call_from_initializer("\"hello\""), None);
+        assert_eq!(extract_call_from_initializer("'world'"), None);
+
+        // Numeric literals
+        assert_eq!(extract_call_from_initializer("42"), None);
+        assert_eq!(extract_call_from_initializer("3.14"), None);
+
+        // Boolean literals
+        assert_eq!(extract_call_from_initializer("true"), None);
+        assert_eq!(extract_call_from_initializer("false"), None);
+
+        // Null/undefined
+        assert_eq!(extract_call_from_initializer("null"), None);
+        assert_eq!(extract_call_from_initializer("undefined"), None);
+    }
+
+    #[test]
+    fn test_extract_call_empty() {
+        assert_eq!(extract_call_from_initializer(""), None);
+        assert_eq!(extract_call_from_initializer("  "), None);
+    }
+
+    #[test]
+    fn test_extract_call_array_object_literals() {
+        // Array literal
+        assert_eq!(extract_call_from_initializer("[]"), None);
+
+        // Object literal
+        assert_eq!(extract_call_from_initializer("{}"), None);
+    }
+
+    #[test]
+    fn test_extract_call_new_expression() {
+        // new expressions are treated as a single call "new X"
+        // The function doesn't specifically parse JS "new" keyword, it just extracts the function call part
+        assert_eq!(
+            extract_call_from_initializer("new Map()"),
+            Some("new Map".to_string())
+        );
+        assert_eq!(
+            extract_call_from_initializer("new Date()"),
+            Some("new Date".to_string())
+        );
+
+        // More complex new expressions
+        assert_eq!(
+            extract_call_from_initializer("new Promise()"),
+            Some("new Promise".to_string())
+        );
+    }
+
+    // ========================================================================
+    // build_call_graph() tests (integration-style)
+    // ========================================================================
+
+    #[test]
+    fn test_build_call_graph_empty() {
+        let summaries: Vec<SemanticSummary> = vec![];
+        let graph = build_call_graph(&summaries, false);
+        assert!(graph.is_empty(), "Empty summaries should produce empty graph");
+    }
+
+    #[test]
+    fn test_build_call_graph_no_calls() {
+        use crate::schema::SymbolInfo;
+
+        // Summaries with symbols but no calls
+        let summaries = vec![
+            SemanticSummary {
+                file: "src/main.ts".to_string(),
+                language: "typescript".to_string(),
+                symbols: vec![
+                    SymbolInfo {
+                        name: "main".to_string(),
+                        kind: crate::schema::SymbolKind::Function,
+                        start_line: 1,
+                        end_line: 10,
+                        calls: vec![], // No calls
+                        ..Default::default()
+                    }
+                ],
+                ..Default::default()
+            },
+        ];
+
+        let graph = build_call_graph(&summaries, false);
+        // No calls means no edges in the graph
+        assert!(graph.is_empty() || graph.values().all(|v| v.is_empty()),
+            "No calls should produce empty or no-edge graph");
+    }
+
+    #[test]
+    fn test_build_call_graph_with_calls() {
+        use crate::schema::{Call, SymbolId, SymbolKind};
+
+        let summaries = vec![
+            SemanticSummary {
+                file: "src/main.ts".to_string(),
+                language: "typescript".to_string(),
+                symbol_id: Some(SymbolId {
+                    hash: "abcd1234:main_hash0001".to_string(),
+                    semantic_hash: "main_hash0001".to_string(),
+                    namespace: "src".to_string(),
+                    symbol: "main".to_string(),
+                    kind: SymbolKind::Function,
+                    arity: 0,
+                }),
+                symbols: vec![],
+                calls: vec![
+                    Call {
+                        name: "helper".to_string(),
+                        object: None,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            SemanticSummary {
+                file: "src/utils.ts".to_string(),
+                language: "typescript".to_string(),
+                symbol_id: Some(SymbolId {
+                    hash: "efgh5678:helper_hash01".to_string(),
+                    semantic_hash: "helper_hash01".to_string(),
+                    namespace: "src".to_string(),
+                    symbol: "helper".to_string(),
+                    kind: SymbolKind::Function,
+                    arity: 0,
+                }),
+                symbols: vec![],
+                calls: vec![],
+                ..Default::default()
+            },
+        ];
+
+        let graph = build_call_graph(&summaries, false);
+        // Should have at least one entry for main calling helper
+        assert!(!graph.is_empty(), "Should produce a call graph with edges");
+    }
+
+    // ========================================================================
+    // ShardStats tests
+    // ========================================================================
+
+    #[test]
+    fn test_shard_stats_total_bytes_all_fields() {
+        let stats = ShardStats {
+            overview_bytes: 1000,
+            module_bytes: 2000,
+            symbol_bytes: 3000,
+            graph_bytes: 4000,
+            index_bytes: 5000,
+            ..Default::default()
+        };
+
+        assert_eq!(stats.total_bytes(), 15000);
+    }
+
+    #[test]
+    fn test_shard_stats_default() {
+        let stats = ShardStats::default();
+        assert_eq!(stats.total_bytes(), 0);
+        assert_eq!(stats.files_written, 0);
+        assert_eq!(stats.symbols_written, 0);
+        assert_eq!(stats.modules_written, 0);
     }
 }

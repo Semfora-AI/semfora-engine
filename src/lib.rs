@@ -45,15 +45,18 @@ pub mod benchmark_builder;
 pub mod bm25;
 pub mod cache;
 pub mod cli;
+pub mod commands;
 pub mod detectors;
 pub mod drift;
 pub mod duplicate;
 pub mod error;
 pub mod extract;
+pub mod fs_utils;
 pub mod git;
 pub mod installer;
 pub mod lang;
 pub mod mcp_server;
+pub mod module_registry;
 pub mod overlay;
 pub mod ripgrep;
 pub mod risk;
@@ -101,7 +104,7 @@ pub use cache::{
 };
 
 // Re-export shard module types
-pub use shard::{extract_module_name, ShardStats, ShardWriter};
+pub use shard::{compute_optimal_names_public, extract_module_name, ShardStats, ShardWriter};
 
 // Re-export benchmark types
 pub use benchmark::{
@@ -166,5 +169,8 @@ pub use sqlite_export::{
 pub use security::{
     CVEMatch, CVEPattern, CVEScanSummary, PatternDatabase, PatternSource, Severity,
 };
+
+// Re-export filesystem utilities (Windows compatibility)
+pub use fs_utils::{atomic_rename, normalize_path};
 
 // Test change to trigger semfora-ci workflow

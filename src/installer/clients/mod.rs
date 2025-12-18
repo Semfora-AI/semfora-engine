@@ -197,6 +197,7 @@ impl Default for ClientRegistry {
 /// Helper functions for JSON config manipulation
 pub(crate) mod json_utils {
     use crate::error::McpDiffError;
+    use crate::fs_utils;
     use serde_json::Value as JsonValue;
     use std::fs;
     use std::path::Path;
@@ -240,8 +241,8 @@ pub(crate) mod json_utils {
             message: e.to_string(),
         })?;
 
-        // Atomic rename
-        fs::rename(&temp_path, path).map_err(|e| McpDiffError::IoError {
+        // Atomic rename (cross-platform)
+        fs_utils::atomic_rename(&temp_path, path).map_err(|e| McpDiffError::IoError {
             path: path.to_path_buf(),
             message: e.to_string(),
         })?;

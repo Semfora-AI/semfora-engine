@@ -26,6 +26,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
 
+/// Helper for serde skip_serializing_if
+fn is_zero(v: &usize) -> bool {
+    *v == 0
+}
+
 /// Reference to a symbol in the codebase
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolRef {
@@ -35,6 +40,9 @@ pub struct SymbolRef {
     pub name: String,
     /// File path
     pub file: String,
+    /// Module name (conflict-aware short name from registry)
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub module: String,
     /// Start line
     pub start_line: usize,
     /// End line
@@ -43,11 +51,12 @@ pub struct SymbolRef {
 
 impl SymbolRef {
     /// Create from SymbolInfo and file path
-    pub fn from_symbol_info(info: &SymbolInfo, hash: &str, file: &str) -> Self {
+    pub fn from_symbol_info(info: &SymbolInfo, hash: &str, file: &str, module: &str) -> Self {
         Self {
             hash: hash.to_string(),
             name: info.name.clone(),
             file: file.to_string(),
+            module: module.to_string(),
             start_line: info.start_line,
             end_line: info.end_line,
         }
@@ -68,6 +77,14 @@ pub struct FunctionSignature {
 
     /// File path
     pub file: String,
+
+    /// Module name (conflict-aware short name from registry)
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub module: String,
+
+    /// Start line number
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub start_line: usize,
 
     /// Name tokens for similarity matching
     /// e.g., "handleUserLogin" → ["handle", "user", "login"]
@@ -105,6 +122,7 @@ impl FunctionSignature {
         info: &SymbolInfo,
         symbol_hash: &str,
         file: &str,
+        module: &str,
         config: Option<&BoilerplateConfig>,
     ) -> Self {
         // 1. Tokenize name: "handleUserLogin" → ["handle", "user", "login"]
@@ -134,6 +152,8 @@ impl FunctionSignature {
             symbol_hash: symbol_hash.to_string(),
             name: info.name.clone(),
             file: file.to_string(),
+            module: module.to_string(),
+            start_line: info.start_line,
             name_tokens,
             call_fingerprint,
             control_flow_fingerprint,
@@ -152,8 +172,9 @@ impl FunctionSignature {
             hash: self.symbol_hash.clone(),
             name: self.name.clone(),
             file: self.file.clone(),
-            start_line: 0, // Not stored in signature
-            end_line: 0,
+            module: self.module.clone(),
+            start_line: self.start_line,
+            end_line: self.start_line + self.line_count.saturating_sub(1),
         }
     }
 }

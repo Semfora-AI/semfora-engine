@@ -1,0 +1,419 @@
+//! Validate command handler - Quality audits (duplicates)
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::{BufRead, BufReader};
+use std::path::Path;
+
+use crate::cache::CacheDir;
+use crate::cli::{OutputFormat, ValidateArgs};
+use crate::commands::CommandContext;
+use crate::duplicate::DuplicateKind;
+use crate::error::{McpDiffError, Result};
+use crate::{DuplicateDetector, FunctionSignature};
+
+/// Run the validate command - find duplicates and consolidation opportunities
+pub fn run_validate(args: &ValidateArgs, ctx: &CommandContext) -> Result<String> {
+    let repo_dir = std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
+        path: format!("current directory: {}", e),
+    })?;
+    let cache = CacheDir::for_repo(&repo_dir)?;
+
+    // If duplicates flag is set or a hash is provided, run duplicate detection
+    if args.duplicates {
+        if let Some(ref target) = args.target {
+            // Check if target looks like a hash (for single symbol duplicate check)
+            if target.contains(':') || target.len() >= 16 {
+                return run_check_duplicates(target, args.threshold, &cache, ctx);
+            }
+        }
+    }
+
+    // Run full duplicate scan with optional file/module filter
+    run_find_duplicates(args, &cache, ctx)
+}
+
+/// Load function signatures from cache
+fn load_signatures(cache: &CacheDir) -> Result<Vec<FunctionSignature>> {
+    let sig_path = cache.signature_index_path();
+    if !sig_path.exists() {
+        return Err(McpDiffError::FileNotFound {
+            path: "Signature index not found. Run `semfora index generate` first.".to_string(),
+        });
+    }
+
+    let file = fs::File::open(&sig_path)?;
+    let reader = BufReader::new(file);
+
+    let mut signatures = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(sig) = serde_json::from_str::<FunctionSignature>(&line) {
+            signatures.push(sig);
+        }
+    }
+
+    Ok(signatures)
+}
+
+/// Extract a short module name from a file path (fallback for old cached data)
+/// e.g., "/home/user/project/src/Presentation/Nop.Web/Factories/ProductModelFactory.cs"
+///    -> "Nop.Web.Factories"
+fn extract_module_name_from_path(file_path: &str) -> String {
+    let path = Path::new(file_path);
+
+    // Get parent directory and file stem
+    let parent = path.parent().and_then(|p| p.file_name()).map(|s| s.to_string_lossy());
+    let grandparent = path.parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.file_name())
+        .map(|s| s.to_string_lossy());
+
+    match (grandparent, parent) {
+        (Some(gp), Some(p)) => format!("{}.{}", gp, p),
+        (None, Some(p)) => p.to_string(),
+        _ => path.file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+    }
+}
+
+/// Get module name from SymbolRef, falling back to path extraction for old cached data
+fn get_module_name(symbol: &crate::duplicate::SymbolRef) -> String {
+    if !symbol.module.is_empty() {
+        symbol.module.clone()
+    } else {
+        extract_module_name_from_path(&symbol.file)
+    }
+}
+
+/// Find all duplicates in the codebase
+fn run_find_duplicates(args: &ValidateArgs, cache: &CacheDir, ctx: &CommandContext) -> Result<String> {
+    if !cache.exists() {
+        return Err(McpDiffError::GitError {
+            message: "No index found. Run `semfora index generate` first.".to_string(),
+        });
+    }
+
+    eprintln!("Loading function signatures...");
+    let mut signatures = load_signatures(cache)?;
+
+    // Filter by target if specified (file path or module name)
+    if let Some(ref target) = args.target {
+        let target_lower = target.to_lowercase();
+        signatures.retain(|sig| sig.file.to_lowercase().contains(&target_lower));
+
+        if signatures.is_empty() {
+            return Err(McpDiffError::FileNotFound {
+                path: format!("No symbols found matching: {}", target),
+            });
+        }
+    }
+
+    if signatures.is_empty() {
+        return Ok("No function signatures found in index.".to_string());
+    }
+
+    eprintln!("Analyzing {} signatures for duplicates...", signatures.len());
+
+    let exclude_boilerplate = !args.include_boilerplate;
+    let detector = DuplicateDetector::new(args.threshold)
+        .with_boilerplate_exclusion(exclude_boilerplate);
+
+    let clusters = detector.find_all_clusters(&signatures);
+    let total_clusters = clusters.len();
+    let limit = args.limit.min(50);
+    let paginated: Vec<_> = clusters.into_iter().take(limit).collect();
+
+    let mut output = String::new();
+
+    match ctx.format {
+        OutputFormat::Json => {
+            // JSON keeps full paths for programmatic access
+            let json_value = serde_json::json!({
+                "_type": "duplicate_analysis",
+                "threshold": args.threshold,
+                "boilerplate_excluded": exclude_boilerplate,
+                "total_signatures": signatures.len(),
+                "filter": args.target,
+                "clusters": total_clusters,
+                "total_duplicates": paginated.iter().map(|c| c.duplicates.len()).sum::<usize>(),
+                "cluster_details": paginated.iter().map(|c| serde_json::json!({
+                    "primary": c.primary.name,
+                    "primary_file": c.primary.file,
+                    "primary_hash": c.primary.hash,
+                    "duplicate_count": c.duplicates.len(),
+                    "duplicates": c.duplicates.iter().take(5).map(|d| serde_json::json!({
+                        "name": d.symbol.name,
+                        "file": d.symbol.file,
+                        "similarity": d.similarity,
+                        "kind": format!("{:?}", d.kind)
+                    })).collect::<Vec<_>>()
+                })).collect::<Vec<_>>()
+            });
+            output = serde_json::to_string_pretty(&json_value).unwrap_or_default();
+        }
+        OutputFormat::Toon => {
+            // Token-optimized format - groups by module
+            output.push_str("_type: duplicate_results\n");
+            output.push_str(&format!(
+                "threshold: {:.0}% | clusters: {} | showing: 1-{} | boilerplate_excluded: {}\n",
+                args.threshold * 100.0,
+                total_clusters,
+                paginated.len(),
+                exclude_boilerplate
+            ));
+
+            if paginated.len() < total_clusters {
+                output.push_str(&format!("hint: use --limit {} for more\n", limit + 20));
+            }
+
+            if paginated.is_empty() {
+                output.push_str("result: No duplicate clusters found above threshold.\n");
+                return Ok(output);
+            }
+
+            let page_duplicates: usize = paginated.iter().map(|c| c.duplicates.len()).sum();
+            output.push_str(&format!("page_duplicates: {}\n\n", page_duplicates));
+
+            for (i, cluster) in paginated.iter().enumerate() {
+                let primary_module = get_module_name(&cluster.primary);
+                let line_info = if cluster.primary.start_line > 0 {
+                    format!(":{}", cluster.primary.start_line)
+                } else {
+                    String::new()
+                };
+
+                // Compact cluster header
+                output.push_str(&format!(
+                    "[{}] {} ({}{})\n",
+                    i + 1,
+                    cluster.primary.name,
+                    primary_module,
+                    line_info
+                ));
+                output.push_str(&format!("  hash: {}\n", cluster.primary.hash));
+                output.push_str(&format!("  duplicates: {}\n", cluster.duplicates.len()));
+
+                // Group duplicates by module (actual index module names)
+                let mut by_module: BTreeMap<String, Vec<&crate::duplicate::DuplicateMatch>> = BTreeMap::new();
+                for dup in &cluster.duplicates {
+                    let module = get_module_name(&dup.symbol);
+                    by_module.entry(module).or_default().push(dup);
+                }
+
+                // Show modules with counts and similarity ranges (limit to top 5)
+                output.push_str("  by_module:\n");
+                let mut module_entries: Vec<_> = by_module.iter().collect();
+                module_entries.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+
+                let max_modules_shown = 5;
+                let mut remaining_count = 0;
+                let mut remaining_modules = 0;
+
+                for (idx, (module, dups)) in module_entries.iter().enumerate() {
+                    if idx >= max_modules_shown {
+                        remaining_count += dups.len();
+                        remaining_modules += 1;
+                        continue;
+                    }
+
+                    let min_sim = dups.iter().map(|d| d.similarity).fold(f64::INFINITY, f64::min);
+                    let max_sim = dups.iter().map(|d| d.similarity).fold(0.0_f64, f64::max);
+
+                    let exact = dups.iter().filter(|d| matches!(d.kind, DuplicateKind::Exact)).count();
+                    let near = dups.iter().filter(|d| matches!(d.kind, DuplicateKind::Near)).count();
+
+                    let kind_hint = if exact > 0 && near == 0 {
+                        "exact"
+                    } else if exact == 0 && near > 0 {
+                        "near"
+                    } else if exact > 0 {
+                        "mixed"
+                    } else {
+                        "divergent"
+                    };
+
+                    output.push_str(&format!(
+                        "    {}: {} ({:.0}-{:.0}%) [{}]\n",
+                        module,
+                        dups.len(),
+                        min_sim * 100.0,
+                        max_sim * 100.0,
+                        kind_hint
+                    ));
+                }
+
+                if remaining_modules > 0 {
+                    output.push_str(&format!(
+                        "    +{} more modules: {} dups\n",
+                        remaining_modules,
+                        remaining_count
+                    ));
+                }
+
+                // Show top 3 individual matches
+                let mut top_matches: Vec<_> = cluster.duplicates.iter().collect();
+                top_matches.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap_or(std::cmp::Ordering::Equal));
+
+                if !top_matches.is_empty() {
+                    output.push_str("  top_matches:\n");
+                    for dup in top_matches.iter().take(3) {
+                        let dup_module = get_module_name(&dup.symbol);
+                        output.push_str(&format!(
+                            "    {}@{} {:.0}%\n",
+                            dup.symbol.name,
+                            dup_module,
+                            dup.similarity * 100.0
+                        ));
+                    }
+                }
+
+                output.push_str("\n");
+            }
+        }
+        OutputFormat::Text => {
+            // Human-readable format for terminal
+            output.push_str("═══════════════════════════════════════════\n");
+            if let Some(ref target) = args.target {
+                output.push_str(&format!("  DUPLICATE ANALYSIS: {}\n", target));
+            } else {
+                output.push_str("  DUPLICATE ANALYSIS\n");
+            }
+            output.push_str("═══════════════════════════════════════════\n\n");
+
+            output.push_str(&format!("Threshold: {:.0}%\n", args.threshold * 100.0));
+            output.push_str(&format!("Boilerplate excluded: {}\n", exclude_boilerplate));
+            output.push_str(&format!("Signatures analyzed: {}\n", signatures.len()));
+            output.push_str(&format!("Clusters found: {}\n\n", total_clusters));
+
+            if paginated.is_empty() {
+                output.push_str("No duplicate clusters found above threshold.\n");
+                return Ok(output);
+            }
+
+            let total_duplicates: usize = paginated.iter().map(|c| c.duplicates.len()).sum();
+            output.push_str(&format!("Total duplicate functions: {}\n\n", total_duplicates));
+
+            for (i, cluster) in paginated.iter().enumerate() {
+                let primary_module = get_module_name(&cluster.primary);
+
+                output.push_str("───────────────────────────────────────────\n");
+                output.push_str(&format!("Cluster {} ({} duplicates)\n", i + 1, cluster.duplicates.len()));
+                output.push_str(&format!("Primary: {} ({})\n", cluster.primary.name, primary_module));
+                output.push_str(&format!("  hash: {}\n", cluster.primary.hash));
+
+                // Group by module (actual index module names)
+                let mut by_module: BTreeMap<String, Vec<&crate::duplicate::DuplicateMatch>> = BTreeMap::new();
+                for dup in &cluster.duplicates {
+                    let module = get_module_name(&dup.symbol);
+                    by_module.entry(module).or_default().push(dup);
+                }
+
+                output.push_str("Duplicates by module:\n");
+                let mut module_entries: Vec<_> = by_module.iter().collect();
+                module_entries.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+
+                for (module, dups) in module_entries.iter().take(5) {
+                    let min_sim = dups.iter().map(|d| d.similarity).fold(f64::INFINITY, f64::min);
+                    let max_sim = dups.iter().map(|d| d.similarity).fold(0.0_f64, f64::max);
+                    output.push_str(&format!(
+                        "  {}: {} functions ({:.0}-{:.0}%)\n",
+                        module,
+                        dups.len(),
+                        min_sim * 100.0,
+                        max_sim * 100.0
+                    ));
+                }
+
+                let shown_modules = module_entries.len().min(5);
+                if module_entries.len() > shown_modules {
+                    let remaining: usize = module_entries.iter().skip(shown_modules).map(|(_, d)| d.len()).sum();
+                    output.push_str(&format!(
+                        "  +{} more modules ({} duplicates)\n",
+                        module_entries.len() - shown_modules,
+                        remaining
+                    ));
+                }
+                output.push('\n');
+            }
+
+            if total_clusters > paginated.len() {
+                output.push_str(&format!("\n... showing {} of {} clusters\n", paginated.len(), total_clusters));
+            }
+        }
+    }
+
+    Ok(output)
+}
+
+/// Check duplicates for a specific symbol by hash
+fn run_check_duplicates(hash: &str, threshold: f64, cache: &CacheDir, ctx: &CommandContext) -> Result<String> {
+    // Load all signatures
+    let signatures = load_signatures(cache)?;
+
+    // Find the signature with matching hash
+    let target_sig = signatures
+        .iter()
+        .find(|s| s.symbol_hash == hash || s.symbol_hash.starts_with(hash))
+        .ok_or_else(|| McpDiffError::FileNotFound {
+            path: format!("Symbol not found: {}", hash),
+        })?;
+
+    // Find duplicates for this specific symbol using DuplicateDetector
+    let detector = DuplicateDetector::new(threshold);
+    let mut duplicates = detector.find_duplicates(target_sig, &signatures);
+
+    // Sort by similarity descending
+    duplicates.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut output = String::new();
+
+    let json_value = serde_json::json!({
+        "_type": "check_duplicates",
+        "symbol": target_sig.name,
+        "hash": target_sig.symbol_hash,
+        "file": target_sig.file,
+        "threshold": threshold,
+        "duplicates": duplicates.iter().map(|dup| serde_json::json!({
+            "name": dup.symbol.name,
+            "hash": dup.symbol.hash,
+            "file": dup.symbol.file,
+            "similarity": dup.similarity,
+            "kind": format!("{:?}", dup.kind)
+        })).collect::<Vec<_>>(),
+        "count": duplicates.len()
+    });
+
+    match ctx.format {
+        OutputFormat::Json => {
+            output = serde_json::to_string_pretty(&json_value).unwrap_or_default();
+        }
+        OutputFormat::Toon => {
+            output = super::encode_toon(&json_value);
+        }
+        OutputFormat::Text => {
+            output.push_str(&format!("symbol: {}\n", target_sig.name));
+            output.push_str(&format!("hash: {}\n", target_sig.symbol_hash));
+            output.push_str(&format!("file: {}\n", target_sig.file));
+            output.push_str(&format!("threshold: {:.0}%\n\n", threshold * 100.0));
+            output.push_str(&format!("duplicates[{}]:\n", duplicates.len()));
+
+            if duplicates.is_empty() {
+                output.push_str("  (no duplicates found)\n");
+            } else {
+                for dup in &duplicates {
+                    output.push_str(&format!(
+                        "  - {} ({:.0}%)\n    {}\n",
+                        dup.symbol.name, dup.similarity * 100.0, dup.symbol.file
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(output)
+}

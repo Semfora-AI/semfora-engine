@@ -14,6 +14,7 @@ use serde_json::{json, Map, Value};
 
 use crate::analysis::{calculate_cognitive_complexity, max_nesting_depth};
 use crate::schema::{ModuleGroup, RepoOverview, RepoStats, RiskLevel, SemanticSummary, SymbolKind};
+use crate::shard::extract_module_name;
 use crate::utils::truncate_to_char_boundary;
 
 
@@ -192,6 +193,18 @@ pub fn filter_meaningful_calls(calls: &[crate::schema::Call]) -> Vec<crate::sche
 
 /// Generate a repository overview from analyzed summaries
 pub fn generate_repo_overview(summaries: &[SemanticSummary], dir_path: &str) -> RepoOverview {
+    generate_repo_overview_with_modules(summaries, dir_path, None)
+}
+
+/// Generate a repository overview with an optional file-to-module mapping.
+///
+/// When `file_to_module` is provided, it's used instead of `extract_module_name`
+/// for consistent naming with module shards (conflict-aware stripping).
+pub fn generate_repo_overview_with_modules(
+    summaries: &[SemanticSummary],
+    dir_path: &str,
+    file_to_module: Option<&HashMap<String, String>>,
+) -> RepoOverview {
     let mut overview = RepoOverview::default();
 
     // Detect framework
@@ -203,8 +216,8 @@ pub fn generate_repo_overview(summaries: &[SemanticSummary], dir_path: &str) -> 
     // Detect package manager
     overview.package_manager = detect_package_manager(summaries);
 
-    // Build module groups
-    overview.modules = build_module_groups(summaries, dir_path);
+    // Build module groups (using provided mapping if available)
+    overview.modules = build_module_groups_with_map(summaries, dir_path, file_to_module);
 
     // Identify entry points
     overview.entry_points = identify_entry_points(summaries);
@@ -348,121 +361,6 @@ fn detect_package_manager(summaries: &[SemanticSummary]) -> Option<String> {
     None
 }
 
-/// Categorize a file by its role based on path and language
-fn categorize_file(relative_path: &str, language: &str) -> String {
-    let path_lower = relative_path.to_lowercase();
-
-    // Test files and fixtures (any language)
-    if path_lower.contains("test")
-        || path_lower.contains("spec")
-        || path_lower.contains("fixture")
-        || path_lower.contains("__test__")
-        || path_lower.contains("__tests__")
-    {
-        return "tests".to_string();
-    }
-
-    // Documentation
-    if path_lower.starts_with("docs/") || path_lower.starts_with("doc/") {
-        return "docs".to_string();
-    }
-
-    // Config files at root level
-    if !relative_path.contains('/')
-        || path_lower.starts_with('.')
-        || path_lower.ends_with(".toml")
-        || path_lower.ends_with(".json")
-        || path_lower.ends_with(".yaml")
-        || path_lower.ends_with(".yml")
-    {
-        // But not if it's source code
-        if !matches!(
-            language,
-            "rust" | "go" | "python" | "typescript" | "javascript" | "tsx" | "jsx"
-        ) {
-            return "config".to_string();
-        }
-    }
-
-    // API routes (any language)
-    if path_lower.contains("/api/") || path_lower.contains("/routes/") {
-        return "api".to_string();
-    }
-
-    // Database (any language)
-    if path_lower.contains("/db/")
-        || path_lower.contains("/database/")
-        || path_lower.contains("/migrations/")
-        || path_lower.contains("/schema")
-    {
-        return "database".to_string();
-    }
-
-    // Server/service implementations
-    if path_lower.contains("server") || path_lower.contains("service") {
-        return "server".to_string();
-    }
-
-    // Language-specific entry points
-    if relative_path.ends_with("main.rs")
-        || relative_path.ends_with("main.go")
-        || relative_path.ends_with("main.py")
-        || relative_path.ends_with("index.ts")
-        || relative_path.ends_with("index.js")
-    {
-        return "entry".to_string();
-    }
-
-    // Library roots
-    if relative_path.ends_with("lib.rs") || relative_path.ends_with("mod.rs") {
-        return "library".to_string();
-    }
-
-    // UI components (JS/TS)
-    if path_lower.contains("/components/") {
-        return "components".to_string();
-    }
-
-    // Pages (Next.js, etc.)
-    if path_lower.contains("/pages/") || path_lower.contains("/app/") {
-        return "pages".to_string();
-    }
-
-    // Utilities/helpers
-    if path_lower.contains("/utils/")
-        || path_lower.contains("/helpers/")
-        || path_lower.contains("/lib/")
-    {
-        return "lib".to_string();
-    }
-
-    // For src/ files, try to extract module name from path
-    if relative_path.starts_with("src/") {
-        let parts: Vec<&str> = relative_path.split('/').collect();
-        if parts.len() >= 2 {
-            // Get the first directory or file under src/
-            let module_part = parts[1];
-            // Remove extension for files like src/foo.rs -> "foo"
-            let module_name = module_part
-                .trim_end_matches(".rs")
-                .trim_end_matches(".go")
-                .trim_end_matches(".py")
-                .trim_end_matches(".ts")
-                .trim_end_matches(".tsx")
-                .trim_end_matches(".js")
-                .trim_end_matches(".jsx");
-
-            // If it's a directory (parts > 2), use the dir name
-            // If it's a file (parts == 2), use the filename without extension
-            if !module_name.is_empty() && module_name != "mod" && module_name != "index" {
-                return module_name.to_string();
-            }
-        }
-    }
-
-    "other".to_string()
-}
-
 /// Get a human-readable purpose for a module group
 fn get_module_purpose(name: &str) -> String {
     match name {
@@ -484,18 +382,30 @@ fn get_module_purpose(name: &str) -> String {
 }
 
 fn build_module_groups(summaries: &[SemanticSummary], dir_path: &str) -> Vec<ModuleGroup> {
+    build_module_groups_with_map(summaries, dir_path, None)
+}
+
+/// Build module groups with an optional file-to-module mapping.
+///
+/// When `file_to_module` is provided, uses it for module names instead of `extract_module_name`.
+/// This ensures consistency with conflict-aware module name stripping.
+fn build_module_groups_with_map(
+    summaries: &[SemanticSummary],
+    _dir_path: &str,
+    file_to_module: Option<&HashMap<String, String>>,
+) -> Vec<ModuleGroup> {
     let mut groups: HashMap<String, Vec<&SemanticSummary>> = HashMap::new();
 
     for s in summaries {
-        // Get relative path
-        let relative = s
-            .file
-            .strip_prefix(dir_path)
-            .unwrap_or(&s.file)
-            .trim_start_matches('/');
-
-        // Categorize by role (language-agnostic where possible)
-        let module = categorize_file(relative, &s.language);
+        // Use provided mapping if available, otherwise fall back to extract_module_name
+        let module = if let Some(mapping) = file_to_module {
+            mapping
+                .get(&s.file)
+                .cloned()
+                .unwrap_or_else(|| extract_module_name(&s.file))
+        } else {
+            extract_module_name(&s.file)
+        };
         groups.entry(module).or_default().push(s);
     }
 
@@ -1353,5 +1263,391 @@ mod tests {
 
         assert!(toon.contains("raw_source"));
         assert!(toon.contains("function foo() {}"));
+    }
+
+    // ========================================================================
+    // is_meaningful_call() tests
+    // ========================================================================
+
+    #[test]
+    fn test_meaningful_call_filters_usestate() {
+        // React hooks like useState should be kept (starts with use + capital letter)
+        assert!(is_meaningful_call("useState", None));
+        assert!(is_meaningful_call("useEffect", None));
+        assert!(is_meaningful_call("useCallback", None));
+        assert!(is_meaningful_call("useMemo", None));
+    }
+
+    #[test]
+    fn test_meaningful_call_keeps_custom_hooks() {
+        // Custom hooks should be kept
+        assert!(is_meaningful_call("useUser", None));
+        assert!(is_meaningful_call("useAuth", None));
+        assert!(is_meaningful_call("useFetchData", None));
+    }
+
+    #[test]
+    fn test_meaningful_call_keeps_react_query_hooks() {
+        // React Query / TanStack Query hooks
+        assert!(is_meaningful_call("useQuery", None));
+        assert!(is_meaningful_call("useMutation", None));
+        assert!(is_meaningful_call("useQueryClient", None));
+        assert!(is_meaningful_call("useInfiniteQuery", None));
+    }
+
+    #[test]
+    fn test_meaningful_call_keeps_swr_hooks() {
+        // SWR hooks
+        assert!(is_meaningful_call("useSWR", None));
+        assert!(is_meaningful_call("useSWRMutation", None));
+        assert!(is_meaningful_call("useSWRInfinite", None));
+    }
+
+    #[test]
+    fn test_meaningful_call_keeps_apollo_hooks() {
+        // Apollo GraphQL hooks
+        assert!(is_meaningful_call("useApolloClient", None));
+    }
+
+    #[test]
+    fn test_meaningful_call_keeps_api_clients() {
+        // Direct API client calls
+        assert!(is_meaningful_call("fetch", None));
+        assert!(is_meaningful_call("axios", None));
+        assert!(is_meaningful_call("ky", None));
+    }
+
+    #[test]
+    fn test_meaningful_call_keeps_http_methods_on_api_clients() {
+        // HTTP methods on API clients (axios.get, ky.post, etc.)
+        assert!(is_meaningful_call("get", Some("axios")));
+        assert!(is_meaningful_call("post", Some("axios")));
+        assert!(is_meaningful_call("put", Some("ky")));
+        assert!(is_meaningful_call("delete", Some("fetch")));
+    }
+
+    #[test]
+    fn test_meaningful_call_keeps_database_operations() {
+        // Database and I/O operations
+        assert!(is_meaningful_call("insert", None));
+        assert!(is_meaningful_call("select", None));
+        assert!(is_meaningful_call("update", None));
+        assert!(is_meaningful_call("delete", None));
+        assert!(is_meaningful_call("query", None));
+        assert!(is_meaningful_call("execute", None));
+    }
+
+    #[test]
+    fn test_meaningful_call_filters_promise_methods() {
+        // Promise chain methods should be filtered (noise)
+        assert!(!is_meaningful_call("then", None));
+        assert!(!is_meaningful_call("catch", None));
+        assert!(!is_meaningful_call("finally", None));
+    }
+
+    #[test]
+    fn test_meaningful_call_filters_math_methods() {
+        // Math methods on Math object should be filtered
+        assert!(!is_meaningful_call("floor", Some("Math")));
+        assert!(!is_meaningful_call("ceil", Some("Math")));
+        assert!(!is_meaningful_call("round", Some("Math")));
+        assert!(!is_meaningful_call("abs", Some("Math")));
+    }
+
+    #[test]
+    fn test_meaningful_call_filters_object_methods() {
+        // Object methods should be filtered
+        assert!(!is_meaningful_call("keys", Some("Object")));
+        assert!(!is_meaningful_call("values", Some("Object")));
+        assert!(!is_meaningful_call("entries", Some("Object")));
+    }
+
+    #[test]
+    fn test_meaningful_call_filters_array_methods() {
+        // Array methods should be filtered
+        assert!(!is_meaningful_call("map", Some("items")));
+        assert!(!is_meaningful_call("filter", Some("data")));
+        assert!(!is_meaningful_call("reduce", Some("arr")));
+        assert!(!is_meaningful_call("forEach", Some("list")));
+    }
+
+    #[test]
+    fn test_meaningful_call_keeps_state_setters() {
+        // State setters (setX) should be kept
+        assert!(is_meaningful_call("setOpen", None));
+        assert!(is_meaningful_call("setLoading", None));
+        assert!(is_meaningful_call("setData", None));
+    }
+
+    #[test]
+    fn test_meaningful_call_keeps_special_objects() {
+        // Calls on special objects like db, Response, process should be kept
+        assert!(is_meaningful_call("query", Some("db")));
+        assert!(is_meaningful_call("json", Some("Response")));
+        assert!(is_meaningful_call("exit", Some("process")));
+    }
+
+    // ========================================================================
+    // detect_framework() tests
+    // ========================================================================
+
+    #[test]
+    fn test_detect_framework_rust_binary() {
+        let summaries = vec![
+            SemanticSummary {
+                file: "Cargo.toml".to_string(),
+                language: "toml".to_string(),
+                ..Default::default()
+            },
+            SemanticSummary {
+                file: "src/main.rs".to_string(),
+                language: "rust".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let framework = detect_framework(&summaries);
+        assert!(framework.is_some());
+        let fw = framework.unwrap();
+        assert!(fw.contains("Rust"), "Should detect Rust: {}", fw);
+        assert!(fw.contains("binary"), "Should detect binary type: {}", fw);
+    }
+
+    #[test]
+    fn test_detect_framework_rust_library() {
+        let summaries = vec![
+            SemanticSummary {
+                file: "Cargo.toml".to_string(),
+                language: "toml".to_string(),
+                ..Default::default()
+            },
+            SemanticSummary {
+                file: "src/lib.rs".to_string(),
+                language: "rust".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let framework = detect_framework(&summaries);
+        assert!(framework.is_some());
+        let fw = framework.unwrap();
+        assert!(fw.contains("Rust"), "Should detect Rust: {}", fw);
+        assert!(fw.contains("library"), "Should detect library type: {}", fw);
+    }
+
+    #[test]
+    fn test_detect_framework_rust_bin_and_lib() {
+        let summaries = vec![
+            SemanticSummary {
+                file: "Cargo.toml".to_string(),
+                language: "toml".to_string(),
+                ..Default::default()
+            },
+            SemanticSummary {
+                file: "src/main.rs".to_string(),
+                language: "rust".to_string(),
+                ..Default::default()
+            },
+            SemanticSummary {
+                file: "src/lib.rs".to_string(),
+                language: "rust".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let framework = detect_framework(&summaries);
+        assert!(framework.is_some());
+        let fw = framework.unwrap();
+        assert!(fw.contains("bin+lib"), "Should detect bin+lib: {}", fw);
+    }
+
+    #[test]
+    fn test_detect_framework_nextjs_app_router() {
+        let summaries = vec![
+            SemanticSummary {
+                file: "next.config.js".to_string(),
+                language: "javascript".to_string(),
+                ..Default::default()
+            },
+            SemanticSummary {
+                file: "app/layout.tsx".to_string(),
+                language: "tsx".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let framework = detect_framework(&summaries);
+        assert!(framework.is_some());
+        let fw = framework.unwrap();
+        assert!(fw.contains("Next.js"), "Should detect Next.js: {}", fw);
+        assert!(fw.contains("App Router"), "Should detect App Router: {}", fw);
+    }
+
+    #[test]
+    fn test_detect_framework_nextjs_pages_router() {
+        // Note: detection requires /pages/ in path (with leading slash from project root)
+        let summaries = vec![
+            SemanticSummary {
+                file: "src/pages/index.tsx".to_string(),
+                language: "tsx".to_string(),
+                ..Default::default()
+            },
+            SemanticSummary {
+                file: "src/pages/about.tsx".to_string(),
+                language: "tsx".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let framework = detect_framework(&summaries);
+        assert!(framework.is_some());
+        let fw = framework.unwrap();
+        assert!(fw.contains("Next.js"), "Should detect Next.js: {}", fw);
+        assert!(fw.contains("Pages Router"), "Should detect Pages Router: {}", fw);
+    }
+
+    #[test]
+    fn test_detect_framework_react_components() {
+        let summaries = vec![
+            SemanticSummary {
+                file: "src/App.tsx".to_string(),
+                language: "tsx".to_string(),
+                symbol_kind: Some(SymbolKind::Component),
+                ..Default::default()
+            },
+            SemanticSummary {
+                file: "src/Header.tsx".to_string(),
+                language: "tsx".to_string(),
+                symbol_kind: Some(SymbolKind::Component),
+                ..Default::default()
+            },
+            SemanticSummary {
+                file: "src/Footer.tsx".to_string(),
+                language: "tsx".to_string(),
+                symbol_kind: Some(SymbolKind::Component),
+                ..Default::default()
+            },
+        ];
+
+        let framework = detect_framework(&summaries);
+        assert!(framework.is_some());
+        let fw = framework.unwrap();
+        assert!(fw.contains("React"), "Should detect React: {}", fw);
+    }
+
+    #[test]
+    fn test_detect_framework_express() {
+        let summaries = vec![
+            SemanticSummary {
+                file: "src/server.ts".to_string(),
+                language: "typescript".to_string(),
+                added_dependencies: vec!["express".to_string()],
+                ..Default::default()
+            },
+        ];
+
+        let framework = detect_framework(&summaries);
+        assert!(framework.is_some());
+        let fw = framework.unwrap();
+        assert!(fw.contains("Express"), "Should detect Express: {}", fw);
+    }
+
+    #[test]
+    fn test_detect_framework_go() {
+        let summaries = vec![
+            SemanticSummary {
+                file: "go.mod".to_string(),
+                language: "go".to_string(),
+                ..Default::default()
+            },
+            SemanticSummary {
+                file: "main.go".to_string(),
+                language: "go".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let framework = detect_framework(&summaries);
+        assert!(framework.is_some());
+        let fw = framework.unwrap();
+        assert!(fw.contains("Go"), "Should detect Go: {}", fw);
+    }
+
+    #[test]
+    fn test_detect_framework_python() {
+        let summaries = vec![
+            SemanticSummary {
+                file: "pyproject.toml".to_string(),
+                language: "toml".to_string(),
+                ..Default::default()
+            },
+            SemanticSummary {
+                file: "src/main.py".to_string(),
+                language: "python".to_string(),
+                ..Default::default()
+            },
+            SemanticSummary {
+                file: "src/utils.py".to_string(),
+                language: "python".to_string(),
+                ..Default::default()
+            },
+            SemanticSummary {
+                file: "src/app.py".to_string(),
+                language: "python".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let framework = detect_framework(&summaries);
+        assert!(framework.is_some());
+        let fw = framework.unwrap();
+        assert!(fw.contains("Python"), "Should detect Python: {}", fw);
+    }
+
+    #[test]
+    fn test_detect_framework_empty() {
+        let summaries: Vec<SemanticSummary> = vec![];
+        let framework = detect_framework(&summaries);
+        assert!(framework.is_none(), "Empty summaries should return None");
+    }
+
+    #[test]
+    fn test_detect_framework_multiple() {
+        // Project with both Rust and Python files
+        let summaries = vec![
+            SemanticSummary {
+                file: "Cargo.toml".to_string(),
+                language: "toml".to_string(),
+                ..Default::default()
+            },
+            SemanticSummary {
+                file: "src/main.rs".to_string(),
+                language: "rust".to_string(),
+                ..Default::default()
+            },
+            SemanticSummary {
+                file: "scripts/build.py".to_string(),
+                language: "python".to_string(),
+                ..Default::default()
+            },
+            SemanticSummary {
+                file: "scripts/test.py".to_string(),
+                language: "python".to_string(),
+                ..Default::default()
+            },
+            SemanticSummary {
+                file: "scripts/deploy.py".to_string(),
+                language: "python".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let framework = detect_framework(&summaries);
+        assert!(framework.is_some());
+        let fw = framework.unwrap();
+        // Should detect both
+        assert!(fw.contains("Rust"), "Should detect Rust in multi-lang: {}", fw);
+        assert!(fw.contains("Python"), "Should detect Python in multi-lang: {}", fw);
+        assert!(fw.contains("+"), "Should combine frameworks: {}", fw);
     }
 }

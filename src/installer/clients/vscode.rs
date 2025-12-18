@@ -5,6 +5,7 @@
 
 use super::{ClientStatus, McpClient, McpServerConfig};
 use crate::error::McpDiffError;
+use crate::fs_utils;
 use crate::installer::platform::{McpClientPaths, Platform};
 use serde_json::Value as JsonValue;
 use std::fs;
@@ -51,7 +52,7 @@ impl VSCodeClient {
             message: e.to_string(),
         })?;
 
-        fs::rename(&temp_path, path).map_err(|e| McpDiffError::IoError {
+        fs_utils::atomic_rename(&temp_path, path).map_err(|e| McpDiffError::IoError {
             path: path.to_path_buf(),
             message: e.to_string(),
         })?;

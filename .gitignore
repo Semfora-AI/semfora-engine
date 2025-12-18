@@ -10,6 +10,9 @@
 *.txt
 !README.txt
 
+# SQLite exports
+*.sqlite
+
 # Demo/test output (except repo-compare-website)
 *.html
 !repo-compare-website/**/*.html
@@ -24,3 +27,6 @@
 # Old PM config
 .pm/
 .mcp.json
+
+# Test scripts
+test_cli_formats.sh

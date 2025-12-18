@@ -12,8 +12,37 @@ permissions:
   contents: write
 
 jobs:
+  # Run all tests before building release artifacts
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-test-
+
+      - name: Run all tests
+        run: cargo test --release --all-targets
+        env:
+          RUST_BACKTRACE: 1
+
   build:
     name: Build (${{ matrix.artifact }})
+    needs: test
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
