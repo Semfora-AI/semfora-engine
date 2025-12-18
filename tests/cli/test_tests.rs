@@ -295,10 +295,8 @@ fn test_detect_text_format() {
     let repo = TestRepo::new();
     repo.add_file("package.json", r#"{"name": "test", "scripts": {"test": "jest"}}"#);
 
-    let output = repo.run_cli_success(&["test", "--detect", "-f", "text"]);
-
-    // Should produce text output
-    assert!(!output.is_empty() || output.is_empty(), "Text format should complete");
+    // run_cli_success already verifies the command completes successfully
+    repo.run_cli_success(&["test", "--detect", "-f", "text"]);
 }
 
 #[test]
@@ -315,10 +313,8 @@ fn test_detect_toon_format() {
     let repo = TestRepo::new();
     repo.add_file("package.json", r#"{"name": "test", "scripts": {"test": "jest"}}"#);
 
-    let output = repo.run_cli_success(&["test", "--detect", "-f", "toon"]);
-
-    // Should produce TOON output
-    assert!(!output.is_empty() || output.is_empty(), "TOON format should complete");
+    // run_cli_success already verifies the command completes successfully
+    repo.run_cli_success(&["test", "--detect", "-f", "toon"]);
 }
 
 // ============================================================================

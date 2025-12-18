@@ -251,11 +251,8 @@ fn test_commit_prep_no_auto_refresh() {
     // Pre-generate index
     repo.generate_index().unwrap();
 
-    // Run without auto-refresh
-    let output = repo.run_cli_success(&["commit", "--no-auto-refresh"]);
-
-    // Should complete without refreshing
-    assert!(!output.is_empty() || output.is_empty(), "Should complete");
+    // run_cli_success already verifies the command completes successfully
+    repo.run_cli_success(&["commit", "--no-auto-refresh"]);
 }
 
 #[test]
@@ -269,10 +266,8 @@ fn test_commit_prep_no_diff_stats() {
 
     repo.generate_index().unwrap();
 
-    let output = repo.run_cli_success(&["commit", "--no-diff-stats"]);
-
-    // Should not include diff stats
-    assert!(!output.is_empty() || output.is_empty(), "Should complete");
+    // run_cli_success already verifies the command completes successfully
+    repo.run_cli_success(&["commit", "--no-diff-stats"]);
 }
 
 // ============================================================================
@@ -344,10 +339,8 @@ fn test_commit_prep_binary_file() {
 
     repo.generate_index().unwrap();
 
-    let output = repo.run_cli_success(&["commit"]);
-
-    // Should handle binary files (may skip or report them)
-    assert!(!output.is_empty() || output.is_empty(), "Should complete");
+    // run_cli_success already verifies the command completes successfully
+    repo.run_cli_success(&["commit"]);
 }
 
 #[test]
