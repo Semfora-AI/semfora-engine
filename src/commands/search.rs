@@ -37,15 +37,57 @@ fn run_hybrid_search(args: &SearchArgs, ctx: &CommandContext) -> Result<String> 
     // Try to get semantic matches
     let semantic_results = get_semantic_matches(&cache, args);
 
-    let json_value = serde_json::json!({
-        "_type": "hybrid_search",
-        "query": args.query,
-        "symbol_matches": symbol_results.as_ref().map(|r| &r.results).unwrap_or(&vec![]),
-        "symbol_count": symbol_results.as_ref().map(|r| r.results.len()).unwrap_or(0),
-        "related_code": semantic_results.as_ref().map(|r| &r.results).unwrap_or(&vec![]),
-        "related_count": semantic_results.as_ref().map(|r| r.results.len()).unwrap_or(0),
-        "suggested_queries": semantic_results.as_ref().map(|r| &r.suggestions).unwrap_or(&vec![]),
-    });
+    let symbol_count = symbol_results.as_ref().map(|r| r.results.len()).unwrap_or(0);
+    let related_count = semantic_results.as_ref().map(|r| r.results.len()).unwrap_or(0);
+
+    // Generate contextual hint for AI based on what was found
+    let hint: Option<&str> = match (symbol_count > 0, related_count > 0) {
+        (true, true) => None, // Both found results - no hint needed
+        (true, false) => Some("Exact symbol matches found. No semantic matches - try get_symbol(hash) for details."),
+        (false, true) => Some("No exact symbol name matches, but BM25 found related code. Use hashes from related_code for get_symbol/get_source."),
+        (false, false) => Some("No results. Try: 1) get_overview to find module names, 2) get_file(module) to explore, 3) simpler single-word queries."),
+    };
+
+    // Build JSON with dynamic ordering - put results first, zeros last
+    let empty_symbols: Vec<SymbolEntry> = vec![];
+    let empty_semantic: Vec<SemanticEntry> = vec![];
+    let empty_suggestions: Vec<String> = vec![];
+    let symbol_matches = symbol_results.as_ref().map(|r| &r.results).unwrap_or(&empty_symbols);
+    let related_code = semantic_results.as_ref().map(|r| &r.results).unwrap_or(&empty_semantic);
+    let suggestions = semantic_results.as_ref().map(|r| &r.suggestions).unwrap_or(&empty_suggestions);
+
+    // Dynamic field ordering: show non-empty results first
+    let json_value = if symbol_count > 0 || related_count == 0 {
+        // Symbol results first (has results, or both empty)
+        let mut obj = serde_json::json!({
+            "_type": "hybrid_search",
+            "query": args.query,
+            "symbol_matches": symbol_matches,
+            "symbol_count": symbol_count,
+            "related_code": related_code,
+            "related_count": related_count,
+            "suggested_queries": suggestions,
+        });
+        if let Some(h) = hint {
+            obj["hint"] = serde_json::json!(h);
+        }
+        obj
+    } else {
+        // Related code first (has results while symbols empty)
+        let mut obj = serde_json::json!({
+            "_type": "hybrid_search",
+            "query": args.query,
+            "related_code": related_code,
+            "related_count": related_count,
+            "symbol_matches": symbol_matches,
+            "symbol_count": symbol_count,
+            "suggested_queries": suggestions,
+        });
+        if let Some(h) = hint {
+            obj["hint"] = serde_json::json!(h);
+        }
+        obj
+    };
 
     match ctx.format {
         OutputFormat::Json => {

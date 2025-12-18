@@ -1402,3 +1402,477 @@ pub fn format_batch_validation_results(
 
     output
 }
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // Levenshtein Distance Tests
+    // ========================================================================
+
+    #[test]
+    fn test_levenshtein_identical_strings() {
+        assert_eq!(levenshtein_distance("hello", "hello"), 0);
+        assert_eq!(levenshtein_distance("", ""), 0);
+        assert_eq!(levenshtein_distance("abc", "abc"), 0);
+    }
+
+    #[test]
+    fn test_levenshtein_empty_strings() {
+        assert_eq!(levenshtein_distance("", "hello"), 5);
+        assert_eq!(levenshtein_distance("hello", ""), 5);
+        assert_eq!(levenshtein_distance("abc", ""), 3);
+    }
+
+    #[test]
+    fn test_levenshtein_single_edit() {
+        // Substitution
+        assert_eq!(levenshtein_distance("cat", "bat"), 1);
+        // Insertion
+        assert_eq!(levenshtein_distance("cat", "cats"), 1);
+        // Deletion
+        assert_eq!(levenshtein_distance("cats", "cat"), 1);
+    }
+
+    #[test]
+    fn test_levenshtein_multiple_edits() {
+        assert_eq!(levenshtein_distance("kitten", "sitting"), 3);
+        assert_eq!(levenshtein_distance("saturday", "sunday"), 3);
+        assert_eq!(levenshtein_distance("abc", "xyz"), 3);
+    }
+
+    #[test]
+    fn test_levenshtein_unicode() {
+        assert_eq!(levenshtein_distance("café", "cafe"), 1);
+        assert_eq!(levenshtein_distance("🔥", "🔥"), 0);
+        assert_eq!(levenshtein_distance("hello", "héllo"), 1);
+    }
+
+    // ========================================================================
+    // Test Module Detection Tests
+    // ========================================================================
+
+    #[test]
+    fn test_is_test_module_exact_matches() {
+        assert!(is_test_module("tests"));
+        assert!(is_test_module("__tests__"));
+        assert!(is_test_module("test-repos"));
+        assert!(is_test_module("spec"));
+        assert!(is_test_module("fixtures"));
+    }
+
+    #[test]
+    fn test_is_test_module_subdirectories() {
+        assert!(is_test_module("tests/unit"));
+        assert!(is_test_module("src/__tests__/components"));
+        assert!(is_test_module("packages/app/tests"));
+    }
+
+    #[test]
+    fn test_is_test_module_case_insensitive() {
+        assert!(is_test_module("TESTS"));
+        assert!(is_test_module("Tests"));
+        assert!(is_test_module("__TESTS__"));
+    }
+
+    #[test]
+    fn test_is_test_module_false_cases() {
+        assert!(!is_test_module("src"));
+        assert!(!is_test_module("utils"));
+        assert!(!is_test_module("components"));
+        assert!(!is_test_module("testing")); // Contains "test" but not a match
+        assert!(!is_test_module("contest")); // Contains "test" but not a match
+    }
+
+    #[test]
+    fn test_is_test_module_exact_patterns() {
+        // Exact matches for prefix/suffix patterns
+        assert!(is_test_module("test_"));
+        assert!(is_test_module("_test"));
+    }
+
+    // ========================================================================
+    // Complexity Assessment Tests
+    // ========================================================================
+
+    fn make_entry(cognitive: usize, nesting: usize) -> SymbolIndexEntry {
+        SymbolIndexEntry {
+            symbol: "test_fn".to_string(),
+            hash: "abc123".to_string(),
+            semantic_hash: "".to_string(),
+            kind: "fn".to_string(),
+            module: "test".to_string(),
+            file: "test.rs".to_string(),
+            lines: "1-10".to_string(),
+            risk: "low".to_string(),
+            cognitive_complexity: cognitive,
+            max_nesting: nesting,
+        }
+    }
+
+    #[test]
+    fn test_assess_complexity_low() {
+        let entry = make_entry(5, 2);
+        let concerns = assess_complexity(&entry);
+        assert!(concerns.is_empty());
+    }
+
+    #[test]
+    fn test_assess_complexity_moderate() {
+        let entry = make_entry(12, 3);
+        let concerns = assess_complexity(&entry);
+        assert_eq!(concerns.len(), 1);
+        assert!(concerns[0].contains("Moderate cognitive complexity"));
+    }
+
+    #[test]
+    fn test_assess_complexity_high() {
+        let entry = make_entry(20, 3);
+        let concerns = assess_complexity(&entry);
+        assert_eq!(concerns.len(), 1);
+        assert!(concerns[0].contains("High cognitive complexity"));
+    }
+
+    #[test]
+    fn test_assess_complexity_deep_nesting() {
+        let entry = make_entry(5, 5);
+        let concerns = assess_complexity(&entry);
+        assert_eq!(concerns.len(), 1);
+        assert!(concerns[0].contains("Deep nesting"));
+    }
+
+    #[test]
+    fn test_assess_complexity_multiple_concerns() {
+        let entry = make_entry(20, 6);
+        let concerns = assess_complexity(&entry);
+        assert_eq!(concerns.len(), 2);
+    }
+
+    // ========================================================================
+    // Validation Suggestion Tests
+    // ========================================================================
+
+    #[test]
+    fn test_generate_validation_suggestions_empty() {
+        let suggestions = generate_validation_suggestions(&[], &[], &[]);
+        assert!(suggestions.is_empty());
+    }
+
+    #[test]
+    fn test_generate_validation_suggestions_complexity_only() {
+        let concerns = vec!["High cognitive complexity".to_string()];
+        let suggestions = generate_validation_suggestions(&concerns, &[], &[]);
+        assert_eq!(suggestions.len(), 1);
+        assert!(suggestions[0].contains("complexity"));
+    }
+
+    #[test]
+    fn test_generate_validation_suggestions_with_duplicate() {
+        let duplicates = vec![DuplicateMatch {
+            name: "similar_fn".to_string(),
+            file: "other.rs".to_string(),
+            similarity: 0.95,
+        }];
+        let suggestions = generate_validation_suggestions(&[], &duplicates, &[]);
+        assert_eq!(suggestions.len(), 1);
+        assert!(suggestions[0].contains("similar_fn"));
+        assert!(suggestions[0].contains("95%"));
+    }
+
+    #[test]
+    fn test_generate_validation_suggestions_high_impact() {
+        let callers: Vec<CallerInfo> = (0..15)
+            .map(|i| CallerInfo {
+                name: format!("caller_{}", i),
+                hash: format!("hash_{}", i),
+                risk: "low".to_string(),
+            })
+            .collect();
+        let suggestions = generate_validation_suggestions(&[], &[], &callers);
+        assert_eq!(suggestions.len(), 1);
+        assert!(suggestions[0].contains("High impact radius"));
+    }
+
+    // ========================================================================
+    // Freshness Note Formatting Tests
+    // ========================================================================
+
+    #[test]
+    fn test_format_freshness_note_not_refreshed() {
+        let result = FreshnessResult {
+            cache: CacheDir::for_repo(&std::env::temp_dir()).unwrap(),
+            refreshed: false,
+            refresh_type: RefreshType::None,
+            files_updated: 0,
+            duration_ms: 0,
+        };
+        assert!(format_freshness_note(&result).is_none());
+    }
+
+    #[test]
+    fn test_format_freshness_note_partial() {
+        let result = FreshnessResult {
+            cache: CacheDir::for_repo(&std::env::temp_dir()).unwrap(),
+            refreshed: true,
+            refresh_type: RefreshType::Partial,
+            files_updated: 5,
+            duration_ms: 123,
+        };
+        let note = format_freshness_note(&result).unwrap();
+        assert!(note.contains("5 files"));
+        assert!(note.contains("123ms"));
+        assert!(note.contains("⚡"));
+    }
+
+    #[test]
+    fn test_format_freshness_note_full() {
+        let result = FreshnessResult {
+            cache: CacheDir::for_repo(&std::env::temp_dir()).unwrap(),
+            refreshed: true,
+            refresh_type: RefreshType::Full,
+            files_updated: 100,
+            duration_ms: 500,
+        };
+        let note = format_freshness_note(&result).unwrap();
+        assert!(note.contains("100 files"));
+        assert!(note.contains("500ms"));
+        assert!(note.contains("🔄"));
+    }
+
+    // ========================================================================
+    // Validation Result Formatting Tests
+    // ========================================================================
+
+    #[test]
+    fn test_format_validation_result_basic() {
+        let result = SymbolValidationResult {
+            symbol: "my_function".to_string(),
+            file: "src/lib.rs".to_string(),
+            lines: "10-25".to_string(),
+            kind: "fn".to_string(),
+            hash: "abc123".to_string(),
+            cognitive_complexity: 8,
+            max_nesting: 3,
+            risk: "low".to_string(),
+            complexity_concerns: vec![],
+            duplicates: vec![],
+            callers: vec![],
+            high_risk_callers: vec![],
+            suggestions: vec![],
+        };
+
+        let output = format_validation_result(&result);
+        assert!(output.contains("_type: validation_result"));
+        assert!(output.contains("symbol: my_function"));
+        assert!(output.contains("file: src/lib.rs"));
+        assert!(output.contains("cognitive: 8"));
+        assert!(output.contains("(none - symbol looks good)"));
+    }
+
+    #[test]
+    fn test_format_validation_result_with_duplicates() {
+        let result = SymbolValidationResult {
+            symbol: "duplicate_fn".to_string(),
+            file: "src/a.rs".to_string(),
+            lines: "1-10".to_string(),
+            kind: "fn".to_string(),
+            hash: "def456".to_string(),
+            cognitive_complexity: 5,
+            max_nesting: 2,
+            risk: "low".to_string(),
+            complexity_concerns: vec![],
+            duplicates: vec![
+                DuplicateMatch {
+                    name: "similar_fn".to_string(),
+                    file: "src/b.rs".to_string(),
+                    similarity: 0.92,
+                },
+            ],
+            callers: vec![],
+            high_risk_callers: vec![],
+            suggestions: vec![],
+        };
+
+        let output = format_validation_result(&result);
+        assert!(output.contains("similar_fn"));
+        assert!(output.contains("92%"));
+    }
+
+    #[test]
+    fn test_format_validation_result_with_callers() {
+        let result = SymbolValidationResult {
+            symbol: "called_fn".to_string(),
+            file: "src/lib.rs".to_string(),
+            lines: "5-15".to_string(),
+            kind: "fn".to_string(),
+            hash: "ghi789".to_string(),
+            cognitive_complexity: 3,
+            max_nesting: 1,
+            risk: "low".to_string(),
+            complexity_concerns: vec![],
+            duplicates: vec![],
+            callers: vec![
+                CallerInfo {
+                    name: "caller_one".to_string(),
+                    hash: "hash1".to_string(),
+                    risk: "low".to_string(),
+                },
+                CallerInfo {
+                    name: "caller_two".to_string(),
+                    hash: "hash2".to_string(),
+                    risk: "high".to_string(),
+                },
+            ],
+            high_risk_callers: vec!["caller_two".to_string()],
+            suggestions: vec![],
+        };
+
+        let output = format_validation_result(&result);
+        assert!(output.contains("direct: 2"));
+        assert!(output.contains("caller_one"));
+        assert!(output.contains("caller_two"));
+        assert!(output.contains("high_risk_callers:"));
+    }
+
+    // ========================================================================
+    // Batch Validation Formatting Tests
+    // ========================================================================
+
+    #[test]
+    fn test_format_batch_validation_results_empty() {
+        let results: Vec<SymbolValidationResult> = vec![];
+        let output = format_batch_validation_results(&results, "test_module");
+
+        assert!(output.contains("_type: batch_validation_results"));
+        assert!(output.contains("context: test_module"));
+        assert!(output.contains("total_symbols: 0"));
+    }
+
+    #[test]
+    fn test_format_batch_validation_results_with_issues() {
+        let results = vec![
+            SymbolValidationResult {
+                symbol: "complex_fn".to_string(),
+                file: "src/complex.rs".to_string(),
+                lines: "1-50".to_string(),
+                kind: "fn".to_string(),
+                hash: "hash1".to_string(),
+                cognitive_complexity: 20,
+                max_nesting: 6,
+                risk: "high".to_string(),
+                complexity_concerns: vec![],
+                duplicates: vec![],
+                callers: vec![],
+                high_risk_callers: vec![],
+                suggestions: vec![],
+            },
+            SymbolValidationResult {
+                symbol: "simple_fn".to_string(),
+                file: "src/simple.rs".to_string(),
+                lines: "1-10".to_string(),
+                kind: "fn".to_string(),
+                hash: "hash2".to_string(),
+                cognitive_complexity: 3,
+                max_nesting: 1,
+                risk: "low".to_string(),
+                complexity_concerns: vec![],
+                duplicates: vec![],
+                callers: vec![],
+                high_risk_callers: vec![],
+                suggestions: vec![],
+            },
+        ];
+
+        let output = format_batch_validation_results(&results, "my_module");
+        assert!(output.contains("total_symbols: 2"));
+        assert!(output.contains("high_complexity: 1"));
+        assert!(output.contains("deep_nesting: 1"));
+        assert!(output.contains("complex_fn"));
+    }
+
+    // ========================================================================
+    // Path Skip Logic Tests
+    // ========================================================================
+
+    #[test]
+    fn test_should_skip_path_hidden() {
+        assert!(should_skip_path(Path::new(".git")));
+        assert!(should_skip_path(Path::new(".hidden")));
+    }
+
+    #[test]
+    fn test_should_skip_path_node_modules() {
+        assert!(should_skip_path(Path::new("node_modules")));
+    }
+
+    #[test]
+    fn test_should_skip_path_target() {
+        assert!(should_skip_path(Path::new("target")));
+    }
+
+    #[test]
+    fn test_should_skip_path_common_dirs() {
+        assert!(should_skip_path(Path::new("dist")));
+        assert!(should_skip_path(Path::new("build")));
+        assert!(should_skip_path(Path::new(".next")));
+        assert!(should_skip_path(Path::new("coverage")));
+        assert!(should_skip_path(Path::new("__pycache__")));
+        assert!(should_skip_path(Path::new("vendor")));
+    }
+
+    #[test]
+    fn test_should_skip_path_false_cases() {
+        assert!(!should_skip_path(Path::new("src")));
+        assert!(!should_skip_path(Path::new("lib")));
+        assert!(!should_skip_path(Path::new("main.rs")));
+    }
+
+    // ========================================================================
+    // StalenessInfo Default Value Tests
+    // ========================================================================
+
+    #[test]
+    fn test_staleness_info_struct() {
+        let info = StalenessInfo {
+            is_stale: true,
+            age_seconds: 3600,
+            modified_files: vec!["file1.rs".to_string()],
+            files_checked: 10,
+        };
+        assert!(info.is_stale);
+        assert_eq!(info.age_seconds, 3600);
+        assert_eq!(info.modified_files.len(), 1);
+        assert_eq!(info.files_checked, 10);
+    }
+
+    #[test]
+    fn test_index_generation_result_struct() {
+        let result = IndexGenerationResult {
+            duration_ms: 500,
+            files_analyzed: 100,
+            modules_written: 10,
+            symbols_written: 500,
+            compression_pct: 75.5,
+        };
+        assert_eq!(result.duration_ms, 500);
+        assert_eq!(result.files_analyzed, 100);
+        assert_eq!(result.compression_pct, 75.5);
+    }
+
+    #[test]
+    fn test_partial_reindex_result_struct() {
+        let result = PartialReindexResult {
+            files_reindexed: 5,
+            modules_updated: 2,
+            duration_ms: 100,
+        };
+        assert_eq!(result.files_reindexed, 5);
+        assert_eq!(result.modules_updated, 2);
+        assert_eq!(result.duration_ms, 100);
+    }
+}

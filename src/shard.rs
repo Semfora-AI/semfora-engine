@@ -130,14 +130,44 @@ impl Default for ModuleRegistry {
 ///
 /// Returns the shortened names (same order as input) and the strip depth used.
 ///
-/// Algorithm: Iteratively strip the first component from ALL names until
-/// doing so would create a duplicate.
+/// Algorithm: Iteratively strip the first component from ALL multi-component names
+/// until doing so would create a duplicate. Single-component modules are preserved
+/// as-is since they're already minimal and can't be stripped further.
+///
+/// This handles the case where a codebase has files in the root (creating "root"
+/// modules) alongside deeply nested modules - the single-component modules won't
+/// block stripping for the multi-component ones.
 fn compute_optimal_names(full_paths: &[String]) -> (Vec<String>, usize) {
     if full_paths.is_empty() {
         return (Vec::new(), 0);
     }
 
-    let mut current_names: Vec<String> = full_paths.to_vec();
+    // Separate single-component modules (can't be stripped) from multi-component
+    // Single-component = no dots in the path
+    let mut result = vec![String::new(); full_paths.len()];
+    let mut multi_indices: Vec<usize> = Vec::new();
+    let mut multi_paths: Vec<String> = Vec::new();
+    let mut single_names: HashSet<String> = HashSet::new();
+
+    for (i, path) in full_paths.iter().enumerate() {
+        if path.contains('.') {
+            // Multi-component - will be processed by stripping algorithm
+            multi_indices.push(i);
+            multi_paths.push(path.clone());
+        } else {
+            // Single-component - preserve as-is (already minimal)
+            result[i] = path.clone();
+            single_names.insert(path.clone());
+        }
+    }
+
+    // If no multi-component modules, nothing to strip
+    if multi_paths.is_empty() {
+        return (result, 0);
+    }
+
+    // Run the stripping algorithm on multi-component modules only
+    let mut current_names = multi_paths;
     let mut strip_depth = 0;
 
     loop {
@@ -147,17 +177,24 @@ fn compute_optimal_names(full_paths: &[String]) -> (Vec<String>, usize) {
             .map(|name| strip_first_component(name))
             .collect();
 
-        // If any name can't be stripped (single component), stop
+        // If any name can't be stripped (became single component), stop
         if stripped.iter().any(|s| s.is_none()) {
             break;
         }
 
         let stripped: Vec<String> = stripped.into_iter().flatten().collect();
 
-        // Check for conflicts using HashSet
+        // Check for conflicts among multi-component names
         let unique: HashSet<&String> = stripped.iter().collect();
         if unique.len() < stripped.len() {
-            // Conflict detected - don't strip further
+            // Conflict detected among multi-component names
+            break;
+        }
+
+        // Check for conflicts with single-component names
+        let conflicts_with_single = stripped.iter().any(|s| single_names.contains(s));
+        if conflicts_with_single {
+            // Stripping would conflict with an existing single-component name
             break;
         }
 
@@ -166,7 +203,21 @@ fn compute_optimal_names(full_paths: &[String]) -> (Vec<String>, usize) {
         strip_depth += 1;
     }
 
-    (current_names, strip_depth)
+    // Put the stripped multi-component names back in their original positions
+    for (idx, stripped_name) in multi_indices.iter().zip(current_names.iter()) {
+        result[*idx] = stripped_name.clone();
+    }
+
+    (result, strip_depth)
+}
+
+/// Public wrapper for `compute_optimal_names` - exposed for integration testing.
+///
+/// This function is used by integration tests to verify the module naming algorithm
+/// works correctly without needing to go through the full index generation pipeline.
+#[doc(hidden)]
+pub fn compute_optimal_names_public(full_paths: &[String]) -> (Vec<String>, usize) {
+    compute_optimal_names(full_paths)
 }
 
 /// Strip the first component from a dotted module path.
@@ -696,8 +747,16 @@ impl ShardWriter {
         let path = self.cache.signature_index_path();
         let mut file = fs::File::create(&path)?;
 
+        // Build file-to-module mapping for proper module names from registry
+        let file_to_module = self.build_file_to_module_map();
+
         for summary in &self.all_summaries {
             let namespace = SymbolId::namespace_from_path(&summary.file);
+            // Get the optimal module name from registry, fallback to extraction
+            let module_name = file_to_module
+                .get(&summary.file)
+                .cloned()
+                .unwrap_or_else(|| extract_module_name(&summary.file));
 
             // If we have symbols in the new multi-symbol format, use those
             if !summary.symbols.is_empty() {
@@ -715,6 +774,7 @@ impl ShardWriter {
                         symbol_info,
                         &symbol_id.hash,
                         &summary.file,
+                        &module_name,
                         None, // Use default boilerplate config
                     );
 
@@ -753,6 +813,7 @@ impl ShardWriter {
                         &symbol_info,
                         &symbol_id.hash,
                         &summary.file,
+                        &module_name,
                         None,
                     );
 
@@ -1903,18 +1964,55 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_optimal_names_single_component_stops() {
-        // Mixed depths - single component stops stripping for all
+    fn test_compute_optimal_names_single_component_does_not_block() {
+        // Single-component modules should NOT block stripping for multi-component ones
         let paths = vec![
-            "main".to_string(),        // Single component
+            "root".to_string(),         // Single component - preserved as-is
             "src.game.player".to_string(),
+            "src.game.enemy".to_string(),
         ];
 
         let (result, depth) = compute_optimal_names(&paths);
 
-        // Can't strip because "main" is single component
-        assert_eq!(depth, 0);
-        assert_eq!(result, vec!["main", "src.game.player"]);
+        // Single-component is preserved, multi-component modules are stripped
+        // "player" and "enemy" are unique so they get fully stripped
+        assert_eq!(result[0], "root");  // Unchanged
+        assert_eq!(result[1], "player"); // Stripped from src.game.player
+        assert_eq!(result[2], "enemy");  // Stripped from src.game.enemy
+        assert_eq!(depth, 2);  // Multi-component modules got stripped twice
+    }
+
+    #[test]
+    fn test_compute_optimal_names_mixed_single_multi_with_conflict() {
+        // Single-component + multi-component with conflict at final level
+        let paths = vec![
+            "main".to_string(),             // Single component
+            "src.game.player".to_string(),
+            "src.map.player".to_string(),   // Conflicts with game.player at "player" level
+        ];
+
+        let (result, depth) = compute_optimal_names(&paths);
+
+        // Single-component preserved, multi-component stripped until conflict
+        assert_eq!(result[0], "main");       // Unchanged
+        assert_eq!(result[1], "game.player"); // Stripped to game.player (conflict prevents further)
+        assert_eq!(result[2], "map.player");  // Stripped to map.player (conflict prevents further)
+        assert_eq!(depth, 1);  // Only stripped "src." due to conflict at next level
+    }
+
+    #[test]
+    fn test_compute_optimal_names_all_single_component() {
+        // All single-component - nothing to strip
+        let paths = vec![
+            "root".to_string(),
+            "main".to_string(),
+            "lib".to_string(),
+        ];
+
+        let (result, depth) = compute_optimal_names(&paths);
+
+        assert_eq!(result, paths);  // All unchanged
+        assert_eq!(depth, 0);       // No stripping occurred
     }
 
     #[test]
@@ -2009,5 +2107,324 @@ mod tests {
 
         // Root file with specific name
         assert_eq!(compute_full_module_path("utils.ts"), "utils");
+    }
+
+    // ========================================================================
+    // detect_project_relative_path() tests
+    // ========================================================================
+
+    #[test]
+    fn test_detect_project_relative_path_tests_dir() {
+        // Should find /tests/ and return from there
+        assert_eq!(
+            detect_project_relative_path("/home/user/project/tests/test_main.py"),
+            "tests/test_main.py"
+        );
+        assert_eq!(
+            detect_project_relative_path("/home/kadajett/Dev/semfora/tests/unit/test_api.py"),
+            "tests/unit/test_api.py"
+        );
+    }
+
+    #[test]
+    fn test_detect_project_relative_path_docs_dir() {
+        assert_eq!(
+            detect_project_relative_path("/home/user/project/docs/api.md"),
+            "docs/api.md"
+        );
+        assert_eq!(
+            detect_project_relative_path("/home/user/code/my-app/doc/README.md"),
+            "doc/README.md"
+        );
+    }
+
+    #[test]
+    fn test_detect_project_relative_path_scripts_dir() {
+        assert_eq!(
+            detect_project_relative_path("/home/user/project/scripts/build.sh"),
+            "scripts/build.sh"
+        );
+    }
+
+    #[test]
+    fn test_detect_project_relative_path_examples_dir() {
+        assert_eq!(
+            detect_project_relative_path("/home/user/project/examples/demo.rs"),
+            "examples/demo.rs"
+        );
+    }
+
+    #[test]
+    fn test_detect_project_relative_path_benchmarks_dir() {
+        assert_eq!(
+            detect_project_relative_path("/home/user/project/benchmarks/perf_test.rs"),
+            "benchmarks/perf_test.rs"
+        );
+        assert_eq!(
+            detect_project_relative_path("/home/user/project/benches/criterion.rs"),
+            "benches/criterion.rs"
+        );
+    }
+
+    #[test]
+    fn test_detect_project_relative_path_jest_dirs() {
+        assert_eq!(
+            detect_project_relative_path("/home/user/project/__tests__/unit.test.ts"),
+            "__tests__/unit.test.ts"
+        );
+        assert_eq!(
+            detect_project_relative_path("/home/user/project/__mocks__/api.ts"),
+            "__mocks__/api.ts"
+        );
+    }
+
+    #[test]
+    fn test_detect_project_relative_path_python_package() {
+        // Python packages with underscores
+        assert_eq!(
+            detect_project_relative_path("/home/user/project/my_package/utils/helpers.py"),
+            "my_package/utils/helpers.py"
+        );
+        assert_eq!(
+            detect_project_relative_path("/home/user/Dev/semfora_pm/db/connection.py"),
+            "semfora_pm/db/connection.py"
+        );
+    }
+
+    #[test]
+    fn test_detect_project_relative_path_hyphenated_project() {
+        // Project directories with hyphens
+        assert_eq!(
+            detect_project_relative_path("/home/user/Dev/my-cool-project/config/settings.toml"),
+            "config/settings.toml"
+        );
+    }
+
+    #[test]
+    fn test_detect_project_relative_path_fallback() {
+        // Short paths should return as-is
+        let short = "main.rs";
+        assert_eq!(detect_project_relative_path(short), short);
+    }
+
+    // ========================================================================
+    // extract_call_from_initializer() tests
+    // ========================================================================
+
+    #[test]
+    fn test_extract_call_simple_function() {
+        // Simple function call
+        assert_eq!(
+            extract_call_from_initializer("useState()"),
+            Some("useState".to_string())
+        );
+        assert_eq!(
+            extract_call_from_initializer("getData()"),
+            Some("getData".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_call_with_arguments() {
+        // Function call with arguments
+        assert_eq!(
+            extract_call_from_initializer("useState(false)"),
+            Some("useState".to_string())
+        );
+        assert_eq!(
+            extract_call_from_initializer("fetchUser(userId)"),
+            Some("fetchUser".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_call_method_call() {
+        // Method calls extract the last part - but common names like "get", "query" may be filtered as noise
+        // The function uses rsplit('.') to get the last part, then filters noise
+
+        // "get" is in the noise list, so axios.get returns None
+        assert_eq!(
+            extract_call_from_initializer("axios.get('/users')"),
+            None
+        );
+
+        // More specific method names that aren't noise should work
+        assert_eq!(
+            extract_call_from_initializer("client.fetchUser()"),
+            Some("fetchUser".to_string())
+        );
+        assert_eq!(
+            extract_call_from_initializer("api.createOrder()"),
+            Some("createOrder".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_call_skip_literals() {
+        // String literals
+        assert_eq!(extract_call_from_initializer("\"hello\""), None);
+        assert_eq!(extract_call_from_initializer("'world'"), None);
+
+        // Numeric literals
+        assert_eq!(extract_call_from_initializer("42"), None);
+        assert_eq!(extract_call_from_initializer("3.14"), None);
+
+        // Boolean literals
+        assert_eq!(extract_call_from_initializer("true"), None);
+        assert_eq!(extract_call_from_initializer("false"), None);
+
+        // Null/undefined
+        assert_eq!(extract_call_from_initializer("null"), None);
+        assert_eq!(extract_call_from_initializer("undefined"), None);
+    }
+
+    #[test]
+    fn test_extract_call_empty() {
+        assert_eq!(extract_call_from_initializer(""), None);
+        assert_eq!(extract_call_from_initializer("  "), None);
+    }
+
+    #[test]
+    fn test_extract_call_array_object_literals() {
+        // Array literal
+        assert_eq!(extract_call_from_initializer("[]"), None);
+
+        // Object literal
+        assert_eq!(extract_call_from_initializer("{}"), None);
+    }
+
+    #[test]
+    fn test_extract_call_new_expression() {
+        // new expressions are treated as a single call "new X"
+        // The function doesn't specifically parse JS "new" keyword, it just extracts the function call part
+        assert_eq!(
+            extract_call_from_initializer("new Map()"),
+            Some("new Map".to_string())
+        );
+        assert_eq!(
+            extract_call_from_initializer("new Date()"),
+            Some("new Date".to_string())
+        );
+
+        // More complex new expressions
+        assert_eq!(
+            extract_call_from_initializer("new Promise()"),
+            Some("new Promise".to_string())
+        );
+    }
+
+    // ========================================================================
+    // build_call_graph() tests (integration-style)
+    // ========================================================================
+
+    #[test]
+    fn test_build_call_graph_empty() {
+        let summaries: Vec<SemanticSummary> = vec![];
+        let graph = build_call_graph(&summaries, false);
+        assert!(graph.is_empty(), "Empty summaries should produce empty graph");
+    }
+
+    #[test]
+    fn test_build_call_graph_no_calls() {
+        use crate::schema::SymbolInfo;
+
+        // Summaries with symbols but no calls
+        let summaries = vec![
+            SemanticSummary {
+                file: "src/main.ts".to_string(),
+                language: "typescript".to_string(),
+                symbols: vec![
+                    SymbolInfo {
+                        name: "main".to_string(),
+                        kind: crate::schema::SymbolKind::Function,
+                        start_line: 1,
+                        end_line: 10,
+                        calls: vec![], // No calls
+                        ..Default::default()
+                    }
+                ],
+                ..Default::default()
+            },
+        ];
+
+        let graph = build_call_graph(&summaries, false);
+        // No calls means no edges in the graph
+        assert!(graph.is_empty() || graph.values().all(|v| v.is_empty()),
+            "No calls should produce empty or no-edge graph");
+    }
+
+    #[test]
+    fn test_build_call_graph_with_calls() {
+        use crate::schema::{Call, SymbolId, SymbolKind};
+
+        let summaries = vec![
+            SemanticSummary {
+                file: "src/main.ts".to_string(),
+                language: "typescript".to_string(),
+                symbol_id: Some(SymbolId {
+                    hash: "abcd1234:main_hash0001".to_string(),
+                    semantic_hash: "main_hash0001".to_string(),
+                    namespace: "src".to_string(),
+                    symbol: "main".to_string(),
+                    kind: SymbolKind::Function,
+                    arity: 0,
+                }),
+                symbols: vec![],
+                calls: vec![
+                    Call {
+                        name: "helper".to_string(),
+                        object: None,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            SemanticSummary {
+                file: "src/utils.ts".to_string(),
+                language: "typescript".to_string(),
+                symbol_id: Some(SymbolId {
+                    hash: "efgh5678:helper_hash01".to_string(),
+                    semantic_hash: "helper_hash01".to_string(),
+                    namespace: "src".to_string(),
+                    symbol: "helper".to_string(),
+                    kind: SymbolKind::Function,
+                    arity: 0,
+                }),
+                symbols: vec![],
+                calls: vec![],
+                ..Default::default()
+            },
+        ];
+
+        let graph = build_call_graph(&summaries, false);
+        // Should have at least one entry for main calling helper
+        assert!(!graph.is_empty(), "Should produce a call graph with edges");
+    }
+
+    // ========================================================================
+    // ShardStats tests
+    // ========================================================================
+
+    #[test]
+    fn test_shard_stats_total_bytes_all_fields() {
+        let stats = ShardStats {
+            overview_bytes: 1000,
+            module_bytes: 2000,
+            symbol_bytes: 3000,
+            graph_bytes: 4000,
+            index_bytes: 5000,
+            ..Default::default()
+        };
+
+        assert_eq!(stats.total_bytes(), 15000);
+    }
+
+    #[test]
+    fn test_shard_stats_default() {
+        let stats = ShardStats::default();
+        assert_eq!(stats.total_bytes(), 0);
+        assert_eq!(stats.files_written, 0);
+        assert_eq!(stats.symbols_written, 0);
+        assert_eq!(stats.modules_written, 0);
     }
 }

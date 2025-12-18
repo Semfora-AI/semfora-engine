@@ -123,7 +123,9 @@ jobs:
 
       - name: Run tests
         if: matrix.os == 'ubuntu-latest'
-        run: cargo test --release
+        run: cargo test --release --all-targets
+        env:
+          RUST_BACKTRACE: 1
 
       - name: Package binaries (Unix)
         if: matrix.os != 'windows-latest'

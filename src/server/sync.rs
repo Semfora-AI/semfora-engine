@@ -35,6 +35,7 @@ use std::time::Instant;
 
 use crate::drift::UpdateStrategy;
 use crate::duplicate::{DuplicateDetector, DuplicateKind, FunctionSignature};
+use crate::shard::extract_module_name;
 use crate::error::Result;
 use crate::extract::extract;
 use crate::lang::Lang;
@@ -600,9 +601,10 @@ impl LayerSynchronizer {
         let detector = DuplicateDetector::new(0.90);
 
         // Check each new symbol for duplicates
+        let module_name = extract_module_name(file_path);
         for (symbol, hash) in new_symbols {
             // Generate signature for this symbol
-            let sig = FunctionSignature::from_symbol_info(symbol, hash, file_path, None);
+            let sig = FunctionSignature::from_symbol_info(symbol, hash, file_path, &module_name, None);
 
             // Skip if no business logic (utility functions, etc.)
             if !sig.has_business_logic {

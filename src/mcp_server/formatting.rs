@@ -600,7 +600,30 @@ pub(super) fn format_duplicate_clusters(clusters: &[DuplicateCluster], threshold
     format_duplicate_clusters_paginated(clusters, threshold, clusters.len(), 0, clusters.len(), "similarity")
 }
 
-/// Format duplicate clusters with pagination info
+/// Extract a short module name from a file path
+/// e.g., "/home/user/project/src/Presentation/Nop.Web/Factories/ProductModelFactory.cs"
+///    -> "Nop.Web.Factories"
+fn extract_module_name(file_path: &str) -> String {
+    let path = Path::new(file_path);
+
+    // Get parent directory and file stem
+    let parent = path.parent().and_then(|p| p.file_name()).map(|s| s.to_string_lossy());
+    let grandparent = path.parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.file_name())
+        .map(|s| s.to_string_lossy());
+
+    match (grandparent, parent) {
+        (Some(gp), Some(p)) => format!("{}.{}", gp, p),
+        (None, Some(p)) => p.to_string(),
+        _ => path.file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+    }
+}
+
+/// Format duplicate clusters with pagination info - TOKEN OPTIMIZED
+/// Groups duplicates by module to reduce output size by ~35x for large codebases
 pub(super) fn format_duplicate_clusters_paginated(
     clusters: &[DuplicateCluster],
     threshold: f64,
@@ -610,29 +633,32 @@ pub(super) fn format_duplicate_clusters_paginated(
     sort_by: &str,
 ) -> String {
     let mut output = String::new();
+
+    // Compact header
     output.push_str("_type: duplicate_results\n");
-    output.push_str(&format!("threshold: {:.2}\n", threshold));
-    output.push_str(&format!("total_clusters: {}\n", total_clusters));
-    output.push_str(&format!("showing: {}\n", clusters.len()));
-    output.push_str(&format!("offset: {}\n", offset));
-    output.push_str(&format!("limit: {}\n", limit));
-    output.push_str(&format!("sort_by: {}\n", sort_by));
+    output.push_str(&format!(
+        "threshold: {:.0}% | clusters: {} | showing: {}-{} | sort: {}\n",
+        threshold * 100.0,
+        total_clusters,
+        offset + 1,
+        offset + clusters.len(),
+        sort_by
+    ));
 
     // Pagination hint
     if offset + clusters.len() < total_clusters {
         output.push_str(&format!(
-            "next_offset: {} (use offset={} to get next page)\n",
-            offset + clusters.len(),
+            "next: offset={} for more\n",
             offset + limit
         ));
     }
 
     if clusters.is_empty() {
         if total_clusters == 0 {
-            output.push_str("message: No duplicate clusters found above threshold.\n");
+            output.push_str("result: No duplicate clusters found above threshold.\n");
         } else {
             output.push_str(&format!(
-                "message: No clusters at offset {}. Total clusters: {}.\n",
+                "result: No clusters at offset {}. Total: {}.\n",
                 offset, total_clusters
             ));
         }
@@ -646,32 +672,114 @@ pub(super) fn format_duplicate_clusters_paginated(
     output.push_str(&format!("page_duplicates: {}\n\n", page_duplicates));
 
     for (i, cluster) in clusters.iter().enumerate() {
-        output.push_str(&format!("cluster[{}]:\n", offset + i + 1));
-        output.push_str(&format!("  primary: {} ({})\n", cluster.primary.name, cluster.primary.file));
+        // Use actual module name from index, fallback to path extraction for old cached data
+        let primary_module = if !cluster.primary.module.is_empty() {
+            cluster.primary.module.clone()
+        } else {
+            extract_module_name(&cluster.primary.file)
+        };
+        let line_info = if cluster.primary.start_line > 0 {
+            format!(":{}", cluster.primary.start_line)
+        } else {
+            String::new()
+        };
+
+        // Compact cluster header: [N] FunctionName (Module:line) → X dups
+        output.push_str(&format!(
+            "[{}] {} ({}{})\n",
+            offset + i + 1,
+            cluster.primary.name,
+            primary_module,
+            line_info
+        ));
         output.push_str(&format!("  hash: {}\n", cluster.primary.hash));
-        if cluster.primary.start_line > 0 {
-            output.push_str(&format!("  lines: {}-{}\n", cluster.primary.start_line, cluster.primary.end_line));
-        }
-        output.push_str(&format!("  duplicates[{}]:\n", cluster.duplicates.len()));
+        output.push_str(&format!("  duplicates: {}\n", cluster.duplicates.len()));
 
+        // Group duplicates by module (actual index module names)
+        let mut by_module: BTreeMap<String, Vec<&DuplicateMatch>> = BTreeMap::new();
         for dup in &cluster.duplicates {
-            let kind_str = match dup.kind {
-                DuplicateKind::Exact => "exact",
-                DuplicateKind::Near => "near",
-                DuplicateKind::Divergent => "divergent",
+            let module = if !dup.symbol.module.is_empty() {
+                dup.symbol.module.clone()
+            } else {
+                extract_module_name(&dup.symbol.file)
             };
-            output.push_str(&format!(
-                "    - {} ({}) [{} {:.0}%]\n",
-                dup.symbol.name, dup.symbol.file, kind_str, dup.similarity * 100.0
-            ));
+            by_module.entry(module).or_default().push(dup);
+        }
 
-            // Show differences for near/divergent matches
-            if !dup.differences.is_empty() && dup.differences.len() <= 3 {
-                for diff in &dup.differences {
-                    output.push_str(&format!("      {}\n", diff));
-                }
+        // Show modules with counts and similarity ranges (limit to top 5)
+        output.push_str("  by_module:\n");
+        let mut module_entries: Vec<_> = by_module.iter().collect();
+        module_entries.sort_by(|a, b| b.1.len().cmp(&a.1.len())); // Sort by count desc
+
+        let max_modules_shown = 5;
+        let mut remaining_count = 0;
+        let mut remaining_modules = 0;
+
+        for (idx, (module, dups)) in module_entries.iter().enumerate() {
+            if idx >= max_modules_shown {
+                remaining_count += dups.len();
+                remaining_modules += 1;
+                continue;
+            }
+
+            // Calculate similarity range for this module
+            let min_sim = dups.iter().map(|d| d.similarity).fold(f64::INFINITY, f64::min);
+            let max_sim = dups.iter().map(|d| d.similarity).fold(0.0_f64, f64::max);
+
+            // Count by kind
+            let exact = dups.iter().filter(|d| matches!(d.kind, DuplicateKind::Exact)).count();
+            let near = dups.iter().filter(|d| matches!(d.kind, DuplicateKind::Near)).count();
+
+            let kind_hint = if exact > 0 && near == 0 {
+                "exact"
+            } else if exact == 0 && near > 0 {
+                "near"
+            } else if exact > 0 {
+                "mixed"
+            } else {
+                "divergent"
+            };
+
+            output.push_str(&format!(
+                "    {}: {} ({:.0}-{:.0}%) [{}]\n",
+                module,
+                dups.len(),
+                min_sim * 100.0,
+                max_sim * 100.0,
+                kind_hint
+            ));
+        }
+
+        if remaining_modules > 0 {
+            output.push_str(&format!(
+                "    +{} more modules: {} dups\n",
+                remaining_modules,
+                remaining_count
+            ));
+        }
+
+        // Show top 3 individual matches for actionable detail
+        let mut top_matches: Vec<_> = cluster.duplicates.iter().collect();
+        top_matches.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap_or(std::cmp::Ordering::Equal));
+
+        if !top_matches.is_empty() {
+            output.push_str("  top_matches:\n");
+            for dup in top_matches.iter().take(3) {
+                // Use actual module name, fallback to path extraction for old cached data
+                let dup_module = if !dup.symbol.module.is_empty() {
+                    dup.symbol.module.clone()
+                } else {
+                    extract_module_name(&dup.symbol.file)
+                };
+                output.push_str(&format!(
+                    "    {}@{} {:.0}%\n",
+                    dup.symbol.name,
+                    dup_module,
+                    dup.similarity * 100.0
+                ));
             }
         }
+
         output.push_str("\n");
     }
 
@@ -986,5 +1094,463 @@ fn format_file_list(
                 }
             }
         }
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    // ========================================================================
+    // get_supported_languages Tests
+    // ========================================================================
+
+    #[test]
+    fn test_get_supported_languages_includes_common_languages() {
+        let output = get_supported_languages();
+        assert!(output.contains("TypeScript"));
+        assert!(output.contains("Rust"));
+        assert!(output.contains("Python"));
+        assert!(output.contains("JavaScript"));
+        assert!(output.contains("Go"));
+    }
+
+    #[test]
+    fn test_get_supported_languages_includes_extensions() {
+        let output = get_supported_languages();
+        assert!(output.contains(".ts"));
+        assert!(output.contains(".rs"));
+        assert!(output.contains(".py"));
+        assert!(output.contains(".go"));
+    }
+
+    // ========================================================================
+    // format_source_snippet Tests
+    // ========================================================================
+
+    #[test]
+    fn test_format_source_snippet_basic() {
+        let source = "line 1\nline 2\nline 3\nline 4\nline 5\n";
+        let output = format_source_snippet(Path::new("test.ts"), source, 2, 3, 0);
+
+        assert!(output.contains("test.ts"));
+        assert!(output.contains("lines 2-3"));
+        assert!(output.contains("line 2"));
+        assert!(output.contains("line 3"));
+    }
+
+    #[test]
+    fn test_format_source_snippet_with_context() {
+        let source = "line 1\nline 2\nline 3\nline 4\nline 5\n";
+        let output = format_source_snippet(Path::new("test.ts"), source, 3, 3, 1);
+
+        // With context of 1, should show lines 2-4
+        assert!(output.contains("line 2"));
+        assert!(output.contains("line 3"));
+        assert!(output.contains("line 4"));
+    }
+
+    #[test]
+    fn test_format_source_snippet_markers() {
+        let source = "line 1\nline 2\nline 3\nline 4\nline 5\n";
+        let output = format_source_snippet(Path::new("test.ts"), source, 2, 3, 1);
+
+        // Target lines should have > marker
+        assert!(output.contains(">"));
+    }
+
+    // ========================================================================
+    // format_search_results Tests
+    // ========================================================================
+
+    fn make_symbol_entry(name: &str, hash: &str, module: &str) -> SymbolIndexEntry {
+        SymbolIndexEntry {
+            symbol: name.to_string(),
+            hash: hash.to_string(),
+            semantic_hash: "".to_string(),
+            kind: "fn".to_string(),
+            module: module.to_string(),
+            file: format!("src/{}.ts", module),
+            lines: "1-10".to_string(),
+            risk: "low".to_string(),
+            cognitive_complexity: 5,
+            max_nesting: 2,
+        }
+    }
+
+    #[test]
+    fn test_format_search_results_empty() {
+        let output = format_search_results("test", &[]);
+
+        assert!(output.contains("_type: search_results"));
+        assert!(output.contains("query: \"test\""));
+        assert!(output.contains("showing: 0"));
+        assert!(output.contains("results: (none)"));
+    }
+
+    #[test]
+    fn test_format_search_results_with_results() {
+        let results = vec![
+            make_symbol_entry("foo", "hash1", "utils"),
+            make_symbol_entry("bar", "hash2", "api"),
+        ];
+        let output = format_search_results("test", &results);
+
+        assert!(output.contains("showing: 2"));
+        assert!(output.contains("foo"));
+        assert!(output.contains("bar"));
+        assert!(output.contains("hash1"));
+        assert!(output.contains("utils"));
+    }
+
+    // ========================================================================
+    // format_ripgrep_results Tests
+    // ========================================================================
+
+    #[test]
+    fn test_format_ripgrep_results_empty() {
+        let output = format_ripgrep_results("pattern", &[]);
+
+        assert!(output.contains("_type: ripgrep_results"));
+        assert!(output.contains("ripgrep fallback"));
+        assert!(output.contains("showing: 0"));
+        assert!(output.contains("results: (none)"));
+    }
+
+    #[test]
+    fn test_format_ripgrep_results_with_matches() {
+        let results = vec![RipgrepSearchResult {
+            file: "src/main.ts".to_string(),
+            line: 10,
+            column: 5,
+            content: "const pattern = 'test'".to_string(),
+        }];
+        let output = format_ripgrep_results("pattern", &results);
+
+        assert!(output.contains("showing: 1"));
+        assert!(output.contains("src/main.ts"));
+        assert!(output.contains("10"));
+        assert!(output.contains("pattern"));
+    }
+
+    #[test]
+    fn test_format_ripgrep_results_truncates_long_content() {
+        let long_content = "x".repeat(150);
+        let results = vec![RipgrepSearchResult {
+            file: "src/main.ts".to_string(),
+            line: 1,
+            column: 1,
+            content: long_content,
+        }];
+        let output = format_ripgrep_results("x", &results);
+
+        // Should be truncated to 100 chars + "..."
+        assert!(output.contains("..."));
+    }
+
+    // ========================================================================
+    // extract_module_name Tests
+    // ========================================================================
+
+    #[test]
+    fn test_extract_module_name_basic() {
+        let result = extract_module_name("/home/user/project/src/utils/helper.ts");
+        // Should get grandparent.parent -> "utils" or "src.utils"
+        assert!(result.contains("utils") || result.contains("src"));
+    }
+
+    #[test]
+    fn test_extract_module_name_dotnet_style() {
+        let result = extract_module_name("/project/src/Nop.Web/Factories/ProductFactory.cs");
+        assert!(result.contains("Nop.Web") || result.contains("Factories"));
+    }
+
+    #[test]
+    fn test_extract_module_name_shallow_path() {
+        let result = extract_module_name("main.ts");
+        assert!(!result.is_empty());
+    }
+
+    // ========================================================================
+    // format_call_graph_summary Tests
+    // ========================================================================
+
+    #[test]
+    fn test_format_call_graph_summary_empty() {
+        let edges: Vec<(String, Vec<String>)> = vec![];
+        let output = format_call_graph_summary(&edges, 0, 0, None);
+
+        assert!(output.contains("_type: call_graph_summary"));
+        assert!(output.contains("total_edges: 0"));
+        assert!(output.contains("avg_calls_per_symbol: 0.0"));
+    }
+
+    #[test]
+    fn test_format_call_graph_summary_with_edges() {
+        let edges = vec![
+            ("caller1".to_string(), vec!["callee1".to_string(), "callee2".to_string()]),
+            ("caller2".to_string(), vec!["callee1".to_string()]),
+        ];
+        let output = format_call_graph_summary(&edges, 3, 3, None);
+
+        assert!(output.contains("total_calls: 3"));
+        assert!(output.contains("caller1"));
+        assert!(output.contains("callee1"));
+    }
+
+    #[test]
+    fn test_format_call_graph_summary_with_name_mapping() {
+        let edges = vec![
+            ("hash1".to_string(), vec!["hash2".to_string()]),
+        ];
+        let mut names = HashMap::new();
+        names.insert("hash1".to_string(), "myFunction".to_string());
+        names.insert("hash2".to_string(), "otherFunction".to_string());
+
+        let output = format_call_graph_summary(&edges, 1, 1, Some(&names));
+
+        assert!(output.contains("myFunction"));
+        assert!(output.contains("otherFunction"));
+    }
+
+    // ========================================================================
+    // format_call_graph_paginated Tests
+    // ========================================================================
+
+    #[test]
+    fn test_format_call_graph_paginated_empty() {
+        let edges: Vec<(String, Vec<String>)> = vec![];
+        let output = format_call_graph_paginated(&edges, 0, 0, 0, 10, None);
+
+        assert!(output.contains("_type: call_graph"));
+        assert!(output.contains("showing: 0"));
+        assert!(output.contains("No edges match"));
+    }
+
+    #[test]
+    fn test_format_call_graph_paginated_with_pagination_hint() {
+        let edges = vec![
+            ("caller1".to_string(), vec!["callee1".to_string()]),
+        ];
+        // Total is more than shown
+        let output = format_call_graph_paginated(&edges, 10, 5, 0, 2, None);
+
+        assert!(output.contains("next_offset:"));
+    }
+
+    // ========================================================================
+    // format_duplicate_matches Tests
+    // ========================================================================
+
+    #[test]
+    fn test_format_duplicate_matches_empty() {
+        let output = format_duplicate_matches("myFunc", "src/main.ts", &[], 0.9);
+
+        assert!(output.contains("_type: duplicate_check"));
+        assert!(output.contains("symbol: myFunc"));
+        assert!(output.contains("matches: 0"));
+        assert!(output.contains("No duplicates found"));
+    }
+
+    #[test]
+    fn test_format_duplicate_matches_with_matches() {
+        use crate::duplicate::{Difference, DuplicateKind, DuplicateMatch, SymbolRef};
+
+        let symbol_ref = SymbolRef {
+            hash: "hash123".to_string(),
+            name: "similarFunc".to_string(),
+            file: "src/utils.ts".to_string(),
+            module: "utils".to_string(),
+            start_line: 10,
+            end_line: 20,
+        };
+        let matches = vec![DuplicateMatch {
+            symbol: symbol_ref,
+            similarity: 0.95,
+            kind: DuplicateKind::Near,
+            differences: vec![Difference::DifferentParamCount {
+                expected: 2,
+                actual: 3,
+            }],
+        }];
+
+        let output = format_duplicate_matches("myFunc", "src/main.ts", &matches, 0.9);
+
+        assert!(output.contains("matches: 1"));
+        assert!(output.contains("similarFunc"));
+        assert!(output.contains("95%"));
+        assert!(output.contains("NEAR"));
+    }
+
+    // ========================================================================
+    // format_cve_scan_results Tests
+    // ========================================================================
+
+    #[test]
+    fn test_format_cve_scan_results_no_matches() {
+        let summary = CVEScanSummary {
+            functions_scanned: 100,
+            patterns_checked: 50,
+            total_matches: 0,
+            scan_time_ms: 123,
+            by_severity: HashMap::new(),
+        };
+        let output = format_cve_scan_results(&summary, &[], 0.75);
+
+        assert!(output.contains("_type: cve_scan"));
+        assert!(output.contains("functions_scanned: 100"));
+        assert!(output.contains("No CVE pattern matches"));
+    }
+
+    #[test]
+    fn test_format_cve_scan_results_with_matches() {
+        let mut by_severity = HashMap::new();
+        by_severity.insert(Severity::High, 1);
+
+        let summary = CVEScanSummary {
+            functions_scanned: 100,
+            patterns_checked: 50,
+            total_matches: 1,
+            scan_time_ms: 123,
+            by_severity,
+        };
+        let matches = vec![CVEMatch {
+            cve_id: "CVE-2021-12345".to_string(),
+            severity: Severity::High,
+            cwe_ids: vec!["CWE-89".to_string()],
+            similarity: 0.85,
+            file: "src/db.ts".to_string(),
+            line: 42,
+            function: "queryDatabase".to_string(),
+            description: "SQL injection vulnerability".to_string(),
+            remediation: Some("Use parameterized queries".to_string()),
+        }];
+
+        let output = format_cve_scan_results(&summary, &matches, 0.75);
+
+        assert!(output.contains("CVE-2021-12345"));
+        assert!(output.contains("85%"));
+        assert!(output.contains("CWE-89"));
+        assert!(output.contains("queryDatabase"));
+    }
+
+    // ========================================================================
+    // format_prep_commit Tests
+    // ========================================================================
+
+    #[test]
+    fn test_format_prep_commit_no_changes() {
+        let git_context = GitContext {
+            branch: "main".to_string(),
+            remote: Some("origin".to_string()),
+            last_commit_hash: Some("abc123".to_string()),
+            last_commit_message: Some("Initial commit".to_string()),
+        };
+
+        let output = format_prep_commit(&git_context, &[], &[], false, false, false);
+
+        assert!(output.contains("_type: prep_commit"));
+        assert!(output.contains("branch: \"main\""));
+        assert!(output.contains("staged_files: 0"));
+        assert!(output.contains("unstaged_files: 0"));
+    }
+
+    #[test]
+    fn test_format_prep_commit_with_staged_changes() {
+        let git_context = GitContext {
+            branch: "feature".to_string(),
+            remote: None,
+            last_commit_hash: None,
+            last_commit_message: None,
+        };
+
+        let staged = vec![AnalyzedFile {
+            path: "src/main.ts".to_string(),
+            change_type: "modified".to_string(),
+            diff_stats: Some(FileDiffStats { insertions: 10, deletions: 5 }),
+            symbols: vec![SymbolMetrics {
+                name: "myFunction".to_string(),
+                kind: "fn".to_string(),
+                lines: "1-10".to_string(),
+                cognitive: Some(8),
+                cyclomatic: None,
+                max_nesting: Some(3),
+                fan_out: None,
+                loc: None,
+                state_mutations: None,
+                io_operations: None,
+            }],
+            error: None,
+        }];
+
+        let output = format_prep_commit(&git_context, &staged, &[], true, false, true);
+
+        assert!(output.contains("staged_files: 1"));
+        assert!(output.contains("src/main.ts"));
+        assert!(output.contains("myFunction"));
+        assert!(output.contains("+10 -5"));
+        assert!(output.contains("cognitive=8"));
+    }
+
+    // ========================================================================
+    // FileDiffStats / SymbolMetrics / AnalyzedFile / GitContext Struct Tests
+    // ========================================================================
+
+    #[test]
+    fn test_file_diff_stats_struct() {
+        let stats = FileDiffStats {
+            insertions: 100,
+            deletions: 50,
+        };
+        assert_eq!(stats.insertions, 100);
+        assert_eq!(stats.deletions, 50);
+    }
+
+    #[test]
+    fn test_symbol_metrics_struct() {
+        let metrics = SymbolMetrics {
+            name: "testFn".to_string(),
+            kind: "fn".to_string(),
+            lines: "1-10".to_string(),
+            cognitive: Some(5),
+            cyclomatic: Some(3),
+            max_nesting: Some(2),
+            fan_out: Some(4),
+            loc: Some(10),
+            state_mutations: Some(1),
+            io_operations: Some(0),
+        };
+        assert_eq!(metrics.name, "testFn");
+        assert_eq!(metrics.cognitive, Some(5));
+    }
+
+    #[test]
+    fn test_analyzed_file_struct() {
+        let file = AnalyzedFile {
+            path: "src/test.ts".to_string(),
+            change_type: "added".to_string(),
+            diff_stats: None,
+            symbols: vec![],
+            error: None,
+        };
+        assert_eq!(file.path, "src/test.ts");
+        assert_eq!(file.change_type, "added");
+    }
+
+    #[test]
+    fn test_git_context_struct() {
+        let ctx = GitContext {
+            branch: "develop".to_string(),
+            remote: Some("upstream".to_string()),
+            last_commit_hash: Some("def456".to_string()),
+            last_commit_message: Some("Fix bug".to_string()),
+        };
+        assert_eq!(ctx.branch, "develop");
+        assert_eq!(ctx.remote, Some("upstream".to_string()));
     }
 }

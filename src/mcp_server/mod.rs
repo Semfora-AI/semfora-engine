@@ -1599,7 +1599,9 @@ impl McpDiffServer {
     // Duplicate Detection Tools
     // ========================================================================
 
-    #[tool(description = "Unified duplicate detection. **Codebase scan** (default): Find all duplicate clusters for health audits. **Single symbol check**: Pass symbol_hash to check one symbol before writing new code or during refactoring.")]
+    #[tool(description = "Unified duplicate detection. **Codebase scan** (default): Find all duplicate clusters for health audits. **Single symbol check**: Pass symbol_hash to check one symbol before writing new code or during refactoring.
+
+Output is token-optimized: duplicates are grouped by module with counts and similarity ranges (e.g., 'Nop.Web.Factories: 12 (91-98%) [near]') plus top 3 individual matches per cluster. Use limit=10-20 for initial exploration, higher for comprehensive scans. Results are paginated - use offset to get more.")]
     async fn find_duplicates(
         &self,
         Parameters(request): Parameters<FindDuplicatesRequest>,
