@@ -14,6 +14,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
+use crate::fs_utils;
 use crate::git;
 use crate::overlay::{LayerKind, LayeredIndex, Overlay};
 use crate::schema::{fnv1a_hash, SCHEMA_VERSION};
@@ -242,7 +243,9 @@ pub struct CacheDir {
 impl CacheDir {
     /// Create a cache directory for a repository
     pub fn for_repo(repo_path: &Path) -> Result<Self> {
-        let repo_root = repo_path.canonicalize().unwrap_or_else(|_| repo_path.to_path_buf());
+        let repo_root = fs_utils::normalize_path(
+            &repo_path.canonicalize().unwrap_or_else(|_| repo_path.to_path_buf()),
+        );
         let repo_hash = compute_repo_hash(&repo_root);
         let cache_base = get_cache_base_dir();
         let root = cache_base.join(&repo_hash);
@@ -257,7 +260,9 @@ impl CacheDir {
     /// Create a cache directory for a worktree (uses path-based hash, not git remote)
     /// This ensures each worktree gets its own separate cache even if they share the same git repo
     pub fn for_worktree(worktree_path: &Path) -> Result<Self> {
-        let repo_root = worktree_path.canonicalize().unwrap_or_else(|_| worktree_path.to_path_buf());
+        let repo_root = fs_utils::normalize_path(
+            &worktree_path.canonicalize().unwrap_or_else(|_| worktree_path.to_path_buf()),
+        );
         // Use path-based hash for worktrees (not git remote URL)
         let repo_hash = format!("{:016x}", fnv1a_hash(&repo_root.to_string_lossy()));
         let cache_base = get_cache_base_dir();
@@ -857,8 +862,8 @@ impl CacheDir {
             }
         }
 
-        // Atomic rename
-        fs::rename(&temp_path, &index_path)?;
+        // Atomic rename (cross-platform: handles Windows file replacement)
+        fs_utils::atomic_rename(&temp_path, &index_path)?;
 
         tracing::debug!(
             "[CACHE] Updated symbol_index.jsonl for {}: {} total entries",
@@ -1352,11 +1357,11 @@ impl CacheDir {
         fs::write(&meta_temp, &meta_json)?;
 
         // Phase 2: Atomically rename all temp files to final locations
-        // On POSIX systems, rename is atomic within the same filesystem
-        fs::rename(&symbols_temp, &symbols_path)?;
-        fs::rename(&deleted_temp, &deleted_path)?;
-        fs::rename(&moves_temp, &moves_path)?;
-        fs::rename(&meta_temp, &meta_path)?;
+        // Uses fs_utils::atomic_rename for cross-platform support (Windows file replacement)
+        fs_utils::atomic_rename(&symbols_temp, &symbols_path)?;
+        fs_utils::atomic_rename(&deleted_temp, &deleted_path)?;
+        fs_utils::atomic_rename(&moves_temp, &moves_path)?;
+        fs_utils::atomic_rename(&meta_temp, &meta_path)?;
 
         Ok(())
     }
@@ -2338,20 +2343,13 @@ pub struct SearchWithFallbackResult {
     pub fallback_used: bool,
 }
 
-/// Get the base cache directory (XDG-compliant)
+/// Get the base cache directory (platform-aware)
+///
+/// - **Windows**: `%LOCALAPPDATA%\semfora\cache`
+/// - **Unix**: `$XDG_CACHE_HOME/semfora` or `~/.cache/semfora`
+/// - **Fallback**: System temp directory
 pub fn get_cache_base_dir() -> PathBuf {
-    // Check XDG_CACHE_HOME first
-    if let Ok(xdg_cache) = std::env::var("XDG_CACHE_HOME") {
-        return PathBuf::from(xdg_cache).join("semfora");
-    }
-
-    // Fall back to ~/.cache/semfora
-    if let Some(home) = dirs::home_dir() {
-        return home.join(".cache").join("semfora");
-    }
-
-    // Last resort: temp directory
-    std::env::temp_dir().join("semfora")
+    fs_utils::get_cache_base_dir()
 }
 
 /// Compute a stable hash for a repository
@@ -2364,10 +2362,12 @@ pub fn compute_repo_hash(repo_path: &Path) -> String {
         return format!("{:016x}", fnv1a_hash(&remote_url));
     }
 
-    // Fall back to absolute path
-    let canonical = repo_path
-        .canonicalize()
-        .unwrap_or_else(|_| repo_path.to_path_buf());
+    // Fall back to absolute path (normalized for Windows compatibility)
+    let canonical = fs_utils::normalize_path(
+        &repo_path
+            .canonicalize()
+            .unwrap_or_else(|_| repo_path.to_path_buf()),
+    );
     format!("{:016x}", fnv1a_hash(&canonical.to_string_lossy()))
 }
 

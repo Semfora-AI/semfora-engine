@@ -5,6 +5,7 @@
 //! - Windows: %LOCALAPPDATA%\semfora\config.toml
 
 use crate::error::McpDiffError;
+use crate::fs_utils;
 use crate::installer::platform::{Platform, SemforaPaths};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -144,7 +145,7 @@ impl SemforaConfig {
             message: e.to_string(),
         })?;
 
-        fs::rename(&temp_path, path).map_err(|e| McpDiffError::IoError {
+        fs_utils::atomic_rename(&temp_path, path).map_err(|e| McpDiffError::IoError {
             path: path.to_path_buf(),
             message: e.to_string(),
         })?;

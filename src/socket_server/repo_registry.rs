@@ -12,6 +12,7 @@ use parking_lot::RwLock;
 use tokio::sync::broadcast;
 
 use crate::cache::CacheDir;
+use crate::fs_utils;
 use crate::server::watcher::{FileWatcher, WatcherHandle};
 use crate::server::ServerState;
 use crate::socket_server::protocol::{
@@ -149,8 +150,9 @@ impl RepoContext {
         for wt in &worktrees {
             // Skip if this worktree is the same as the base repo (main worktree)
             // git worktree list includes the main repo as the first entry
-            if wt.path.canonicalize().unwrap_or_else(|_| wt.path.clone())
-                == base_repo_path.canonicalize().unwrap_or_else(|_| base_repo_path.clone())
+            // Use normalize_path for Windows compatibility (strips \\?\ prefix)
+            if fs_utils::normalize_path(&wt.path.canonicalize().unwrap_or_else(|_| wt.path.clone()))
+                == fs_utils::normalize_path(&base_repo_path.canonicalize().unwrap_or_else(|_| base_repo_path.clone()))
             {
                 tracing::debug!("Skipping main worktree (same as base repo): {:?}", wt.path);
                 continue;

@@ -17,7 +17,7 @@ use crate::git::{
 };
 use crate::tokens::{format_analysis_compact, format_analysis_report, TokenAnalyzer};
 use crate::{
-    encode_toon, encode_toon_directory, extract, generate_repo_overview, is_test_file,
+    encode_toon, encode_toon_directory, extract, fs_utils, generate_repo_overview, is_test_file,
     CacheDir, Lang, SemanticSummary, ShardWriter,
 };
 
@@ -283,8 +283,10 @@ fn run_shard(ctx: &CommandContext, args: &AnalyzeArgs, dir_path: &Path) -> Resul
         });
     }
 
-    // Get canonical path for consistent cache lookup
-    let canonical_path = dir_path.canonicalize().unwrap_or_else(|_| dir_path.to_path_buf());
+    // Get canonical path for consistent cache lookup (normalized for Windows)
+    let canonical_path = fs_utils::normalize_path(
+        &dir_path.canonicalize().unwrap_or_else(|_| dir_path.to_path_buf()),
+    );
     let cache = CacheDir::for_repo(&canonical_path)?;
 
     if ctx.verbose {

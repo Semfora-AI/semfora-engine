@@ -51,6 +51,7 @@ pub mod drift;
 pub mod duplicate;
 pub mod error;
 pub mod extract;
+pub mod fs_utils;
 pub mod git;
 pub mod installer;
 pub mod lang;
@@ -168,5 +169,8 @@ pub use sqlite_export::{
 pub use security::{
     CVEMatch, CVEPattern, CVEScanSummary, PatternDatabase, PatternSource, Severity,
 };
+
+// Re-export filesystem utilities (Windows compatibility)
+pub use fs_utils::{atomic_rename, normalize_path};
 
 // Test change to trigger semfora-ci workflow
