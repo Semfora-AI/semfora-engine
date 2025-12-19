@@ -3,6 +3,11 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
   pull_request:
     branches: [main]
 
@@ -56,24 +61,75 @@ jobs:
         # SECURITY_PATTERNS_PATH to be set at compile time with a pre-built patterns file
         run: cargo clippy --all-targets -- -D warnings
 
-  # Tests - run on multiple platforms
-  test:
-    name: Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-
+  # Tests - Linux always, macOS/Windows only on PRs
+  test-linux:
+    name: Test (Linux)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # Set up MSVC environment on Windows for tree-sitter native compilation
-      - name: Set up MSVC (Windows)
-        if: matrix.os == 'windows-latest'
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-test-
+
+      - name: Run tests
+        run: cargo test --lib --bins --tests --examples
+        env:
+          RUST_BACKTRACE: 1
+
+  # macOS tests - only on PRs (10x minute multiplier!)
+  test-macos:
+    name: Test (macOS)
+    if: github.event_name == 'pull_request'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-test-
+
+      - name: Run tests
+        run: cargo test --lib --bins --tests --examples
+        env:
+          RUST_BACKTRACE: 1
+
+  # Windows tests - only on PRs (2x minute multiplier)
+  test-windows:
+    name: Test (Windows)
+    if: github.event_name == 'pull_request'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up MSVC
         uses: ilammy/msvc-dev-cmd@v1
 
       - name: Cache cargo
@@ -90,14 +146,10 @@ jobs:
             ${{ runner.os }}-cargo-test-
 
       - name: Run tests
-        # Note: --benches is excluded because criterion benchmarks require at least
-        # 10 samples and fail when run as tests (n < 10 in CI environment)
         run: cargo test --lib --bins --tests --examples
         env:
           RUST_BACKTRACE: 1
-          # Use clang-cl on Windows because tree-sitter-scss passes GCC-style flags
-          # (-Wno-unused-parameter) that MSVC's cl.exe doesn't understand
-          CC: ${{ matrix.os == 'windows-latest' && 'clang-cl' || '' }}
+          CC: clang-cl
 
   # Doc tests (separate because they can be slow)
   doc:
@@ -127,53 +179,10 @@ jobs:
         env:
           RUSTDOCFLAGS: -Dwarnings
 
-  # Build check (compile only, no artifacts) - ensures it builds on all platforms
-  build-check:
-    name: Build Check (${{ matrix.os }})
-    needs: [fmt, clippy]
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      # Set up MSVC environment on Windows for tree-sitter native compilation
-      - name: Set up MSVC (Windows)
-        if: matrix.os == 'windows-latest'
-        uses: ilammy/msvc-dev-cmd@v1
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-build-
-
-      - name: Build check
-        # Note: --target is NOT used because it forces the CC crate into cross-compile
-        # mode which breaks MSVC auto-detection on Windows. All builds are native.
-        run: cargo check --release
-        env:
-          # Use clang-cl on Windows because tree-sitter-scss passes GCC-style flags
-          # (-Wno-unused-parameter) that MSVC's cl.exe doesn't understand
-          CC: ${{ matrix.os == 'windows-latest' && 'clang-cl' || '' }}
-
   # Summary job for branch protection
   ci-success:
     name: CI Success
-    needs: [fmt, clippy, test, doc, build-check]
+    needs: [fmt, clippy, test-linux, doc]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -181,9 +190,8 @@ jobs:
         run: |
           if [[ "${{ needs.fmt.result }}" != "success" ]] || \
              [[ "${{ needs.clippy.result }}" != "success" ]] || \
-             [[ "${{ needs.test.result }}" != "success" ]] || \
-             [[ "${{ needs.doc.result }}" != "success" ]] || \
-             [[ "${{ needs.build-check.result }}" != "success" ]]; then
+             [[ "${{ needs.test-linux.result }}" != "success" ]] || \
+             [[ "${{ needs.doc.result }}" != "success" ]]; then
             echo "One or more jobs failed"
             exit 1
           fi
