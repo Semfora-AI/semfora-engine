@@ -41,10 +41,14 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Run Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        # Note: --all-features is not used because embedded-patterns feature requires
+        # SECURITY_PATTERNS_PATH to be set at compile time with a pre-built patterns file
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Run all tests
-        run: cargo test --release --all-targets
+        # Note: --benches is excluded because criterion benchmarks require at least
+        # 10 samples and fail when run as tests
+        run: cargo test --release --lib --bins --tests --examples
         env:
           RUST_BACKTRACE: 1
 
