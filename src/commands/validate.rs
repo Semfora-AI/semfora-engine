@@ -112,7 +112,9 @@ fn run_find_duplicates(
 
     // Filter by target if specified (file path or module name)
     if let Some(ref target) = args.target {
-        let target_lower = target.to_lowercase();
+        // Normalize path separators for cross-platform compatibility
+        let target_normalized = target.replace('/', std::path::MAIN_SEPARATOR_STR);
+        let target_lower = target_normalized.to_lowercase();
         signatures.retain(|sig| sig.file.to_lowercase().contains(&target_lower));
 
         if signatures.is_empty() {
