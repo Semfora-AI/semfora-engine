@@ -95,6 +95,9 @@ jobs:
         run: cargo test --lib --bins --tests --examples
         env:
           RUST_BACKTRACE: 1
+          # Use clang-cl on Windows because tree-sitter-scss passes GCC-style flags
+          # (-Wno-unused-parameter) that MSVC's cl.exe doesn't understand
+          CC: ${{ matrix.os == 'windows-latest' && 'clang-cl' || '' }}
 
   # Doc tests (separate because they can be slow)
   doc:
@@ -162,6 +165,10 @@ jobs:
         # Note: --target is NOT used because it forces the CC crate into cross-compile
         # mode which breaks MSVC auto-detection on Windows. All builds are native.
         run: cargo check --release
+        env:
+          # Use clang-cl on Windows because tree-sitter-scss passes GCC-style flags
+          # (-Wno-unused-parameter) that MSVC's cl.exe doesn't understand
+          CC: ${{ matrix.os == 'windows-latest' && 'clang-cl' || '' }}
 
   # Summary job for branch protection
   ci-success:
