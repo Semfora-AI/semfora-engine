@@ -9,9 +9,8 @@ license = "MIT"
 name = "semfora-engine"
 path = "src/main.rs"
 
-[[bin]]
-name = "semfora-engine-server"
-path = "src/mcp_server/bin.rs"
+# Note: semfora-engine-server was consolidated into the main binary
+# Use `semfora-engine serve` to run the MCP server
 
 [[bin]]
 name = "semfora-daemon"
