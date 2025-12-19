@@ -122,6 +122,7 @@ jobs:
     name: Create Release & Upload to R2
     needs: build
     runs-on: ubuntu-latest
+    environment: CI
     steps:
       - uses: actions/checkout@v4
 
@@ -170,7 +171,7 @@ jobs:
           for file in release/*; do
             filename=$(basename "$file")
             echo "Uploading $filename to releases/$VERSION/$filename"
-            wrangler r2 object put "semfora-releases/$VERSION/$filename" --file="$file"
+            wrangler r2 object put "semfora-releases/$VERSION/$filename" --file="$file" --remote
           done
 
       - name: Update latest symlink on R2
@@ -182,7 +183,7 @@ jobs:
 
           # Upload version.txt to latest/
           echo "$VERSION" > latest-version.txt
-          wrangler r2 object put "semfora-releases/latest/version.txt" --file="latest-version.txt"
+          wrangler r2 object put "semfora-releases/latest/version.txt" --file="latest-version.txt" --remote
 
           # Copy all release files to latest/ directory
           for file in release/*.tar.gz release/*.zip release/*.sha256; do
@@ -192,7 +193,7 @@ jobs:
               # e.g., semfora-engine-1.0.0-linux-x86_64.tar.gz -> semfora-engine-linux-x86_64.tar.gz
               latest_filename=$(echo "$filename" | sed "s/-$VERSION//")
               echo "Uploading to latest/$latest_filename"
-              wrangler r2 object put "semfora-releases/latest/$latest_filename" --file="$file"
+              wrangler r2 object put "semfora-releases/latest/$latest_filename" --file="$file" --remote
             fi
           done
 
