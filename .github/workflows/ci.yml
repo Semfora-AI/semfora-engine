@@ -71,6 +71,11 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # Set up MSVC environment on Windows for tree-sitter native compilation
+      - name: Set up MSVC (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -143,6 +148,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Set up MSVC environment on Windows for tree-sitter native compilation
+      - name: Set up MSVC (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -158,9 +168,6 @@ jobs:
 
       - name: Build check
         run: cargo check --release --target ${{ matrix.target }}
-        env:
-          CC_x86_64_pc_windows_msvc: ${{ matrix.os == 'windows-latest' && 'clang-cl' || '' }}
-          CXX_x86_64_pc_windows_msvc: ${{ matrix.os == 'windows-latest' && 'clang-cl' || '' }}
 
   # Summary job for branch protection
   ci-success:

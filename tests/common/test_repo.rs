@@ -45,8 +45,9 @@ impl TestRepo {
 
     /// Run semfora-engine CLI command and return output
     pub fn run_cli(&self, args: &[&str]) -> std::io::Result<Output> {
-        let binary =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/release/semfora-engine");
+        // Use Cargo's built-in env var that points to the binary built during test compilation
+        // This works in both debug and release modes, and in CI
+        let binary = PathBuf::from(env!("CARGO_BIN_EXE_semfora-engine"));
 
         Command::new(&binary)
             .current_dir(self.path())
