@@ -30,11 +30,7 @@ jobs:
             target: aarch64-apple-darwin
             artifact: darwin-arm64
             ext: tar.gz
-          # Cross-compile x86_64 from ARM macOS (macos-13 Intel runners are retired)
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            artifact: darwin-x86_64
-            ext: tar.gz
+          # darwin-x86_64 dropped - Intel Macs are <5% of users and declining
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: windows-x86_64
@@ -206,7 +202,6 @@ jobs:
           echo "|----------|----------|" >> $GITHUB_STEP_SUMMARY
           echo "| Linux x86_64 | \`curl -fsSL https://dl.semfora.com/releases/${{ steps.version.outputs.version }}/semfora-engine-${{ steps.version.outputs.version }}-linux-x86_64.tar.gz\` |" >> $GITHUB_STEP_SUMMARY
           echo "| macOS ARM64 | \`curl -fsSL https://dl.semfora.com/releases/${{ steps.version.outputs.version }}/semfora-engine-${{ steps.version.outputs.version }}-darwin-arm64.tar.gz\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| macOS x86_64 | \`curl -fsSL https://dl.semfora.com/releases/${{ steps.version.outputs.version }}/semfora-engine-${{ steps.version.outputs.version }}-darwin-x86_64.tar.gz\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Windows x86_64 | \`curl -fsSL https://dl.semfora.com/releases/${{ steps.version.outputs.version }}/semfora-engine-${{ steps.version.outputs.version }}-windows-x86_64.zip\` |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Quick Install" >> $GITHUB_STEP_SUMMARY

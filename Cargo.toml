@@ -132,6 +132,11 @@ codegen-units = 1     # Single codegen unit for better optimization
 opt-level = "s"       # Optimize for size ("z" for even smaller, "3" for speed)
 panic = "abort"       # No stack unwinding (smaller binary)
 
+[profile.quick]
+inherits = "release"
+lto = false           # Skip LTO for faster builds
+codegen-units = 16    # Parallel compilation
+
 [build-dependencies]
 cc = "1.0"
 
