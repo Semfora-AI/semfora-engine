@@ -124,6 +124,14 @@ which = "6.0"
 json5 = "0.4"
 toml = "0.8"
 
+# Release profile: optimized for size and reverse-engineering resistance
+[profile.release]
+strip = true          # Remove debug symbols and function names
+lto = true            # Link-time optimization (smaller binary, harder to decompile)
+codegen-units = 1     # Single codegen unit for better optimization
+opt-level = "s"       # Optimize for size ("z" for even smaller, "3" for speed)
+panic = "abort"       # No stack unwinding (smaller binary)
+
 [build-dependencies]
 cc = "1.0"
 

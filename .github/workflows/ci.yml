@@ -8,86 +8,117 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
 
 jobs:
-  # Semantic analysis runs FIRST - fail fast before building
-  semfora-ci:
-    name: Semantic Analysis
+  # Format check - fast, runs first
+  fmt:
+    name: Format
     runs-on: ubuntu-latest
-    # Only run on PRs (not pushes to main)
-    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  # Clippy lint check
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-clippy-
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  # Tests - run on multiple platforms
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # Full history for diff analysis
-
-      - name: Fetch base branch
-        run: git fetch origin ${{ github.base_ref }}:${{ github.base_ref }}
+      - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache semfora-engine build
+      - name: Cache cargo
         uses: actions/cache@v4
         with:
-          path: target
-          key: semfora-engine-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            semfora-engine-${{ runner.os }}-
+            ${{ runner.os }}-cargo-test-
 
-      - name: Build semfora-engine
-        run: |
-          cargo build --release
-          sudo cp target/release/semfora-engine /usr/local/bin/
-          semfora-engine --version
+      - name: Run tests
+        run: cargo test --all-targets
+        env:
+          RUST_BACKTRACE: 1
 
-      - name: Checkout semfora-ci
-        uses: actions/checkout@v4
-        with:
-          repository: Semfora-AI/semfora-ci
-          path: semfora-ci
-          token: ${{ secrets.GITHUB_TOKEN }}
+  # Doc tests (separate because they can be slow)
+  doc:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Cache semfora-ci build
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
         uses: actions/cache@v4
         with:
-          path: semfora-ci/target
-          key: semfora-ci-${{ runner.os }}-${{ hashFiles('semfora-ci/**/Cargo.lock') }}
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-doc-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            semfora-ci-${{ runner.os }}-
+            ${{ runner.os }}-cargo-doc-
 
-      - name: Build semfora-ci
-        run: |
-          cd semfora-ci
-          cargo build --release
-          sudo cp target/release/semfora-ci /usr/local/bin/
-          semfora-ci --version
+      - name: Check documentation
+        run: cargo doc --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: -Dwarnings
 
-      - name: Cache Semantic Index
-        uses: actions/cache@v4
-        with:
-          path: .semfora-cache
-          key: semfora-index-${{ runner.os }}-${{ hashFiles('**/*.rs') }}
-          restore-keys: |
-            semfora-index-${{ runner.os }}-
-
-      - name: Run Semantic Analysis
-        id: semfora
-        run: semfora-ci --ci
-        # --ci: Auto-detect GitHub Actions, set format, write step summary
-        # Exits non-zero on errors, blocking the PR
-
-  # Build only runs after semantic analysis passes (for PRs)
-  # For pushes to main, build runs immediately
-  build:
-    name: Build (${{ matrix.os }})
-    needs: [semfora-ci]
-    # Run if: push to main OR (PR AND semfora-ci passed)
-    if: |
-      always() &&
-      (github.event_name == 'push' || needs.semfora-ci.result == 'success')
+  # Build check (compile only, no artifacts) - ensures it builds on all platforms
+  build-check:
+    name: Build Check (${{ matrix.os }})
+    needs: [fmt, clippy]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -95,16 +126,10 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact: linux-x86_64
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact: macos-arm64
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            artifact: macos-x86_64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact: windows-x86_64
 
     steps:
       - uses: actions/checkout@v4
@@ -114,42 +139,40 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-
+
+      - name: Build check
+        run: cargo check --release --target ${{ matrix.target }}
         env:
-          # Use clang-cl on Windows to handle GCC-style flags from tree-sitter crates
           CC_x86_64_pc_windows_msvc: ${{ matrix.os == 'windows-latest' && 'clang-cl' || '' }}
           CXX_x86_64_pc_windows_msvc: ${{ matrix.os == 'windows-latest' && 'clang-cl' || '' }}
 
-      - name: Run tests
-        if: matrix.os == 'ubuntu-latest'
-        run: cargo test --release --all-targets
-        env:
-          RUST_BACKTRACE: 1
-
-      - name: Package binaries (Unix)
-        if: matrix.os != 'windows-latest'
+  # Summary job for branch protection
+  ci-success:
+    name: CI Success
+    needs: [fmt, clippy, test, doc, build-check]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Check all jobs
         run: |
-          mkdir -p dist
-          cp target/${{ matrix.target }}/release/semfora-engine dist/
-          cp target/${{ matrix.target }}/release/semfora-engine-server dist/
-          cp target/${{ matrix.target }}/release/semfora-daemon dist/
-          tar -czvf semfora-engine-${{ matrix.artifact }}.tar.gz -C dist .
-
-      - name: Package binaries (Windows)
-        if: matrix.os == 'windows-latest'
-        run: |
-          mkdir dist
-          copy target\${{ matrix.target }}\release\semfora-engine.exe dist\
-          copy target\${{ matrix.target }}\release\semfora-engine-server.exe dist\
-          copy target\${{ matrix.target }}\release\semfora-daemon.exe dist\
-          Compress-Archive -Path dist\* -DestinationPath semfora-engine-${{ matrix.artifact }}.zip
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: semfora-engine-${{ matrix.artifact }}
-          path: |
-            semfora-engine-*.tar.gz
-            semfora-engine-*.zip
-          if-no-files-found: error
+          if [[ "${{ needs.fmt.result }}" != "success" ]] || \
+             [[ "${{ needs.clippy.result }}" != "success" ]] || \
+             [[ "${{ needs.test.result }}" != "success" ]] || \
+             [[ "${{ needs.doc.result }}" != "success" ]] || \
+             [[ "${{ needs.build-check.result }}" != "success" ]]; then
+            echo "One or more jobs failed"
+            exit 1
+          fi
+          echo "All CI checks passed!"
