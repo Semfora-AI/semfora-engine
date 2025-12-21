@@ -16,9 +16,13 @@ use crate::Lang;
 
 /// Run the commit command - prepare information for commit message
 pub fn run_commit(args: &CommitArgs, ctx: &CommandContext) -> Result<String> {
-    let repo_dir = std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
-        path: format!("current directory: {}", e),
-    })?;
+    // Use provided path or current directory
+    let repo_dir = match &args.path {
+        Some(p) => p.clone(),
+        None => std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
+            path: format!("current directory: {}", e),
+        })?,
+    };
 
     if !is_git_repo(Some(&repo_dir)) {
         return Err(McpDiffError::GitError {

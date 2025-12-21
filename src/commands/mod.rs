@@ -35,12 +35,12 @@ pub use analyze::run_analyze;
 pub use cache::run_cache;
 pub use commit::run_commit;
 pub use index::run_index;
-pub use query::run_query;
+pub use query::{run_file_symbols, run_get_callgraph, run_get_callers, run_get_source, run_get_symbol, run_overview, run_query};
 pub use search::run_search;
 pub use security::run_security;
 pub use serve::run_serve;
 pub use test::run_test;
-pub use validate::run_validate;
+pub use validate::{run_duplicates, run_validate};
 
 use crate::cli::OutputFormat;
 

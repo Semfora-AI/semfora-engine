@@ -55,6 +55,69 @@ Semfora Engine is a semantic code analysis system that produces compressed TOON 
 
 ---
 
+## Unified CLI/MCP Architecture (2025-12 Refactor)
+
+The codebase follows a **CLI-first** architecture where all core logic lives in shared modules
+and CLI command handlers. MCP tools act as thin wrappers that delegate to these handlers.
+
+### Shared Modules
+
+| Module | Location | Purpose |
+|--------|----------|---------|
+| **paths** | `src/paths.rs` | Unified path resolution, canonicalization |
+| **indexing** | `src/indexing/` | File collection, parallel analysis |
+| **parsing** | `src/parsing/` | AST parsing with `parse_and_extract` |
+| **cache** | `src/cache/` | Index storage, signature loading |
+| **git** | `src/git/branch.rs`, `commit.rs` | Git operations |
+
+### Command Handler Pattern
+
+All 11 MCP tools delegate to CLI handlers via this pattern:
+
+```rust
+// MCP tool handler in src/mcp_server/mod.rs
+async fn handle_analyze(...) -> Result<String> {
+    // 1. Build CLI args from MCP params
+    let args = AnalyzeArgs { ... };
+
+    // 2. Call CLI handler (all logic here)
+    let result = run_analyze(&args)?;
+
+    // 3. Format for MCP output (if needed)
+    Ok(result)
+}
+
+// CLI handler in src/commands/analyze.rs
+pub fn run_analyze(args: &AnalyzeArgs) -> Result<String> {
+    // All business logic lives here
+    // Shared between CLI and MCP
+}
+```
+
+### Unified Handlers
+
+| CLI Command | Handler | MCP Tool(s) |
+|-------------|---------|-------------|
+| `analyze <file>` | `run_analyze()` | `analyze`, `analyze_diff` |
+| `query overview` | `run_overview()` | `get_overview` |
+| `query symbol` | `run_symbol()` | `get_symbol` |
+| `query source` | `run_source()` | `get_source` |
+| `query callers` | `run_callers()` | `get_callers` |
+| `query callgraph` | `run_callgraph()` | `get_callgraph` |
+| `query file` | `run_file_symbols()` | `get_file` |
+| `validate` | `run_validate()` | `validate` |
+| `validate --duplicates` | `run_duplicates()` | `find_duplicates` |
+| `commit --prep` | `run_commit()` | `prep_commit` |
+
+### Benefits
+
+- **Single source of truth**: Logic is implemented once in CLI handlers
+- **Consistent behavior**: CLI and MCP produce identical output for same inputs
+- **Reduced maintenance**: ~1,500 lines of duplicate code removed
+- **Parallel processing**: CLI index generation now uses Rayon for 3-5x speedup
+
+---
+
 ## Core Modules
 
 ### Semantic Extraction (`src/extract.rs`, `src/detectors/`)
@@ -94,7 +157,13 @@ Query-driven semantic index for efficient retrieval.
 
 ### MCP Server (`src/mcp_server/`)
 
-30+ tools exposed via MCP protocol for AI agents.
+MCP server providing 18+ tools for AI agents. Following the 2025-12 refactor, all tools
+delegate to CLI handlers (see Unified CLI/MCP Architecture above).
+
+**Key Files**:
+- `mod.rs` - Tool handlers (thin wrappers around CLI handlers)
+- `helpers.rs` - Cache freshness, symbol validation, batch operations
+- `formatting.rs` - TOON output formatting for diff/overview
 
 **Query-Driven Tools (Preferred)**:
 | Tool | Token Cost | Use Case |
@@ -314,8 +383,22 @@ cargo build --release
 ### Testing
 
 ```bash
+# Run all tests
 cargo test
+
+# Run CLI/MCP parity tests (validates unified handlers)
+cargo test --test cli_mcp_parity
+
+# Run integration tests by category
+cargo test --test integration_tests cli::
+cargo test --test integration_tests mcp::
+cargo test --test integration_tests languages::
 ```
+
+**Test Architecture**:
+- Unit tests: `src/**/*.rs` (inline `#[cfg(test)]` modules)
+- Integration tests: `tests/integration_tests.rs` + `tests/{cli,mcp,languages}/`
+- CLI/MCP parity: `tests/cli_mcp_parity.rs` (verifies CLI and MCP produce same output)
 
 ### Regenerating Index
 

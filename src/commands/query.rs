@@ -1,6 +1,7 @@
 //! Query command handler - Query the semantic index for symbols, source, callers, etc.
 
 use std::fs;
+use std::path::PathBuf;
 
 use crate::cache::{CacheDir, SymbolIndexEntry};
 use crate::cli::{OutputFormat, QueryArgs, QueryType};
@@ -13,11 +14,12 @@ use crate::git::{get_current_branch, get_last_commit};
 pub fn run_query(args: &QueryArgs, ctx: &CommandContext) -> Result<String> {
     match &args.query_type {
         QueryType::Overview {
+            path,
             modules,
             max_modules,
             exclude_test_dirs,
             include_git_context,
-        } => run_overview(*modules, *max_modules, *exclude_test_dirs, *include_git_context, ctx),
+        } => run_overview(path.as_ref(), *modules, *max_modules, *exclude_test_dirs, *include_git_context, ctx),
         QueryType::Module {
             name,
             symbols,
@@ -33,25 +35,29 @@ pub fn run_query(args: &QueryArgs, ctx: &CommandContext) -> Result<String> {
         }
         QueryType::Symbol {
             hash,
+            path,
             file,
             line,
             source,
             context,
-        } => run_get_symbol(hash.as_deref(), file.as_deref(), *line, *source, *context, ctx),
+        } => run_get_symbol(path.as_ref(), hash.as_deref(), file.as_deref(), *line, *source, *context, ctx),
         QueryType::Source {
             file,
+            path,
             start,
             end,
             hash,
             context,
-        } => run_get_source(file.as_deref(), *start, *end, hash.as_deref(), *context, ctx),
+        } => run_get_source(path.as_ref(), file.as_deref(), *start, *end, hash.as_deref(), *context, ctx),
         QueryType::Callers {
             hash,
+            path,
             depth,
             source,
             limit,
-        } => run_get_callers(hash, *depth, *source, *limit, ctx),
+        } => run_get_callers(path.as_ref(), hash, *depth, *source, *limit, ctx),
         QueryType::Callgraph {
+            path,
             module,
             symbol,
             export,
@@ -59,6 +65,7 @@ pub fn run_query(args: &QueryArgs, ctx: &CommandContext) -> Result<String> {
             limit,
             offset,
         } => run_get_callgraph(
+            path.as_ref(),
             module.as_deref(),
             symbol.as_deref(),
             export.as_deref(),
@@ -69,26 +76,33 @@ pub fn run_query(args: &QueryArgs, ctx: &CommandContext) -> Result<String> {
         ),
         QueryType::File {
             path,
+            repo_path,
             source,
             kind,
             risk,
             context,
-        } => run_file_symbols(path, *source, kind.as_deref(), risk.as_deref(), *context, ctx),
+        } => run_file_symbols(repo_path.as_ref(), path, *source, kind.as_deref(), risk.as_deref(), *context, ctx),
         QueryType::Languages => run_list_languages(ctx),
     }
 }
 
 /// Get repository overview (DEDUP-201: unified CLI/MCP handler)
-fn run_overview(
+///
+/// If path is None, uses the current directory.
+pub fn run_overview(
+    path: Option<&PathBuf>,
     include_modules: bool,
     max_modules: usize,
     exclude_test_dirs: bool,
     include_git_context: bool,
     ctx: &CommandContext,
 ) -> Result<String> {
-    let repo_dir = std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
-        path: format!("current directory: {}", e),
-    })?;
+    let repo_dir = match path {
+        Some(p) => p.clone(),
+        None => std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
+            path: format!("current directory: {}", e),
+        })?,
+    };
     let cache = CacheDir::for_repo(&repo_dir)?;
 
     if !cache.exists() {
@@ -548,13 +562,12 @@ fn run_list_module_symbols(
     Ok(output)
 }
 
-/// Get a specific symbol by hash or file+line location
-///
-/// Supports three modes:
-/// 1. Hash mode: lookup by symbol hash (comma-separated for batch)
+/// Get symbol(s) by hash or file+line location (DEDUP-306: unified CLI/MCP handler)
+/// 1. Hash mode: single hash or comma-separated hashes for batch queries
 /// 2. File+line mode: find symbol at specific file:line location
 /// 3. Combined: file+line takes precedence if both provided
-fn run_get_symbol(
+pub fn run_get_symbol(
+    path: Option<&PathBuf>,
     hash: Option<&str>,
     file: Option<&str>,
     line: Option<usize>,
@@ -562,9 +575,12 @@ fn run_get_symbol(
     context: usize,
     ctx: &CommandContext,
 ) -> Result<String> {
-    let repo_dir = std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
-        path: format!("current directory: {}", e),
-    })?;
+    let repo_dir = match path {
+        Some(p) => p.clone(),
+        None => std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
+            path: format!("current directory: {}", e),
+        })?,
+    };
     let cache = CacheDir::for_repo(&repo_dir)?;
 
     let mut results: Vec<SymbolIndexEntry> = Vec::new();
@@ -678,13 +694,13 @@ fn find_symbol_by_location(
         })
 }
 
-/// Get source code for a file or symbol(s)
-///
+/// Get source code for a file or symbol(s) (DEDUP-306: unified CLI/MCP handler)
 /// Supports three modes:
 /// 1. Batch mode: comma-separated hashes (get source for each)
 /// 2. Single hash mode: get source for one symbol by hash
 /// 3. File mode: file + start/end lines
-fn run_get_source(
+pub fn run_get_source(
+    path: Option<&PathBuf>,
     file: Option<&str>,
     start: Option<usize>,
     end: Option<usize>,
@@ -692,9 +708,12 @@ fn run_get_source(
     context: usize,
     ctx: &CommandContext,
 ) -> Result<String> {
-    let repo_dir = std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
-        path: format!("current directory: {}", e),
-    })?;
+    let repo_dir = match path {
+        Some(p) => p.clone(),
+        None => std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
+            path: format!("current directory: {}", e),
+        })?,
+    };
     let cache = CacheDir::for_repo(&repo_dir)?;
 
     // Batch mode: comma-separated hashes
@@ -885,8 +904,9 @@ fn format_file_source(
     Ok(output)
 }
 
-/// Get callers of a symbol (DEDUP-202: unified with MCP - BFS traversal with depth)
-fn run_get_callers(
+/// Get callers of a symbol (DEDUP-306: unified CLI/MCP handler)
+pub fn run_get_callers(
+    path: Option<&PathBuf>,
     hash: &str,
     depth: usize,
     include_source: bool,
@@ -895,9 +915,12 @@ fn run_get_callers(
 ) -> Result<String> {
     use std::collections::{HashMap, HashSet};
 
-    let repo_dir = std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
-        path: format!("current directory: {}", e),
-    })?;
+    let repo_dir = match path {
+        Some(p) => p.clone(),
+        None => std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
+            path: format!("current directory: {}", e),
+        })?,
+    };
     let cache = CacheDir::for_repo(&repo_dir)?;
 
     // Load call graph
@@ -1011,6 +1034,24 @@ fn run_get_callers(
                     output.push_str(&format!("  {},{},{}\n", n, h, d));
                 }
             }
+
+            // Include source snippets if requested (for MCP parity)
+            if include_source && !all_callers.is_empty() {
+                output.push_str("\n__caller_sources__:\n");
+                for (caller_hash, caller_name, _) in all_callers.iter().take(5) {
+                    if let Some(symbol) = load_symbol_from_cache(&cache, caller_hash)? {
+                        if let Some(source) =
+                            get_source_for_symbol(&cache, &symbol.file, &symbol.lines, 1)
+                        {
+                            output.push_str(&format!("--- {} ({}) ---\n", caller_name, caller_hash));
+                            output.push_str(&format!("# {}:{}\n", symbol.file, symbol.lines));
+                            for line in source.lines().take(5) {
+                                output.push_str(&format!("{}\n", line));
+                            }
+                        }
+                    }
+                }
+            }
         }
         OutputFormat::Text => {
             output.push_str("═══════════════════════════════════════════\n");
@@ -1049,15 +1090,10 @@ fn run_get_callers(
     Ok(output)
 }
 
-/// Get the call graph with filtering and pagination (DEDUP-205: unified with MCP)
-///
-/// Supports:
-/// - Module filtering
-/// - Symbol filtering by name or hash (with name resolution)
-/// - Pagination with offset/limit
-/// - Summary statistics mode
-/// - SQLite export
-fn run_get_callgraph(
+/// Get call graph (DEDUP-306: unified CLI/MCP handler)
+/// Supports: module filtering, symbol filtering, pagination, stats mode, SQLite export
+pub fn run_get_callgraph(
+    path: Option<&PathBuf>,
     module: Option<&str>,
     symbol: Option<&str>,
     export: Option<&str>,
@@ -1068,9 +1104,12 @@ fn run_get_callgraph(
 ) -> Result<String> {
     use std::collections::{HashMap, HashSet};
 
-    let repo_dir = std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
-        path: format!("current directory: {}", e),
-    })?;
+    let repo_dir = match path {
+        Some(p) => p.clone(),
+        None => std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
+            path: format!("current directory: {}", e),
+        })?,
+    };
     let cache = CacheDir::for_repo(&repo_dir)?;
 
     // Handle SQLite export
@@ -1343,27 +1382,27 @@ fn run_export_sqlite(path: &str, cache: &CacheDir, _ctx: &CommandContext) -> Res
     ))
 }
 
-/// Get all symbols in a file (DEDUP-206: unified with MCP)
-///
-/// Supports:
-/// - Kind filtering (function, struct, class, etc.)
-/// - Risk filtering (low, medium, high)
-/// - Source code inclusion with configurable context
-fn run_file_symbols(
-    path: &str,
+/// Get all symbols in a file (DEDUP-306: unified CLI/MCP handler)
+/// Supports kind filtering, risk filtering, and source code inclusion
+pub fn run_file_symbols(
+    repo_path: Option<&PathBuf>,
+    file_path: &str,
     include_source: bool,
     kind_filter: Option<&str>,
     risk_filter: Option<&str>,
     context: usize,
     ctx: &CommandContext,
 ) -> Result<String> {
-    let repo_dir = std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
-        path: format!("current directory: {}", e),
-    })?;
+    let repo_dir = match repo_path {
+        Some(p) => p.clone(),
+        None => std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
+            path: format!("current directory: {}", e),
+        })?,
+    };
     let cache = CacheDir::for_repo(&repo_dir)?;
 
     // Load all symbol entries and filter by file
-    let target_file = path.trim_start_matches("./");
+    let target_file = file_path.trim_start_matches("./");
     let symbols: Vec<SymbolIndexEntry> = cache
         .load_all_symbol_entries()
         .map_err(|e| McpDiffError::FileNotFound {
@@ -1394,14 +1433,14 @@ fn run_file_symbols(
         return match ctx.format {
             OutputFormat::Json => Ok(serde_json::json!({
                 "_type": "file_symbols",
-                "file": path,
+                "file": file_path,
                 "count": 0,
                 "symbols": [],
                 "hint": "File may not be indexed or path doesn't match."
             }).to_string()),
             OutputFormat::Toon | OutputFormat::Text => Ok(format!(
                 "_type: file_symbols\nfile: \"{}\"\nshowing: 0\nsymbols: (none)\nhint: File may not be indexed or path doesn't match.\n",
-                path
+                file_path
             )),
         };
     }
@@ -1423,7 +1462,7 @@ fn run_file_symbols(
 
     let json_value = serde_json::json!({
         "_type": "file_symbols",
-        "file": path,
+        "file": file_path,
         "count": symbols.len(),
         "kind_filter": kind_filter,
         "risk_filter": risk_filter,
@@ -1439,7 +1478,7 @@ fn run_file_symbols(
         OutputFormat::Toon => {
             // Compact TOON format with key columns
             output.push_str("_type: file_symbols\n");
-            output.push_str(&format!("file: \"{}\"\n", path));
+            output.push_str(&format!("file: \"{}\"\n", file_path));
             output.push_str(&format!("showing: {}\n", symbols.len()));
             output.push_str(&format!(
                 "symbols[{}]{{name,hash,kind,lines,risk}}:\n",
@@ -1466,7 +1505,7 @@ fn run_file_symbols(
         }
         OutputFormat::Text => {
             output.push_str("═══════════════════════════════════════════\n");
-            output.push_str(&format!("  FILE: {}\n", path));
+            output.push_str(&format!("  FILE: {}\n", file_path));
             output.push_str("═══════════════════════════════════════════\n\n");
             output.push_str(&format!("symbols[{}]:\n", symbols.len()));
 

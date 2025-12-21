@@ -4,8 +4,8 @@
 //! the semantic code analysis capabilities of semfora-engine as tools that can be
 //! called by AI assistants like Claude.
 
-mod formatting;
-mod helpers;
+pub mod formatting;
+pub mod helpers;
 mod types;
 
 // Instruction variants for A/B testing - change import to switch:
@@ -27,82 +27,28 @@ use tokio::sync::Mutex;
 use crate::{
     // CLI types for MCP->CLI handler consolidation
     cli::{
-        IndexArgs, IndexOperation, OutputFormat, SearchArgs, SecurityArgs, SecurityOperation,
-        TestArgs,
+        AnalyzeArgs, CommitArgs, IndexArgs, IndexOperation, OutputFormat, SearchArgs, SecurityArgs,
+        SecurityOperation, TestArgs, ValidateArgs,
     },
-    commands::{run_index, run_search, run_security, run_test, CommandContext},
-    duplicate::DuplicateDetector,
-    encode_toon,
-    encode_toon_directory,
-    generate_repo_overview,
-    normalize_kind,
+    commands::{run_analyze, run_commit, run_duplicates, run_file_symbols, run_get_callgraph, run_get_callers, run_get_source, run_get_symbol, run_index, run_overview, run_search, run_security, run_test, run_validate, CommandContext},
     server::ServerState,
     test_runner::{self},
     utils::truncate_to_char_boundary,
     CacheDir,
-    Lang,
 };
 
 // Re-export types for external use
-use formatting::{
-    analyze_files,
-    extract_source_for_symbol,
-    format_call_graph_paginated,
-    format_call_graph_summary,
-    // Diff formatting with pagination
-    format_diff_output_paginated,
-    format_diff_summary,
-    format_duplicate_clusters_paginated,
-    format_duplicate_matches,
-    format_module_symbols,
-    // Prep-commit formatting
-    format_prep_commit,
-    format_source_snippet,
-    get_supported_languages,
-    load_signatures,
-    AnalyzedFile,
-    FileDiffStats,
-    GitContext,
-    SymbolMetrics,
-};
+use formatting::{format_module_symbols, get_supported_languages};
 use helpers::{
     check_cache_staleness_detailed,
-    collect_files,
     ensure_fresh_index,
-    filter_repo_overview,
-    // Validation helpers
-    find_symbol_by_hash,
-    find_symbol_by_location,
-    format_batch_validation_results,
     format_freshness_note,
-    format_validation_result,
     generate_index_internal,
-    // String similarity
-    levenshtein_distance,
-    parse_and_extract,
-    validate_single_symbol,
-    validate_symbols_batch,
     FreshnessResult,
 };
 pub use types::*;
 // Match this to the active module above:
 use instructions_fast::MCP_INSTRUCTIONS;
-
-// ============================================================================
-// Large File Handling Constants
-// ============================================================================
-
-/// File size threshold for suggesting summary mode (100KB)
-const LARGE_FILE_BYTES: u64 = 100_000;
-
-/// File size threshold for requiring focus mode (500KB)
-const VERY_LARGE_FILE_BYTES: u64 = 500_000;
-
-/// Line count threshold for large file handling
-const LARGE_FILE_LINES: usize = 3000;
-
-/// Symbol count threshold for automatic summarization
-const LARGE_SYMBOL_COUNT: usize = 50;
 
 // ============================================================================
 // MCP Server Implementation
@@ -341,7 +287,7 @@ impl McpDiffServer {
             };
         }
 
-        // Path-based analysis
+        // Path-based analysis - delegate to CLI handler (DEDUP-301)
         let path = match &request.path {
             Some(p) => p,
             None => {
@@ -353,216 +299,51 @@ impl McpDiffServer {
 
         let resolved_path = self.resolve_path(path).await;
 
-        if !resolved_path.exists() {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "Path not found: {}",
-                resolved_path.display()
-            ))]));
+        // Build CLI args from MCP request
+        let args = AnalyzeArgs {
+            path: Some(resolved_path),
+            diff: None,
+            uncommitted: false,
+            commit: None,
+            all_commits: false,
+            base: None,
+            max_depth: request.max_depth.unwrap_or(10),
+            extensions: request.extensions.clone().unwrap_or_default(),
+            allow_tests: false,
+            summary_only: request.summary_only.unwrap_or(false),
+            start_line: request.start_line,
+            end_line: request.end_line,
+            output_mode: request.output_mode.clone().unwrap_or_else(|| "full".to_string()),
+            target_ref: None,
+            limit: None,
+            offset: None,
+            shard: false,
+            incremental: false,
+            analyze_tokens: None,
+            compare_compact: false,
+            print_ast: false,
+        };
+
+        // Select output format based on MCP request
+        let format = match request.format.as_deref() {
+            Some("json") => OutputFormat::Json,
+            _ => OutputFormat::Toon,
+        };
+
+        let ctx = CommandContext {
+            format,
+            verbose: false,
+            progress: false,
+        };
+
+        // Call CLI handler
+        match run_analyze(&ctx, &args) {
+            Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Analysis failed: {}",
+                e
+            ))])),
         }
-
-        // Directory analysis
-        if resolved_path.is_dir() {
-            let max_depth = request.max_depth.unwrap_or(10);
-            let summary_only = request.summary_only.unwrap_or(false);
-            let extensions = request.extensions.clone().unwrap_or_default();
-
-            let files = collect_files(&resolved_path, max_depth, &extensions);
-
-            if files.is_empty() {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "directory: {}\nfiles_found: 0\n",
-                    resolved_path.display()
-                ))]));
-            }
-
-            let summaries = analyze_files(&files);
-            let dir_str = resolved_path.display().to_string();
-            let overview = generate_repo_overview(&summaries, &dir_str);
-
-            let output = if summary_only {
-                encode_toon_directory(&overview, &[])
-            } else {
-                encode_toon_directory(&overview, &summaries)
-            };
-
-            return Ok(CallToolResult::success(vec![Content::text(output)]));
-        }
-
-        // File analysis
-        let lang = match Lang::from_path(&resolved_path) {
-            Ok(l) => l,
-            Err(_) => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Unsupported file type: {}",
-                    resolved_path.display()
-                ))]))
-            }
-        };
-
-        let source = match fs::read_to_string(&resolved_path) {
-            Ok(s) => s,
-            Err(e) => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Failed to read file: {}",
-                    e
-                ))]))
-            }
-        };
-
-        // Large file detection
-        let file_size = fs::metadata(&resolved_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let line_count = source.lines().count();
-        let has_focus = request.start_line.is_some() && request.end_line.is_some();
-
-        // For very large files without focus, return metadata with navigation hints
-        if (file_size > VERY_LARGE_FILE_BYTES || line_count > LARGE_FILE_LINES) && !has_focus {
-            // Do a quick parse to get symbol count for the hint
-            let symbol_hint = if let Ok(summary) = parse_and_extract(&resolved_path, &source, lang)
-            {
-                format!(
-                    "\nsymbols_found: {}\nhigh_risk_count: {}\n",
-                    summary.symbols.len(),
-                    summary
-                        .symbols
-                        .iter()
-                        .filter(|s| s.behavioral_risk == crate::RiskLevel::High)
-                        .count()
-                )
-            } else {
-                String::new()
-            };
-
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "_type: large_file_notice\n\
-                 file: {}\n\
-                 size_bytes: {}\n\
-                 line_count: {}\n\
-                 language: {}\n\
-                 {}\n\
-                 This file is very large ({:.1}KB, {} lines).\n\
-                 Use focus mode to analyze a specific section:\n\
-                   analyze(path=\"{}\", start_line=N, end_line=M)\n\n\
-                 Or use get_file to see symbol index with line ranges.\n",
-                resolved_path.display(),
-                file_size,
-                line_count,
-                lang.name(),
-                symbol_hint,
-                file_size as f64 / 1024.0,
-                line_count,
-                resolved_path.display()
-            ))]));
-        }
-
-        // Focus mode: extract only specified line range
-        let source_to_analyze = if let (Some(start), Some(end)) =
-            (request.start_line, request.end_line)
-        {
-            let lines: Vec<&str> = source.lines().collect();
-            let start_idx = start.saturating_sub(1);
-            let end_idx = end.min(lines.len());
-
-            if start_idx >= lines.len() {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "start_line {} exceeds file length {} lines",
-                    start, lines.len()
-                ))]));
-            }
-
-            lines[start_idx..end_idx].join("\n")
-        } else {
-            source
-        };
-
-        let summary = match parse_and_extract(&resolved_path, &source_to_analyze, lang) {
-            Ok(s) => s,
-            Err(e) => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Analysis failed: {}",
-                    e
-                ))]))
-            }
-        };
-
-        // Output mode support
-        let output = match request.output_mode.as_deref() {
-            Some("symbols_only") => {
-                // Just list symbols with line ranges
-                let mut out = format!(
-                    "_type: symbols_only\nfile: {}\nsymbol_count: {}\n\n",
-                    resolved_path.display(),
-                    summary.symbols.len()
-                );
-                for sym in &summary.symbols {
-                    out.push_str(&format!(
-                        "- {} ({}) L{}-{}\n",
-                        sym.name,
-                        sym.kind.as_str(),
-                        sym.start_line,
-                        sym.end_line
-                    ));
-                }
-                out
-            }
-            Some("summary") => {
-                // Brief overview only
-                format!(
-                    "_type: analysis_summary\n\
-                     file: {}\n\
-                     language: {}\n\
-                     symbols: {}\n\
-                     calls: {}\n\
-                     high_risk: {}\n",
-                    resolved_path.display(),
-                    summary.language,
-                    summary.symbols.len(),
-                    summary.calls.len(),
-                    summary
-                        .symbols
-                        .iter()
-                        .filter(|s| s.behavioral_risk == crate::RiskLevel::High)
-                        .count()
-                )
-            }
-            _ => {
-                // Full output (default)
-                let mut output = match request.format.as_deref() {
-                    Some("json") => {
-                        serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".to_string())
-                    }
-                    _ => encode_toon(&summary),
-                };
-
-                // Add focus context if applicable
-                if has_focus {
-                    output = format!(
-                        "_type: focused_analysis\n\
-                         file: {}\n\
-                         focus_range: L{}-{}\n\
-                         ---\n{}",
-                        resolved_path.display(),
-                        request.start_line.unwrap_or(1),
-                        request.end_line.unwrap_or(0),
-                        output
-                    );
-                }
-
-                // Symbol count warning for large files
-                if summary.symbols.len() > LARGE_SYMBOL_COUNT {
-                    output = format!(
-                        "# Note: {} symbols found. Consider using output_mode='symbols_only' for overview first.\n\n{}",
-                        summary.symbols.len(),
-                        output
-                    );
-                }
-
-                output
-            }
-        };
-
-        Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
     #[tool(
@@ -572,79 +353,58 @@ impl McpDiffServer {
         &self,
         Parameters(request): Parameters<AnalyzeDiffRequest>,
     ) -> Result<CallToolResult, McpError> {
+        // Resolve working directory
         let working_dir = match &request.working_dir {
             Some(wd) => self.resolve_path(wd).await,
             None => self.get_working_dir().await,
         };
 
+        // Validate git repo before delegating
         if !crate::git::is_git_repo(Some(&working_dir)) {
             return Ok(CallToolResult::error(vec![Content::text(
                 "Not a git repository",
             )]));
         }
 
-        let base_ref = &request.base_ref;
-        let target_ref = request.target_ref.as_deref().unwrap_or("HEAD");
-
-        // Extract pagination options with defaults
-        let limit = request.limit.unwrap_or(20).min(100); // Default 20, max 100
-        let offset = request.offset.unwrap_or(0);
-        let summary_only = request.summary_only.unwrap_or(false);
-
-        // Handle special case for uncommitted changes
-        let (changed_files, display_target) = if target_ref.eq_ignore_ascii_case("WORKING") {
-            // Compare base_ref against working tree (uncommitted changes)
-            let files = match crate::git::get_uncommitted_changes(base_ref, Some(&working_dir)) {
-                Ok(files) => files,
-                Err(e) => {
-                    return Ok(CallToolResult::error(vec![Content::text(format!(
-                        "Failed to get uncommitted changes: {}",
-                        e
-                    ))]))
-                }
-            };
-            (files, "WORKING (uncommitted)")
-        } else {
-            // Normal comparison between refs
-            let merge_base = crate::git::get_merge_base(base_ref, target_ref, Some(&working_dir))
-                .unwrap_or_else(|_| base_ref.to_string());
-
-            let files =
-                match crate::git::get_changed_files(&merge_base, target_ref, Some(&working_dir)) {
-                    Ok(files) => files,
-                    Err(e) => {
-                        return Ok(CallToolResult::error(vec![Content::text(format!(
-                            "Failed to get changed files: {}",
-                            e
-                        ))]))
-                    }
-                };
-            (files, target_ref)
+        // Build CLI args from MCP request (DEDUP-302)
+        let args = AnalyzeArgs {
+            path: Some(working_dir),
+            diff: Some(request.base_ref.clone()),
+            uncommitted: false,
+            commit: None,
+            all_commits: false,
+            base: None,
+            max_depth: 10,
+            extensions: vec![],
+            allow_tests: false,
+            summary_only: request.summary_only.unwrap_or(false),
+            start_line: None,
+            end_line: None,
+            output_mode: "full".to_string(),
+            target_ref: request.target_ref.clone(),
+            limit: request.limit,
+            offset: request.offset,
+            shard: false,
+            incremental: false,
+            analyze_tokens: None,
+            compare_compact: false,
+            print_ast: false,
         };
 
-        if changed_files.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "_type: analyze_diff\nbase: \"{}\"\ntarget: \"{}\"\ntotal_files: 0\n_note: No files changed.\n",
-                base_ref,
-                display_target
-            ))]));
+        let ctx = CommandContext {
+            format: OutputFormat::Toon,
+            verbose: false,
+            progress: false,
+        };
+
+        // Delegate to CLI handler
+        match run_analyze(&ctx, &args) {
+            Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Diff analysis failed: {}",
+                e
+            ))])),
         }
-
-        // Choose output format based on options
-        let output = if summary_only {
-            format_diff_summary(&working_dir, base_ref, display_target, &changed_files)
-        } else {
-            format_diff_output_paginated(
-                &working_dir,
-                base_ref,
-                display_target,
-                &changed_files,
-                offset,
-                limit,
-            )
-        };
-
-        Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
     #[tool(
@@ -669,8 +429,6 @@ impl McpDiffServer {
         &self,
         Parameters(request): Parameters<GetOverviewRequest>,
     ) -> Result<CallToolResult, McpError> {
-        use crate::git::{get_current_branch, get_last_commit};
-
         let repo_path = match &request.path {
             Some(p) => self.resolve_path(p).await,
             None => self.get_working_dir().await,
@@ -686,54 +444,30 @@ impl McpDiffServer {
             Ok(r) => r,
             Err(e) => return Ok(CallToolResult::error(vec![Content::text(e)])),
         };
-        let cache = freshness.cache.clone();
 
-        let overview_path = cache.repo_overview_path();
+        // Build output with optional freshness notice
+        let mut output = String::new();
+        if let Some(note) = format_freshness_note(&freshness) {
+            output.push_str(&note);
+            output.push_str("\n\n");
+        }
 
-        match fs::read_to_string(&overview_path) {
-            Ok(content) => {
-                // Build output with optional freshness notice
-                let mut output = String::new();
+        // Delegate to CLI handler (DEDUP-303)
+        // include_modules=true when max_modules > 0
+        let include_modules = max_modules > 0;
+        let ctx = CommandContext {
+            format: OutputFormat::Toon,
+            verbose: false,
+            progress: false,
+        };
 
-                // Add freshness note if index was refreshed
-                if let Some(note) = format_freshness_note(&freshness) {
-                    output.push_str(&note);
-                    output.push_str("\n\n");
-                }
-
-                // Add git context if requested (DEDUP-104: uses shared git module)
-                if include_git_context {
-                    let branch = get_current_branch(Some(&repo_path)).ok();
-                    let commit = get_last_commit(Some(&repo_path))
-                        .map(|c| format!("{} {}", c.short_sha, c.subject));
-
-                    if branch.is_some() || commit.is_some() {
-                        output.push_str("git_context:\n");
-                        if let Some(b) = branch {
-                            output.push_str(&format!("  branch: \"{}\"\n", b));
-                        }
-                        if let Some(c) = commit {
-                            // Truncate commit message
-                            let c = if c.len() > 60 {
-                                format!("{}...", &c[..57])
-                            } else {
-                                c
-                            };
-                            output.push_str(&format!("  last_commit: \"{}\"\n", c));
-                        }
-                        output.push('\n');
-                    }
-                }
-
-                // Filter and limit modules in the content
-                let filtered_content =
-                    filter_repo_overview(&content, max_modules, exclude_test_dirs);
-
-                output.push_str(&filtered_content);
+        match run_overview(Some(&repo_path), include_modules, max_modules, exclude_test_dirs, include_git_context, &ctx) {
+            Ok(overview_output) => {
+                output.push_str(&overview_output);
                 Ok(CallToolResult::success(vec![Content::text(output)]))
             }
             Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Failed to read overview: {}",
+                "Failed to get overview: {}",
                 e
             ))])),
         }
@@ -746,107 +480,45 @@ impl McpDiffServer {
         &self,
         Parameters(request): Parameters<GetSymbolRequest>,
     ) -> Result<CallToolResult, McpError> {
+        // DEDUP-306: Delegate to CLI run_get_symbol handler
+
         let repo_path = match &request.path {
             Some(p) => self.resolve_path(p).await,
             None => self.get_working_dir().await,
         };
 
-        // Ensure index exists and is fresh
-        let freshness = match self.ensure_index(&repo_path).await {
-            Ok(r) => r,
-            Err(e) => return Ok(CallToolResult::error(vec![Content::text(e)])),
-        };
-        let cache = freshness.cache;
-
-        // Check for batch mode (hashes takes precedence)
-        if let Some(ref hashes) = request.hashes {
+        // Convert batch hashes array to comma-separated string (CLI format)
+        let hash_str: Option<String> = if let Some(ref hashes) = request.hashes {
             if !hashes.is_empty() {
-                // Batch mode
-                let hashes: Vec<&str> = hashes.iter().take(20).map(|s| s.as_str()).collect();
-
-                let include_source = request.include_source.unwrap_or(false);
-                let context = request.context.unwrap_or(3);
-
-                let mut output = String::new();
-                output.push_str("_type: batch_symbols\n");
-                output.push_str(&format!("requested: {}\n", hashes.len()));
-
-                let mut found = 0;
-                let mut not_found: Vec<&str> = Vec::new();
-
-                for hash in &hashes {
-                    let symbol_path = cache.symbol_path(hash);
-                    if symbol_path.exists() {
-                        match fs::read_to_string(&symbol_path) {
-                            Ok(content) => {
-                                output.push_str(&format!("\n--- {} ---\n", hash));
-                                output.push_str(&content);
-
-                                // Optionally include source code
-                                if include_source {
-                                    if let Some(source_snippet) =
-                                        extract_source_for_symbol(&cache, &content, context)
-                                    {
-                                        output.push_str("\n__source__:\n");
-                                        output.push_str(&source_snippet);
-                                    }
-                                }
-                                found += 1;
-                            }
-                            Err(_) => not_found.push(hash),
-                        }
-                    } else {
-                        not_found.push(hash);
-                    }
-                }
-
-                output.push_str(&format!("\n_summary:\n  found: {}\n", found));
-                if !not_found.is_empty() {
-                    output.push_str(&format!("  not_found: {}\n", not_found.join(",")));
-                }
-
-                return Ok(CallToolResult::success(vec![Content::text(output)]));
+                Some(hashes.iter().take(20).cloned().collect::<Vec<_>>().join(","))
+            } else {
+                request.symbol_hash.clone()
             }
-        }
-
-        // File+line mode: find symbol at specific location
-        if let (Some(file), Some(line)) = (&request.file, request.line) {
-            let entry = match find_symbol_by_location(&cache, file, line) {
-                Ok(e) => e,
-                Err(e) => return Ok(CallToolResult::error(vec![Content::text(e)])),
-            };
-            let symbol_path = cache.symbol_path(&entry.hash);
-            return match fs::read_to_string(&symbol_path) {
-                Ok(content) => Ok(CallToolResult::success(vec![Content::text(content)])),
-                Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Failed to read symbol: {}",
-                    e
-                ))])),
-            };
-        }
-
-        // Single symbol mode
-        let symbol_hash = match &request.symbol_hash {
-            Some(h) => h,
-            None => {
-                return Ok(CallToolResult::error(vec![Content::text(
-                    "Either symbol_hash, hashes, or file+line must be provided",
-                )]))
-            }
+        } else {
+            request.symbol_hash.clone()
         };
 
-        let symbol_path = cache.symbol_path(symbol_hash);
-        if !symbol_path.exists() {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "Symbol '{}' not found in index",
-                symbol_hash
-            ))]));
-        }
+        let include_source = request.include_source.unwrap_or(false);
+        let context = request.context.unwrap_or(3);
 
-        match fs::read_to_string(&symbol_path) {
-            Ok(content) => Ok(CallToolResult::success(vec![Content::text(content)])),
+        let ctx = CommandContext {
+            format: OutputFormat::Toon,
+            verbose: false,
+            progress: false,
+        };
+
+        match run_get_symbol(
+            Some(&repo_path),
+            hash_str.as_deref(),
+            request.file.as_deref(),
+            request.line,
+            include_source,
+            context,
+            &ctx,
+        ) {
+            Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),
             Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Failed to read symbol: {}",
+                "Failed to get symbol: {}",
                 e
             ))])),
         }
@@ -859,376 +531,51 @@ impl McpDiffServer {
         &self,
         Parameters(request): Parameters<GetCallgraphRequest>,
     ) -> Result<CallToolResult, McpError> {
-        use std::io::{BufRead, BufReader};
+        // DEDUP-306: Delegate to CLI run_get_callgraph handler
 
         let repo_path = match &request.path {
             Some(p) => self.resolve_path(p).await,
             None => self.get_working_dir().await,
         };
 
-        // Ensure index exists and is fresh
-        let freshness = match self.ensure_index(&repo_path).await {
-            Ok(r) => r,
-            Err(e) => return Ok(CallToolResult::error(vec![Content::text(e)])),
-        };
-        let cache = freshness.cache.clone();
-
-        // Handle export mode
-        if let Some(export_format) = &request.export {
+        // For SQLite export, use output_path if provided
+        let export_arg: Option<String> = if let Some(export_format) = &request.export {
             if export_format == "sqlite" {
-                use crate::sqlite_export::{default_export_path, SqliteExporter};
-                use std::path::Path;
-
-                let output_path = match &request.output_path {
-                    Some(p) => {
-                        let path = Path::new(p);
-                        if path.is_absolute() {
-                            path.to_path_buf()
-                        } else {
-                            repo_path.join(p)
-                        }
-                    }
-                    None => default_export_path(&cache),
-                };
-
-                let batch_size = request.batch_size.unwrap_or(5000).clamp(100, 50000);
-                let exporter = SqliteExporter::new().with_batch_size(batch_size);
-
-                return match exporter.export(&cache, &output_path, None) {
-                    Ok(stats) => {
-                        let mut output = String::new();
-                        output.push_str("_type: sqlite_export_result\n");
-                        output.push_str("status: \"success\"\n");
-                        output.push_str(&format!("output_path: \"{}\"\n", stats.output_path));
-                        output.push_str(&format!(
-                            "file_size_mb: {:.2}\n",
-                            stats.file_size_bytes as f64 / 1024.0 / 1024.0
-                        ));
-                        output.push_str(&format!("nodes_exported: {}\n", stats.nodes_inserted));
-                        output.push_str(&format!("edges_exported: {}\n", stats.edges_inserted));
-                        output
-                            .push_str(&format!("module_edges: {}\n", stats.module_edges_inserted));
-                        output.push_str(&format!("duration_ms: {}\n", stats.duration_ms));
-                        output.push_str("\nhint: \"Open with semfora-graph explorer or any SQLite client (DB Browser, DBeaver, sqlite3 CLI)\"\n");
-                        Ok(CallToolResult::success(vec![Content::text(output)]))
-                    }
-                    Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                        "Export failed: {}",
-                        e
-                    ))])),
-                };
+                // If output_path provided, pass it; otherwise CLI uses default
+                request.output_path.clone().or(Some("sqlite".to_string()))
             } else {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Unknown export format: '{}'. Supported: 'sqlite'",
-                    export_format
-                ))]));
+                Some(export_format.clone())
             }
-        }
+        } else {
+            None
+        };
 
-        let call_graph_path = cache.call_graph_path();
-        if !call_graph_path.exists() {
-            return Ok(CallToolResult::error(vec![Content::text(
-                "Call graph not found in index. The index may need to be regenerated.",
-            )]));
-        }
-
-        // Parse parameters
         let limit = request.limit.unwrap_or(500).min(2000) as usize;
         let offset = request.offset.unwrap_or(0) as usize;
-        let summary_only = request.summary_only.unwrap_or(false);
+        let stats_only = request.summary_only.unwrap_or(false);
 
-        // Build hash-to-name mapping for symbol resolution and display
-        let hash_to_name: std::collections::HashMap<String, String> = cache
-            .load_all_symbol_entries()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|e| (e.hash, e.symbol))
-            .collect();
-
-        // Resolve symbol filter to matching hashes
-        // This enables searching by name (e.g., "get_symbol") instead of just hash
-        let resolved_symbol_hashes: Option<std::collections::HashSet<String>> =
-            if let Some(symbol) = &request.symbol {
-                let symbol_lower = symbol.to_lowercase();
-
-                // Check if it looks like a hash (contains : with hex-like chars)
-                let is_hash_like = symbol.contains(':')
-                    && symbol.chars().all(|c| c.is_ascii_hexdigit() || c == ':');
-
-                if is_hash_like {
-                    // Direct hash lookup - include if it exists in our mapping
-                    if hash_to_name.contains_key(symbol) {
-                        Some(std::iter::once(symbol.clone()).collect())
-                    } else {
-                        // Hash not found, but still use it for filtering (might be external)
-                        Some(std::iter::once(symbol.clone()).collect())
-                    }
-                } else {
-                    // Search by name - first try exact match, then partial
-                    let exact_matches: std::collections::HashSet<String> = hash_to_name
-                        .iter()
-                        .filter(|(_, name)| name.to_lowercase() == symbol_lower)
-                        .map(|(hash, _)| hash.clone())
-                        .collect();
-
-                    if !exact_matches.is_empty() {
-                        Some(exact_matches)
-                    } else {
-                        // Fallback to partial/fuzzy match (BM25-style)
-                        let partial_matches: std::collections::HashSet<String> = hash_to_name
-                            .iter()
-                            .filter(|(_, name)| name.to_lowercase().contains(&symbol_lower))
-                            .map(|(hash, _)| hash.clone())
-                            .collect();
-
-                        if partial_matches.is_empty() {
-                            // No matches at all - we'll return helpful message later
-                            Some(std::collections::HashSet::new())
-                        } else {
-                            Some(partial_matches)
-                        }
-                    }
-                }
-            } else {
-                None
-            };
-
-        // If symbol filter was provided but resolved to empty set, suggest alternatives
-        if let Some(ref hashes) = resolved_symbol_hashes {
-            if hashes.is_empty() {
-                if let Some(symbol) = &request.symbol {
-                    // Find similar symbol names to suggest
-                    let symbol_lower = symbol.to_lowercase();
-                    let mut suggestions: Vec<(&String, usize)> = hash_to_name
-                        .values()
-                        .filter(|name| {
-                            let name_lower = name.to_lowercase();
-                            // Simple similarity: shared prefix or substring
-                            name_lower
-                                .starts_with(&symbol_lower[..symbol_lower.len().min(3).max(1)])
-                                || symbol_lower
-                                    .split('_')
-                                    .any(|part| name_lower.contains(part))
-                        })
-                        .map(|name| {
-                            (
-                                name,
-                                levenshtein_distance(&symbol_lower, &name.to_lowercase()),
-                            )
-                        })
-                        .collect();
-                    suggestions.sort_by_key(|(_, dist)| *dist);
-                    suggestions.truncate(5);
-
-                    let mut output = String::new();
-                    output.push_str("_type: call_graph\n");
-                    output.push_str(&format!("symbol_filter: \"{}\"\n", symbol));
-                    output.push_str("status: \"no_matches\"\n");
-                    output.push_str(&format!(
-                        "message: \"No symbol found matching '{}'\"\n\n",
-                        symbol
-                    ));
-
-                    if !suggestions.is_empty() {
-                        output.push_str("did_you_mean:\n");
-                        for (name, _) in suggestions {
-                            output.push_str(&format!("  - {}\n", name));
-                        }
-                    }
-
-                    return Ok(CallToolResult::success(vec![Content::text(output)]));
-                }
-            }
-        }
-
-        // Check file size - for large files (>10MB), require filter or default to summary
-        let file_size = fs::metadata(&call_graph_path).map(|m| m.len()).unwrap_or(0);
-        let is_large = file_size > 10 * 1024 * 1024; // 10MB threshold
-
-        if is_large && request.module.is_none() && request.symbol.is_none() && !summary_only {
-            // For large repos without filters, return summary with instructions
-            let file = match fs::File::open(&call_graph_path) {
-                Ok(f) => f,
-                Err(e) => {
-                    return Ok(CallToolResult::error(vec![Content::text(format!(
-                        "Failed to open call graph: {}",
-                        e
-                    ))]))
-                }
-            };
-
-            let reader = BufReader::new(file);
-            let mut total_edges = 0usize;
-            let mut total_callees = 0usize;
-            let mut top_callers: Vec<(String, usize)> = Vec::new();
-
-            for line in reader.lines().filter_map(|l| l.ok()) {
-                if line.starts_with("_type:")
-                    || line.starts_with("schema_version:")
-                    || line.starts_with("edges:")
-                {
-                    continue;
-                }
-                // Note: hash may contain colons (e.g., "locationHash:semanticHash"), so we find ": ["
-                if let Some(bracket_pos) = line.find(": [") {
-                    let caller = line[..bracket_pos].trim().to_string();
-                    let rest = line[bracket_pos + 2..].trim();
-                    if rest.starts_with('[') && rest.ends_with(']') {
-                        let inner = &rest[1..rest.len() - 1];
-                        let callee_count = if inner.is_empty() {
-                            0
-                        } else {
-                            inner.matches(',').count() + 1
-                        };
-                        total_edges += 1;
-                        total_callees += callee_count;
-
-                        // Track top callers (by callee count)
-                        if callee_count > 10 {
-                            top_callers.push((caller, callee_count));
-                        }
-                    }
-                }
-            }
-
-            // Sort and take top 20
-            top_callers.sort_by(|a, b| b.1.cmp(&a.1));
-            top_callers.truncate(20);
-
-            let mut output = String::new();
-            output.push_str("_type: call_graph_summary\n");
-            output.push_str(&format!("file_size: {} MB\n", file_size / 1024 / 1024));
-            output.push_str(&format!("total_callers: {}\n", total_edges));
-            output.push_str(&format!("total_call_edges: {}\n", total_callees));
-            output.push_str(&format!(
-                "avg_callees_per_caller: {:.1}\n\n",
-                total_callees as f64 / total_edges.max(1) as f64
-            ));
-
-            output.push_str("top_callers_by_fan_out:\n");
-            for (caller, count) in &top_callers {
-                output.push_str(&format!("  {} ({} callees)\n", caller, count));
-            }
-
-            output
-                .push_str("\n⚠️ Large call graph detected. Use filters to query specific parts:\n");
-            output.push_str("  - module: Filter by module name\n");
-            output.push_str("  - symbol: Filter by symbol name\n");
-            output.push_str("  - summary_only: true for statistics only\n");
-
-            return Ok(CallToolResult::success(vec![Content::text(output)]));
-        }
-
-        // Stream through file with filtering (for filtered queries or small files)
-        let file = match fs::File::open(&call_graph_path) {
-            Ok(f) => f,
-            Err(e) => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Failed to open call graph: {}",
-                    e
-                ))]))
-            }
+        let ctx = CommandContext {
+            format: OutputFormat::Toon,
+            verbose: false,
+            progress: false,
         };
 
-        let reader = BufReader::new(file);
-        let mut edges: Vec<(String, Vec<String>)> = Vec::new();
-        let mut total_edges = 0usize;
-        let mut skipped = 0usize;
-
-        for line in reader.lines().filter_map(|l| l.ok()) {
-            // Skip header lines
-            if line.starts_with("_type:")
-                || line.starts_with("schema_version:")
-                || line.starts_with("edges:")
-            {
-                continue;
-            }
-
-            // Parse edge
-            // Note: hash may contain colons (e.g., "locationHash:semanticHash"), so we find ": ["
-            if let Some(bracket_pos) = line.find(": [") {
-                let caller = line[..bracket_pos].trim();
-                let rest = line[bracket_pos + 2..].trim();
-
-                if rest.starts_with('[') && rest.ends_with(']') {
-                    total_edges += 1;
-
-                    let inner = &rest[1..rest.len() - 1];
-                    let callees: Vec<String> = inner
-                        .split(',')
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.trim().trim_matches('"').to_string())
-                        .collect();
-
-                    // Apply filters during streaming
-                    let matches_filter = {
-                        let mut matches = true;
-
-                        if let Some(module) = &request.module {
-                            let caller_matches = caller.contains(module.as_str());
-                            let callee_matches =
-                                callees.iter().any(|c| c.contains(module.as_str()));
-                            if !caller_matches && !callee_matches {
-                                matches = false;
-                            }
-                        }
-
-                        // Use resolved symbol hashes for filtering (supports name-based lookup)
-                        if matches {
-                            if let Some(ref resolved_hashes) = resolved_symbol_hashes {
-                                // Check if caller or any callee matches the resolved hashes
-                                let caller_matches = resolved_hashes.contains(caller);
-                                let callee_matches = callees.iter().any(|c| {
-                                    // Handle both internal hashes and external calls
-                                    resolved_hashes.contains(c.as_str())
-                                });
-                                if !caller_matches && !callee_matches {
-                                    matches = false;
-                                }
-                            }
-                        }
-
-                        matches
-                    };
-
-                    if matches_filter {
-                        // Handle offset
-                        if skipped < offset {
-                            skipped += 1;
-                            continue;
-                        }
-
-                        // Collect edges (for both summary and non-summary mode)
-                        if edges.len() < limit {
-                            edges.push((caller.to_string(), callees));
-                        }
-
-                        // Early exit if we have enough for non-summary mode
-                        // (summary mode will process all matching edges)
-                    }
-                }
-            }
-        }
-
-        let filtered_count = skipped + edges.len();
-
-        // Summary mode: return statistics only
-        if summary_only {
-            let output =
-                format_call_graph_summary(&edges, total_edges, edges.len(), Some(&hash_to_name));
-            return Ok(CallToolResult::success(vec![Content::text(output)]));
-        }
-
-        // Paginated output
-        let output = format_call_graph_paginated(
-            &edges,
-            total_edges,
-            filtered_count,
-            offset,
+        match run_get_callgraph(
+            Some(&repo_path),
+            request.module.as_deref(),
+            request.symbol.as_deref(),
+            export_arg.as_deref(),
+            stats_only,
             limit,
-            Some(&hash_to_name),
-        );
-        Ok(CallToolResult::success(vec![Content::text(output)]))
+            offset,
+            &ctx,
+        ) {
+            Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Failed to get call graph: {}",
+                e
+            ))])),
+        }
     }
 
     // ========================================================================
@@ -1242,133 +589,47 @@ impl McpDiffServer {
         &self,
         Parameters(request): Parameters<GetSourceRequest>,
     ) -> Result<CallToolResult, McpError> {
+        // DEDUP-306: Delegate to CLI run_get_source handler
+
+        let repo_path = self.get_working_dir().await;
+
+        // Convert batch hashes array to comma-separated string (CLI format)
+        let hash_str: Option<String> = if let Some(ref hashes) = request.hashes {
+            if !hashes.is_empty() {
+                Some(hashes.iter().take(20).cloned().collect::<Vec<_>>().join(","))
+            } else {
+                request.symbol_hash.clone()
+            }
+        } else {
+            request.symbol_hash.clone()
+        };
+
+        // For file mode, use file path as string
+        let file_str: Option<String> = request.file_path.clone();
+
         let context = request.context.unwrap_or(5);
 
-        // Batch mode: extract source for multiple symbols
-        if let Some(ref hashes) = request.hashes {
-            if !hashes.is_empty() {
-                let repo_path = self.get_working_dir().await;
-                let cache = match CacheDir::for_repo(&repo_path) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        return Ok(CallToolResult::error(vec![Content::text(format!(
-                            "Failed to access cache: {}",
-                            e
-                        ))]))
-                    }
-                };
+        let ctx = CommandContext {
+            format: OutputFormat::Toon,
+            verbose: false,
+            progress: false,
+        };
 
-                let hashes: Vec<&str> = hashes.iter().take(20).map(|s| s.as_str()).collect();
-
-                let mut output = String::new();
-                output.push_str("_type: batch_source\n");
-                output.push_str(&format!("requested: {}\n", hashes.len()));
-
-                let mut found = 0;
-                let mut not_found: Vec<&str> = Vec::new();
-
-                for hash in &hashes {
-                    let symbol_path = cache.symbol_path(hash);
-                    if symbol_path.exists() {
-                        if let Ok(symbol_content) = fs::read_to_string(&symbol_path) {
-                            if let Some(source_snippet) =
-                                extract_source_for_symbol(&cache, &symbol_content, context)
-                            {
-                                output.push_str(&format!("\n--- {} ---\n", hash));
-                                output.push_str(&source_snippet);
-                                found += 1;
-                            } else {
-                                not_found.push(hash);
-                            }
-                        } else {
-                            not_found.push(hash);
-                        }
-                    } else {
-                        not_found.push(hash);
-                    }
-                }
-
-                output.push_str(&format!("\n_summary:\n  found: {}\n", found));
-                if !not_found.is_empty() {
-                    output.push_str(&format!("  not_found: {}\n", not_found.join(",")));
-                }
-
-                return Ok(CallToolResult::success(vec![Content::text(output)]));
-            }
+        match run_get_source(
+            Some(&repo_path),
+            file_str.as_deref(),
+            request.start_line,
+            request.end_line,
+            hash_str.as_deref(),
+            context,
+            &ctx,
+        ) {
+            Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Failed to get source: {}",
+                e
+            ))])),
         }
-
-        // Single hash mode
-        if let Some(ref hash) = request.symbol_hash {
-            let repo_path = self.get_working_dir().await;
-            let cache = match CacheDir::for_repo(&repo_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    return Ok(CallToolResult::error(vec![Content::text(format!(
-                        "Failed to access cache: {}",
-                        e
-                    ))]))
-                }
-            };
-
-            let symbol_path = cache.symbol_path(hash);
-            if !symbol_path.exists() {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Symbol {} not found in index",
-                    hash
-                ))]));
-            }
-
-            let symbol_content = match fs::read_to_string(&symbol_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    return Ok(CallToolResult::error(vec![Content::text(format!(
-                        "Failed to read symbol: {}",
-                        e
-                    ))]))
-                }
-            };
-
-            return match extract_source_for_symbol(&cache, &symbol_content, context) {
-                Some(source) => Ok(CallToolResult::success(vec![Content::text(source)])),
-                None => Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Could not extract source for symbol {}",
-                    hash
-                ))])),
-            };
-        }
-
-        // File+lines mode (requires file_path)
-        let file_path = match &request.file_path {
-            Some(p) => self.resolve_path(p).await,
-            None => {
-                return Ok(CallToolResult::error(vec![Content::text(
-                    "Either file_path, symbol_hash, or hashes must be provided",
-                )]))
-            }
-        };
-
-        let (start_line, end_line) = match (request.start_line, request.end_line) {
-            (Some(s), Some(e)) => (s, e),
-            _ => {
-                return Ok(CallToolResult::error(vec![Content::text(
-                    "Both start_line and end_line are required for file+lines mode",
-                )]))
-            }
-        };
-
-        let source = match fs::read_to_string(&file_path) {
-            Ok(s) => s,
-            Err(e) => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Failed to read file {}: {}",
-                    file_path.display(),
-                    e
-                ))]))
-            }
-        };
-
-        let output = format_source_snippet(&file_path, &source, start_line, end_line, context);
-        Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
     // ========================================================================
@@ -1455,163 +716,45 @@ impl McpDiffServer {
         &self,
         Parameters(request): Parameters<ValidateRequest>,
     ) -> Result<CallToolResult, McpError> {
+        // Resolve working directory
         let repo_path = match &request.path {
             Some(p) => self.resolve_path(p).await,
             None => self.get_working_dir().await,
         };
 
-        let cache = match CacheDir::for_repo(&repo_path) {
-            Ok(c) => c,
-            Err(e) => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Failed to access cache: {}",
-                    e
-                ))]))
-            }
+        // Build CLI args from MCP request (DEDUP-304)
+        let args = ValidateArgs {
+            target: None,
+            path: Some(repo_path),
+            symbol_hash: request.symbol_hash.clone(),
+            file_path: request.file_path.clone(),
+            line: request.line,
+            module: request.module.clone(),
+            include_source: request.include_source.unwrap_or(false),
+            duplicates: false,
+            threshold: request.duplicate_threshold.unwrap_or(0.85),
+            include_boilerplate: false,
+            kind: request.kind.clone(),
+            limit: request.limit.unwrap_or(100),
+            offset: 0,
+            min_lines: 3,
+            sort_by: "similarity".to_string(),
         };
 
-        if !cache.exists() {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "No index found for {}. Run index tool first.",
-                repo_path.display()
-            ))]));
+        let ctx = CommandContext {
+            format: OutputFormat::Toon,
+            verbose: false,
+            progress: false,
+        };
+
+        // Delegate to CLI handler
+        match run_validate(&args, &ctx) {
+            Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Validation failed: {}",
+                e
+            ))])),
         }
-
-        let threshold = request.duplicate_threshold.unwrap_or(0.85);
-
-        // Scope detection (in order of priority):
-        // 1. symbol_hash → single symbol validation
-        // 2. file_path + line → single symbol at location
-        // 3. file_path only → file-level validation
-        // 4. module → module-level validation
-
-        if let Some(ref hash) = request.symbol_hash {
-            // Single symbol by hash
-            let symbol_entry = match find_symbol_by_hash(&cache, hash) {
-                Ok(entry) => entry,
-                Err(e) => return Ok(CallToolResult::error(vec![Content::text(e)])),
-            };
-
-            let result = validate_single_symbol(&cache, &symbol_entry, threshold);
-            let mut output = format_validation_result(&result);
-
-            if request.include_source.unwrap_or(false) {
-                if let Some(source) =
-                    get_symbol_source_snippet(&cache, &symbol_entry.file, &symbol_entry.lines, 2)
-                {
-                    output.push_str("\n__source__:\n");
-                    output.push_str(&source);
-                }
-            }
-
-            return Ok(CallToolResult::success(vec![Content::text(output)]));
-        }
-
-        if let Some(ref file_path) = request.file_path {
-            if let Some(line) = request.line {
-                // Single symbol by file + line
-                let symbol_entry = match find_symbol_by_location(&cache, file_path, line) {
-                    Ok(entry) => entry,
-                    Err(e) => return Ok(CallToolResult::error(vec![Content::text(e)])),
-                };
-
-                let result = validate_single_symbol(&cache, &symbol_entry, threshold);
-                let mut output = format_validation_result(&result);
-
-                if request.include_source.unwrap_or(false) {
-                    if let Some(source) = get_symbol_source_snippet(
-                        &cache,
-                        &symbol_entry.file,
-                        &symbol_entry.lines,
-                        2,
-                    ) {
-                        output.push_str("\n__source__:\n");
-                        output.push_str(&source);
-                    }
-                }
-
-                return Ok(CallToolResult::success(vec![Content::text(output)]));
-            }
-
-            // File-level validation (all symbols in file)
-            let all_entries = match cache.load_all_symbol_entries() {
-                Ok(e) => e,
-                Err(e) => {
-                    return Ok(CallToolResult::error(vec![Content::text(format!(
-                        "Failed to load symbol index: {}",
-                        e
-                    ))]))
-                }
-            };
-
-            let mut entries: Vec<_> = all_entries
-                .into_iter()
-                .filter(|e| e.file.ends_with(file_path) || file_path.ends_with(&e.file))
-                .collect();
-
-            if let Some(ref kind) = request.kind {
-                let normalized = normalize_kind(kind);
-                entries.retain(|e| e.kind.eq_ignore_ascii_case(normalized));
-            }
-
-            if entries.is_empty() {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "No symbols found in file: {}",
-                    file_path
-                ))]));
-            }
-
-            let results = validate_symbols_batch(&cache, &entries, threshold);
-            let output = format_batch_validation_results(&results, file_path);
-
-            return Ok(CallToolResult::success(vec![Content::text(output)]));
-        }
-
-        if let Some(ref module_name) = request.module {
-            // Module-level validation
-            let all_entries = match cache.load_all_symbol_entries() {
-                Ok(e) => e,
-                Err(e) => {
-                    return Ok(CallToolResult::error(vec![Content::text(format!(
-                        "Failed to load symbol index: {}",
-                        e
-                    ))]))
-                }
-            };
-
-            let mut entries: Vec<_> = all_entries
-                .into_iter()
-                .filter(|e| {
-                    e.module.eq_ignore_ascii_case(module_name) || e.module.ends_with(module_name)
-                })
-                .collect();
-
-            if let Some(ref kind) = request.kind {
-                let normalized = normalize_kind(kind);
-                entries.retain(|e| e.kind.eq_ignore_ascii_case(normalized));
-            }
-
-            let limit = request.limit.unwrap_or(100).min(500);
-            entries.truncate(limit);
-
-            if entries.is_empty() {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "No symbols found in module: {}",
-                    module_name
-                ))]));
-            }
-
-            let results = validate_symbols_batch(&cache, &entries, threshold);
-            let output =
-                format_batch_validation_results(&results, &format!("module:{}", module_name));
-
-            return Ok(CallToolResult::success(vec![Content::text(output)]));
-        }
-
-        // No valid scope provided
-        Ok(CallToolResult::error(vec![Content::text(
-            "Must provide one of: symbol_hash, file_path (with optional line), or module",
-        )]))
     }
 
     /// Unified index handler - smart refresh by default.
@@ -1874,134 +1017,44 @@ Output is token-optimized: duplicates are grouped by module with counts and simi
         &self,
         Parameters(request): Parameters<FindDuplicatesRequest>,
     ) -> Result<CallToolResult, McpError> {
+        // DEDUP-307: Delegate to CLI run_duplicates handler
+
         let repo_path = match &request.path {
             Some(p) => self.resolve_path(p).await,
             None => self.get_working_dir().await,
         };
 
-        let cache = match CacheDir::for_repo(&repo_path) {
-            Ok(c) => c,
-            Err(e) => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Failed to access cache: {}",
-                    e
-                ))]))
-            }
-        };
-
-        // Load signatures from index
-        let signatures = match load_signatures(&cache) {
-            Ok(sigs) => sigs,
-            Err(e) => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Failed to load signature index: {}. Run generate_index first.",
-                    e
-                ))]))
-            }
-        };
-
-        if signatures.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
-                "_type: duplicate_results\nclusters: 0\nmessage: No function signatures found in index.\n"
-            )]));
-        }
-
         let threshold = request.threshold.unwrap_or(0.90);
-
-        // Single symbol mode: check specific symbol for duplicates
-        if let Some(symbol_hash) = &request.symbol_hash {
-            let target = match signatures.iter().find(|s| &s.symbol_hash == symbol_hash) {
-                Some(sig) => sig,
-                None => {
-                    return Ok(CallToolResult::error(vec![Content::text(format!(
-                        "Symbol {} not found in signature index.",
-                        symbol_hash
-                    ))]))
-                }
-            };
-
-            let detector = DuplicateDetector::new(threshold);
-            let matches = detector.find_duplicates(target, &signatures);
-            let output = format_duplicate_matches(&target.name, &target.file, &matches, threshold);
-            return Ok(CallToolResult::success(vec![Content::text(output)]));
-        }
-
-        // Codebase scan mode: find all duplicate clusters
         let exclude_boilerplate = request.exclude_boilerplate.unwrap_or(true);
         let min_lines = request.min_lines.unwrap_or(3) as usize;
         let limit = request.limit.unwrap_or(50).min(200) as usize;
         let offset = request.offset.unwrap_or(0) as usize;
         let sort_by = request.sort_by.as_deref().unwrap_or("similarity");
 
-        let detector =
-            DuplicateDetector::new(threshold).with_boilerplate_exclusion(exclude_boilerplate);
+        let ctx = CommandContext {
+            format: OutputFormat::Toon,
+            verbose: false,
+            progress: false,
+        };
 
-        // Filter by module and min_lines
-        let filtered_sigs: Vec<_> = signatures
-            .iter()
-            .filter(|s| {
-                // Apply module filter
-                if let Some(module) = &request.module {
-                    if !s.file.contains(module) {
-                        return false;
-                    }
-                }
-                // Apply min_lines filter
-                s.line_count >= min_lines
-            })
-            .cloned()
-            .collect();
-
-        // Find all clusters
-        let mut clusters = detector.find_all_clusters(&filtered_sigs);
-        let total_clusters = clusters.len();
-
-        // Sort clusters by specified criteria
-        match sort_by {
-            "size" => {
-                // Sort by primary function size (lines), largest first
-                clusters.sort_by(|a, b| {
-                    let a_size = a.primary.end_line.saturating_sub(a.primary.start_line);
-                    let b_size = b.primary.end_line.saturating_sub(b.primary.start_line);
-                    b_size.cmp(&a_size)
-                });
-            }
-            "count" => {
-                // Sort by number of duplicates, most first
-                clusters.sort_by(|a, b| b.duplicates.len().cmp(&a.duplicates.len()));
-            }
-            _ => {
-                // Default: sort by highest similarity in cluster
-                clusters.sort_by(|a, b| {
-                    let a_max = a
-                        .duplicates
-                        .iter()
-                        .map(|d| d.similarity)
-                        .fold(0.0_f64, f64::max);
-                    let b_max = b
-                        .duplicates
-                        .iter()
-                        .map(|d| d.similarity)
-                        .fold(0.0_f64, f64::max);
-                    b_max
-                        .partial_cmp(&a_max)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-            }
-        }
-
-        // Apply pagination
-        let paginated: Vec<_> = clusters.into_iter().skip(offset).take(limit).collect();
-
-        let output = format_duplicate_clusters_paginated(
-            &paginated,
+        match run_duplicates(
+            Some(&repo_path),
+            request.symbol_hash.as_deref(),
             threshold,
-            total_clusters,
-            offset,
-            limit,
+            request.module.as_deref(),
+            exclude_boilerplate,
+            min_lines,
             sort_by,
-        );
-        Ok(CallToolResult::success(vec![Content::text(output)]))
+            limit,
+            offset,
+            &ctx,
+        ) {
+            Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Failed to find duplicates: {}",
+                e
+            ))])),
+        }
     }
 
     // ========================================================================
@@ -2015,29 +1068,15 @@ Output is token-optimized: duplicates are grouped by module with counts and simi
         &self,
         Parameters(request): Parameters<PrepCommitRequest>,
     ) -> Result<CallToolResult, McpError> {
-        use crate::git::{get_current_branch, get_last_commit, get_remote_url};
-        use std::process::Command; // For diff stats
+        // DEDUP-305: Delegate to CLI run_commit handler
 
         let repo_path = match &request.path {
             Some(p) => self.resolve_path(p).await,
             None => self.get_working_dir().await,
         };
 
-        // Verify it's a git repo
-        if !crate::git::is_git_repo(Some(&repo_path)) {
-            return Ok(CallToolResult::error(vec![Content::text(
-                "Not a git repository",
-            )]));
-        }
-
-        // Extract options with defaults
-        let include_complexity = request.include_complexity.unwrap_or(false);
-        let include_all_metrics = request.include_all_metrics.unwrap_or(false);
-        let staged_only = request.staged_only.unwrap_or(false);
+        // MCP-specific: Auto-refresh index if requested (async operation)
         let auto_refresh = request.auto_refresh_index.unwrap_or(true);
-        let show_diff_stats = request.show_diff_stats.unwrap_or(true);
-
-        // Auto-refresh index if requested
         if auto_refresh {
             if let Ok(cache) = CacheDir::for_repo(&repo_path) {
                 if cache.exists() {
@@ -2050,264 +1089,31 @@ Output is token-optimized: duplicates are grouped by module with counts and simi
             }
         }
 
-        // Get git context (DEDUP-104: uses shared git module)
-        let branch = get_current_branch(Some(&repo_path)).unwrap_or_else(|_| "unknown".to_string());
-        let remote = get_remote_url(None, Some(&repo_path));
-        let (last_commit_hash, last_commit_message) = get_last_commit(Some(&repo_path))
-            .map(|c| (Some(c.short_sha), Some(c.subject)))
-            .unwrap_or((None, None));
-
-        let git_context = GitContext {
-            branch,
-            remote,
-            last_commit_hash,
-            last_commit_message,
+        // Build CLI args from MCP request
+        let args = CommitArgs {
+            path: Some(repo_path),
+            staged: request.staged_only.unwrap_or(false),
+            metrics: request.include_complexity.unwrap_or(false),
+            all_metrics: request.include_all_metrics.unwrap_or(false),
+            no_auto_refresh: true, // Already handled above
+            no_diff_stats: !request.show_diff_stats.unwrap_or(true),
         };
 
-        // Get staged changes
-        let staged_changes = match crate::git::get_staged_changes(Some(&repo_path)) {
-            Ok(files) => files,
-            Err(e) => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Failed to get staged changes: {}",
-                    e
-                ))]))
-            }
+        // Create command context (MCP uses TOON format)
+        let ctx = CommandContext {
+            format: OutputFormat::Toon,
+            verbose: false,
+            progress: false,
         };
 
-        // Get unstaged changes (unless staged_only)
-        let unstaged_changes = if staged_only {
-            Vec::new()
-        } else {
-            match crate::git::get_unstaged_changes(Some(&repo_path)) {
-                Ok(files) => files,
-                Err(e) => {
-                    return Ok(CallToolResult::error(vec![Content::text(format!(
-                        "Failed to get unstaged changes: {}",
-                        e
-                    ))]))
-                }
-            }
-        };
-
-        // If no changes at all, return early
-        if staged_changes.is_empty() && unstaged_changes.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
-                "_type: prep_commit\n_note: No changes to commit.\n\nstaged_changes: (none)\nunstaged_changes: (none)\n"
-            )]));
+        // Delegate to CLI handler
+        match run_commit(&args, &ctx) {
+            Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Commit preparation failed: {}",
+                e
+            ))])),
         }
-
-        // Helper to analyze a list of changed files
-        let analyze_files_list = |changes: &[crate::git::ChangedFile]| -> Vec<AnalyzedFile> {
-            changes
-                .iter()
-                .map(|changed_file| {
-                    let file_path = repo_path.join(&changed_file.path);
-                    let change_type_str = format!("{:?}", changed_file.change_type);
-
-                    // Get diff stats if requested
-                    let diff_stats = if show_diff_stats {
-                        // Get diff stats for this specific file
-                        let stat_output = Command::new("git")
-                            .args(["diff", "--numstat", "--cached", "--", &changed_file.path])
-                            .current_dir(&repo_path)
-                            .output()
-                            .ok()
-                            .filter(|o| o.status.success())
-                            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-
-                        // If no cached stat, try unstaged
-                        let stat_output = stat_output.or_else(|| {
-                            Command::new("git")
-                                .args(["diff", "--numstat", "--", &changed_file.path])
-                                .current_dir(&repo_path)
-                                .output()
-                                .ok()
-                                .filter(|o| o.status.success())
-                                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                        });
-
-                        stat_output.and_then(|stat| {
-                            let parts: Vec<&str> = stat.split_whitespace().collect();
-                            if parts.len() >= 2 {
-                                let insertions = parts[0].parse().unwrap_or(0);
-                                let deletions = parts[1].parse().unwrap_or(0);
-                                Some(FileDiffStats {
-                                    insertions,
-                                    deletions,
-                                })
-                            } else {
-                                None
-                            }
-                        })
-                    } else {
-                        None
-                    };
-
-                    // Skip deleted files - they have no symbols
-                    if matches!(changed_file.change_type, crate::git::ChangeType::Deleted) {
-                        return AnalyzedFile {
-                            path: changed_file.path.clone(),
-                            change_type: change_type_str,
-                            diff_stats,
-                            symbols: Vec::new(),
-                            error: Some("file deleted".to_string()),
-                        };
-                    }
-
-                    // Check if file exists
-                    if !file_path.exists() {
-                        return AnalyzedFile {
-                            path: changed_file.path.clone(),
-                            change_type: change_type_str,
-                            diff_stats,
-                            symbols: Vec::new(),
-                            error: Some("file not found".to_string()),
-                        };
-                    }
-
-                    // Check if it's a supported language
-                    let lang = match Lang::from_path(&file_path) {
-                        Ok(l) => l,
-                        Err(_) => {
-                            return AnalyzedFile {
-                                path: changed_file.path.clone(),
-                                change_type: change_type_str,
-                                diff_stats,
-                                symbols: Vec::new(),
-                                error: Some("unsupported language".to_string()),
-                            };
-                        }
-                    };
-
-                    // Parse and extract symbols
-                    let source = match fs::read_to_string(&file_path) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            return AnalyzedFile {
-                                path: changed_file.path.clone(),
-                                change_type: change_type_str,
-                                diff_stats,
-                                symbols: Vec::new(),
-                                error: Some(format!("read error: {}", e)),
-                            };
-                        }
-                    };
-
-                    let summary = match parse_and_extract(&file_path, &source, lang) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            return AnalyzedFile {
-                                path: changed_file.path.clone(),
-                                change_type: change_type_str,
-                                diff_stats,
-                                symbols: Vec::new(),
-                                error: Some(format!("parse error: {}", e)),
-                            };
-                        }
-                    };
-
-                    // Create a single symbol entry for the file-level summary
-                    let lines = format!(
-                        "{}-{}",
-                        summary.start_line.unwrap_or(1),
-                        summary.end_line.unwrap_or(1)
-                    );
-
-                    let (
-                        cognitive,
-                        cyclomatic,
-                        max_nesting,
-                        fan_out,
-                        loc,
-                        state_mutations,
-                        io_operations,
-                    ) = if include_complexity || include_all_metrics {
-                        // Pass 0 for fan_in since we don't have call graph data
-                        let complexity =
-                            crate::analysis::symbol_complexity_from_summary(&summary, 0);
-                        (
-                            Some(complexity.cognitive as usize),
-                            Some(complexity.cyclomatic as usize),
-                            Some(complexity.max_nesting as usize),
-                            if include_all_metrics {
-                                Some(complexity.fan_out as usize)
-                            } else {
-                                None
-                            },
-                            if include_all_metrics {
-                                Some(complexity.loc as usize)
-                            } else {
-                                None
-                            },
-                            if include_all_metrics {
-                                Some(complexity.state_mutations as usize)
-                            } else {
-                                None
-                            },
-                            if include_all_metrics {
-                                Some(complexity.io_operations as usize)
-                            } else {
-                                None
-                            },
-                        )
-                    } else {
-                        (None, None, None, None, None, None, None)
-                    };
-
-                    // Get symbol name and kind from the summary
-                    let symbol_name = summary.symbol.clone().unwrap_or_else(|| {
-                        // Use file stem as fallback name
-                        std::path::Path::new(&changed_file.path)
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("unknown")
-                            .to_string()
-                    });
-                    let symbol_kind = summary
-                        .symbol_kind
-                        .map(|k| format!("{:?}", k).to_lowercase())
-                        .unwrap_or_else(|| "file".to_string());
-
-                    let symbols = vec![SymbolMetrics {
-                        name: symbol_name,
-                        kind: symbol_kind,
-                        lines,
-                        cognitive,
-                        cyclomatic,
-                        max_nesting,
-                        fan_out,
-                        loc,
-                        state_mutations,
-                        io_operations,
-                    }];
-
-                    AnalyzedFile {
-                        path: changed_file.path.clone(),
-                        change_type: change_type_str,
-                        diff_stats,
-                        symbols,
-                        error: None,
-                    }
-                })
-                .collect()
-        };
-
-        // Analyze staged and unstaged files
-        let staged_files = analyze_files_list(&staged_changes);
-        let unstaged_files = analyze_files_list(&unstaged_changes);
-
-        // Format output
-        let output = format_prep_commit(
-            &git_context,
-            &staged_files,
-            &unstaged_files,
-            include_complexity,
-            include_all_metrics,
-            show_diff_stats,
-        );
-
-        Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
     #[tool(
@@ -2317,6 +1123,9 @@ Output is token-optimized: duplicates are grouped by module with counts and simi
         &self,
         Parameters(request): Parameters<GetFileRequest>,
     ) -> Result<CallToolResult, McpError> {
+        // DEDUP-306: Delegate file mode to CLI run_file_symbols handler
+        // Module mode uses MCP-specific formatting helpers
+
         // Validate mutually exclusive parameters
         match (&request.file_path, &request.module) {
             (Some(_), Some(_)) => {
@@ -2337,7 +1146,7 @@ Output is token-optimized: duplicates are grouped by module with counts and simi
             None => self.get_working_dir().await,
         };
 
-        // Module mode: list symbols in a module
+        // Module mode: list symbols in a module (uses MCP-specific formatting)
         if let Some(module) = &request.module {
             let freshness = match self.ensure_index(&repo_path).await {
                 Ok(r) => r,
@@ -2366,94 +1175,32 @@ Output is token-optimized: duplicates are grouped by module with counts and simi
             return Ok(CallToolResult::success(vec![Content::text(output)]));
         }
 
-        // File mode: get symbols in a specific file
+        // File mode: delegate to CLI run_file_symbols handler
         let file_path = request.file_path.as_ref().unwrap();
-
-        let cache = match CacheDir::for_repo(&repo_path) {
-            Ok(c) => c,
-            Err(e) => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Failed to access cache: {}",
-                    e
-                ))]))
-            }
-        };
-
-        if !cache.exists() {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "No sharded index found for {}. Run generate_index first.",
-                repo_path.display()
-            ))]));
-        }
-
         let include_source = request.include_source.unwrap_or(false);
         let context = request.context.unwrap_or(2);
 
-        // Normalize the file path for matching
-        let target_file = file_path.trim_start_matches("./");
-
-        // Search the symbol index for symbols in this file
-        let symbols: Vec<_> = match cache.load_all_symbol_entries() {
-            Ok(all) => all
-                .into_iter()
-                .filter(|e| {
-                    let entry_file = e.file.trim_start_matches("./");
-                    entry_file == target_file
-                        || entry_file.ends_with(target_file)
-                        || target_file.ends_with(entry_file)
-                })
-                .filter(|e| {
-                    request
-                        .kind
-                        .as_ref()
-                        .map_or(true, |k| e.kind == normalize_kind(k))
-                })
-                .collect(),
-            Err(e) => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Failed to load symbol index: {}",
-                    e
-                ))]))
-            }
+        let ctx = CommandContext {
+            format: OutputFormat::Toon,
+            verbose: false,
+            progress: false,
         };
 
-        if symbols.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "_type: file_symbols\nfile: \"{}\"\nshowing: 0\nsymbols: (none)\nhint: File may not be indexed or path doesn't match.\n",
-                file_path
-            ))]));
+        match run_file_symbols(
+            Some(&repo_path),
+            file_path,
+            include_source,
+            request.kind.as_deref(),
+            request.risk.as_deref(),
+            context,
+            &ctx,
+        ) {
+            Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Failed to get file symbols: {}",
+                e
+            ))])),
         }
-
-        let mut output = String::new();
-        output.push_str("_type: file_symbols\n");
-        output.push_str(&format!("file: \"{}\"\n", file_path));
-        output.push_str(&format!("showing: {}\n", symbols.len()));
-        output.push_str(&format!(
-            "symbols[{}]{{name,hash,kind,lines,risk}}:\n",
-            symbols.len()
-        ));
-
-        for entry in &symbols {
-            output.push_str(&format!(
-                "  {},{},{},{},{}\n",
-                entry.symbol, entry.hash, entry.kind, entry.lines, entry.risk
-            ));
-        }
-
-        // Include source for each symbol if requested
-        if include_source && !symbols.is_empty() {
-            output.push_str("\n__sources__:\n");
-            for entry in &symbols {
-                if let Some(source) =
-                    get_symbol_source_snippet(&cache, &entry.file, &entry.lines, context)
-                {
-                    output.push_str(&format!("\n--- {} ({}) ---\n", entry.symbol, entry.lines));
-                    output.push_str(&source);
-                }
-            }
-        }
-
-        Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
     #[tool(
@@ -2463,210 +1210,33 @@ Output is token-optimized: duplicates are grouped by module with counts and simi
         &self,
         Parameters(request): Parameters<GetCallersRequest>,
     ) -> Result<CallToolResult, McpError> {
+        // DEDUP-306: Delegate to CLI run_get_callers handler
+
         let repo_path = match &request.path {
             Some(p) => self.resolve_path(p).await,
             None => self.get_working_dir().await,
         };
 
-        let cache = match CacheDir::for_repo(&repo_path) {
-            Ok(c) => c,
-            Err(e) => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Failed to access cache: {}",
-                    e
-                ))]))
-            }
-        };
-
-        if !cache.exists() {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "No sharded index found for {}. Run generate_index first.",
-                repo_path.display()
-            ))]));
-        }
-
         let depth = request.depth.unwrap_or(1).min(3);
         let limit = request.limit.unwrap_or(20).min(50);
         let include_source = request.include_source.unwrap_or(false);
 
-        // Load call graph
-        let call_graph_path = cache.call_graph_path();
-        if !call_graph_path.exists() {
-            return Ok(CallToolResult::error(vec![Content::text(
-                "Call graph not found. Run generate_index to create it.",
-            )]));
-        }
-
-        let content = match fs::read_to_string(&call_graph_path) {
-            Ok(c) => c,
-            Err(e) => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Failed to read call graph: {}",
-                    e
-                ))]))
-            }
+        // Create command context (MCP uses TOON format)
+        let ctx = CommandContext {
+            format: OutputFormat::Toon,
+            verbose: false,
+            progress: false,
         };
 
-        // Build reverse call graph (callee -> callers)
-        let mut reverse_graph: std::collections::HashMap<String, Vec<String>> =
-            std::collections::HashMap::new();
-        let mut symbol_names: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-
-        for line in content.lines() {
-            if line.starts_with("_type:")
-                || line.starts_with("schema_version:")
-                || line.starts_with("edges:")
-            {
-                continue;
-            }
-            // Find ": [" pattern - the colon before the call list
-            // Hash format is "file_hash:semantic_hash", so we can't use simple find(':')
-            if let Some(bracket_pos) = line.find(": [") {
-                let caller = line[..bracket_pos].trim().to_string();
-                let rest = line[bracket_pos + 2..].trim();
-                if rest.starts_with('[') && rest.ends_with(']') {
-                    let inner = &rest[1..rest.len() - 1];
-                    for callee in inner.split(',').filter(|s| !s.is_empty()) {
-                        let callee = callee.trim().trim_matches('"').to_string();
-                        // Skip external calls
-                        if !callee.starts_with("ext:") {
-                            reverse_graph
-                                .entry(callee.clone())
-                                .or_default()
-                                .push(caller.clone());
-                        }
-                    }
-                }
-            }
+        // Delegate to CLI handler
+        match run_get_callers(Some(&repo_path), &request.symbol_hash, depth, include_source, limit, &ctx) {
+            Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Failed to get callers: {}",
+                e
+            ))])),
         }
-
-        // Load symbol index for name resolution
-        if let Ok(entries) = cache.load_all_symbol_entries() {
-            for entry in entries {
-                symbol_names.insert(entry.hash.clone(), entry.symbol.clone());
-            }
-        }
-
-        // Find callers at each depth level
-        let target_hash = &request.symbol_hash;
-        let target_name = symbol_names
-            .get(target_hash)
-            .cloned()
-            .unwrap_or_else(|| target_hash.clone());
-
-        let mut all_callers: Vec<(String, String, usize)> = Vec::new(); // (hash, name, depth)
-        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut current_level: Vec<String> = vec![target_hash.clone()];
-
-        for current_depth in 1..=depth {
-            let mut next_level: Vec<String> = Vec::new();
-
-            for hash in &current_level {
-                if let Some(callers) = reverse_graph.get(hash) {
-                    for caller_hash in callers {
-                        if !visited.contains(caller_hash) && all_callers.len() < limit {
-                            visited.insert(caller_hash.clone());
-                            let caller_name = symbol_names
-                                .get(caller_hash)
-                                .cloned()
-                                .unwrap_or_else(|| caller_hash.clone());
-                            all_callers.push((caller_hash.clone(), caller_name, current_depth));
-                            next_level.push(caller_hash.clone());
-                        }
-                    }
-                }
-            }
-
-            current_level = next_level;
-            if current_level.is_empty() {
-                break;
-            }
-        }
-
-        // Format output
-        let mut output = String::new();
-        output.push_str("_type: callers\n");
-        output.push_str(&format!("target: {} ({})\n", target_name, target_hash));
-        output.push_str(&format!("depth: {}\n", depth));
-        output.push_str(&format!("total_callers: {}\n", all_callers.len()));
-
-        if all_callers.is_empty() {
-            output.push_str("callers: (none - this may be an entry point or unused)\n");
-        } else {
-            output.push_str(&format!(
-                "callers[{}]{{name,hash,depth}}:\n",
-                all_callers.len()
-            ));
-            for (hash, name, d) in &all_callers {
-                output.push_str(&format!("  {},{},{}\n", name, hash, d));
-            }
-
-            // Include source snippets if requested
-            if include_source {
-                output.push_str("\n__caller_sources__:\n");
-                for (hash, name, _) in all_callers.iter().take(5) {
-                    // Get symbol info to find file/lines
-                    let symbol_path = cache.symbol_path(hash);
-                    if symbol_path.exists() {
-                        if let Ok(content) = fs::read_to_string(&symbol_path) {
-                            let mut file: Option<String> = None;
-                            let mut lines: Option<String> = None;
-                            for line in content.lines() {
-                                let trimmed = line.trim();
-                                if trimmed.starts_with("file:") {
-                                    file = Some(
-                                        trimmed
-                                            .trim_start_matches("file:")
-                                            .trim()
-                                            .trim_matches('"')
-                                            .to_string(),
-                                    );
-                                } else if trimmed.starts_with("lines:") {
-                                    lines = Some(
-                                        trimmed
-                                            .trim_start_matches("lines:")
-                                            .trim()
-                                            .trim_matches('"')
-                                            .to_string(),
-                                    );
-                                }
-                            }
-                            if let (Some(f), Some(l)) = (file, lines) {
-                                if let Some(source) = get_symbol_source_snippet(&cache, &f, &l, 2) {
-                                    output.push_str(&format!("\n--- {} ({}) ---\n", name, l));
-                                    output.push_str(&source);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(CallToolResult::success(vec![Content::text(output)]))
     }
-}
-
-/// Get source snippet for a symbol given file and line range
-fn get_symbol_source_snippet(
-    cache: &CacheDir,
-    file: &str,
-    lines: &str,
-    context: usize,
-) -> Option<String> {
-    let (start_line, end_line) = if let Some((s, e)) = lines.split_once('-') {
-        (s.parse::<usize>().ok()?, e.parse::<usize>().ok()?)
-    } else {
-        return None;
-    };
-
-    let full_path = cache.repo_root.join(file);
-    let source = fs::read_to_string(&full_path).ok()?;
-
-    Some(format_source_snippet(
-        &full_path, &source, start_line, end_line, context,
-    ))
 }
 
 /// Format test results as compact TOON output

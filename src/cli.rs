@@ -116,6 +116,18 @@ pub struct AnalyzeArgs {
     #[arg(long, value_name = "BRANCH")]
     pub base: Option<String>,
 
+    /// Target ref to compare against (defaults to HEAD, use WORKING for uncommitted)
+    #[arg(long, value_name = "REF")]
+    pub target_ref: Option<String>,
+
+    /// Maximum number of files to show in diff output (pagination)
+    #[arg(long, value_name = "N")]
+    pub limit: Option<usize>,
+
+    /// Offset for diff pagination (skip first N files)
+    #[arg(long, value_name = "N")]
+    pub offset: Option<usize>,
+
     /// Maximum directory depth for recursive scan (default: 10)
     #[arg(long, default_value = "10")]
     pub max_depth: usize,
@@ -131,6 +143,18 @@ pub struct AnalyzeArgs {
     /// Show summary statistics only (no per-file details)
     #[arg(long)]
     pub summary_only: bool,
+
+    /// Start line for focused analysis (file mode only)
+    #[arg(long, value_name = "LINE")]
+    pub start_line: Option<usize>,
+
+    /// End line for focused analysis (file mode only)
+    #[arg(long, value_name = "LINE")]
+    pub end_line: Option<usize>,
+
+    /// Output mode: 'full' (default), 'symbols_only', or 'summary'
+    #[arg(long, value_name = "MODE", default_value = "full")]
+    pub output_mode: String,
 
     /// Generate sharded index (writes to cache directory)
     #[arg(long)]
@@ -226,6 +250,10 @@ pub struct QueryArgs {
 pub enum QueryType {
     /// Get repository overview
     Overview {
+        /// Path to repository (defaults to current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
+
         /// Include full module list
         #[arg(long)]
         modules: bool,
@@ -270,6 +298,10 @@ pub enum QueryType {
         /// Symbol hash (or multiple comma-separated hashes)
         hash: Option<String>,
 
+        /// Path to repository (defaults to current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
+
         /// File path (for location-based lookup)
         #[arg(long)]
         file: Option<String>,
@@ -291,6 +323,10 @@ pub enum QueryType {
     Source {
         /// File path (optional if hash/hashes provided)
         file: Option<String>,
+
+        /// Path to repository (defaults to current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
 
         /// Start line (1-indexed, requires file)
         #[arg(long)]
@@ -314,6 +350,10 @@ pub enum QueryType {
         /// Symbol hash
         hash: String,
 
+        /// Path to repository (defaults to current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
+
         /// Depth (1=direct only, max 3)
         #[arg(long, default_value = "1")]
         depth: usize,
@@ -329,6 +369,10 @@ pub enum QueryType {
 
     /// Get the call graph
     Callgraph {
+        /// Path to repository (defaults to current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
+
         /// Filter to a specific module
         #[arg(long)]
         module: Option<String>,
@@ -358,6 +402,10 @@ pub enum QueryType {
     File {
         /// File path
         path: String,
+
+        /// Path to repository (defaults to current directory)
+        #[arg(long)]
+        repo_path: Option<PathBuf>,
 
         /// Include source code snippets
         #[arg(long)]
@@ -391,6 +439,30 @@ pub struct ValidateArgs {
     /// (auto-detects what type of validation to perform)
     #[arg(value_name = "TARGET")]
     pub target: Option<String>,
+
+    /// Repository path (defaults to current directory)
+    #[arg(long)]
+    pub path: Option<PathBuf>,
+
+    /// Symbol hash for single symbol validation
+    #[arg(long)]
+    pub symbol_hash: Option<String>,
+
+    /// File path for file-level or symbol validation
+    #[arg(long)]
+    pub file_path: Option<String>,
+
+    /// Line number for symbol at location (requires --file-path)
+    #[arg(long)]
+    pub line: Option<usize>,
+
+    /// Module name for module-level validation
+    #[arg(long)]
+    pub module: Option<String>,
+
+    /// Include source snippet in output
+    #[arg(long)]
+    pub include_source: bool,
 
     /// Find duplicate code patterns across the codebase
     #[arg(long)]
@@ -606,6 +678,10 @@ pub struct TestArgs {
 /// Arguments for the commit command (prep-commit)
 #[derive(Args, Debug)]
 pub struct CommitArgs {
+    /// Repository path (defaults to current directory)
+    #[arg(long)]
+    pub path: Option<PathBuf>,
+
     /// Only show staged changes (default: shows both staged and unstaged)
     #[arg(long)]
     pub staged: bool,
@@ -792,7 +868,7 @@ pub enum TokenAnalysisMode {
 }
 
 /// Output format options
-#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, ValueEnum)]
 pub enum OutputFormat {
     /// Human-readable text with visual formatting (default for terminal)
     #[default]

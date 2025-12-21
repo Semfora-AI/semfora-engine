@@ -1,4 +1,4 @@
-//! Validate command handler - Quality audits (duplicates)
+//! Validate command handler - Quality audits (complexity, duplicates, impact)
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -8,16 +8,53 @@ use crate::cli::{OutputFormat, ValidateArgs};
 use crate::commands::CommandContext;
 use crate::duplicate::DuplicateKind;
 use crate::error::{McpDiffError, Result};
+use crate::mcp_server::helpers::{
+    find_symbol_by_hash, find_symbol_by_location, format_batch_validation_results,
+    format_validation_result, validate_single_symbol, validate_symbols_batch,
+};
+use crate::normalize_kind;
 use crate::{DuplicateDetector, FunctionSignature};
 
-/// Run the validate command - find duplicates and consolidation opportunities
+/// Run the validate command - unified validation with auto scope detection
+///
+/// Scope priority: symbol_hash > file_path+line > file_path > module > duplicates
 pub fn run_validate(args: &ValidateArgs, ctx: &CommandContext) -> Result<String> {
-    let repo_dir = std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
-        path: format!("current directory: {}", e),
-    })?;
+    // Use provided path or current directory
+    let repo_dir = match &args.path {
+        Some(p) => p.clone(),
+        None => std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
+            path: format!("current directory: {}", e),
+        })?,
+    };
     let cache = CacheDir::for_repo(&repo_dir)?;
 
-    // If duplicates flag is set or a hash is provided, run duplicate detection
+    if !cache.exists() {
+        return Err(McpDiffError::GitError {
+            message: "No index found. Run `semfora index generate` first.".to_string(),
+        });
+    }
+
+    // Scope detection (in order of priority):
+    // 1. symbol_hash → single symbol validation
+    if let Some(ref hash) = args.symbol_hash {
+        return run_validate_symbol_by_hash(args, &cache, hash, ctx);
+    }
+
+    // 2. file_path + line → single symbol at location
+    // 3. file_path only → file-level validation
+    if let Some(ref file_path) = args.file_path {
+        if let Some(line) = args.line {
+            return run_validate_symbol_by_location(args, &cache, file_path, line, ctx);
+        }
+        return run_validate_file(args, &cache, file_path, ctx);
+    }
+
+    // 4. module → module-level validation
+    if let Some(ref module_name) = args.module {
+        return run_validate_module(args, &cache, module_name, ctx);
+    }
+
+    // 5. duplicates flag or legacy target-based routing
     if args.duplicates {
         if let Some(ref target) = args.target {
             // Check if target looks like a hash (for single symbol duplicate check)
@@ -27,8 +64,116 @@ pub fn run_validate(args: &ValidateArgs, ctx: &CommandContext) -> Result<String>
         }
     }
 
-    // Run full duplicate scan with optional file/module filter
+    // Default: run full duplicate scan with optional file/module filter
     run_find_duplicates(args, &cache, ctx)
+}
+
+/// Validate a single symbol by hash (DEDUP-304)
+fn run_validate_symbol_by_hash(
+    args: &ValidateArgs,
+    cache: &CacheDir,
+    hash: &str,
+    _ctx: &CommandContext,
+) -> Result<String> {
+    let symbol_entry = find_symbol_by_hash(cache, hash).map_err(|e| McpDiffError::GitError {
+        message: e,
+    })?;
+
+    let result = validate_single_symbol(cache, &symbol_entry, args.threshold);
+    let output = format_validation_result(&result);
+    // Note: include_source not yet implemented in CLI (source snippets require additional handling)
+    Ok(output)
+}
+
+/// Validate a single symbol by file+line location (DEDUP-304)
+fn run_validate_symbol_by_location(
+    args: &ValidateArgs,
+    cache: &CacheDir,
+    file_path: &str,
+    line: usize,
+    _ctx: &CommandContext,
+) -> Result<String> {
+    let symbol_entry =
+        find_symbol_by_location(cache, file_path, line).map_err(|e| McpDiffError::GitError {
+            message: e,
+        })?;
+
+    let result = validate_single_symbol(cache, &symbol_entry, args.threshold);
+    let output = format_validation_result(&result);
+    // Note: include_source not yet implemented in CLI (source snippets require additional handling)
+    Ok(output)
+}
+
+/// Validate all symbols in a file (DEDUP-304)
+fn run_validate_file(
+    args: &ValidateArgs,
+    cache: &CacheDir,
+    file_path: &str,
+    _ctx: &CommandContext,
+) -> Result<String> {
+    let all_entries = cache
+        .load_all_symbol_entries()
+        .map_err(|e| McpDiffError::GitError {
+            message: format!("Failed to load symbol index: {}", e),
+        })?;
+
+    let mut entries: Vec<_> = all_entries
+        .into_iter()
+        .filter(|e| e.file.ends_with(file_path) || file_path.ends_with(&e.file))
+        .collect();
+
+    if let Some(ref kind) = args.kind {
+        let normalized = normalize_kind(kind);
+        entries.retain(|e| e.kind.eq_ignore_ascii_case(normalized));
+    }
+
+    if entries.is_empty() {
+        return Err(McpDiffError::FileNotFound {
+            path: format!("No symbols found in file: {}", file_path),
+        });
+    }
+
+    let results = validate_symbols_batch(cache, &entries, args.threshold);
+    let output = format_batch_validation_results(&results, file_path);
+
+    Ok(output)
+}
+
+/// Validate all symbols in a module (DEDUP-304)
+fn run_validate_module(
+    args: &ValidateArgs,
+    cache: &CacheDir,
+    module_name: &str,
+    _ctx: &CommandContext,
+) -> Result<String> {
+    let all_entries = cache
+        .load_all_symbol_entries()
+        .map_err(|e| McpDiffError::GitError {
+            message: format!("Failed to load symbol index: {}", e),
+        })?;
+
+    let mut entries: Vec<_> = all_entries
+        .into_iter()
+        .filter(|e| e.module.eq_ignore_ascii_case(module_name) || e.module.ends_with(module_name))
+        .collect();
+
+    if let Some(ref kind) = args.kind {
+        let normalized = normalize_kind(kind);
+        entries.retain(|e| e.kind.eq_ignore_ascii_case(normalized));
+    }
+
+    entries.truncate(args.limit.min(500));
+
+    if entries.is_empty() {
+        return Err(McpDiffError::FileNotFound {
+            path: format!("No symbols found in module: {}", module_name),
+        });
+    }
+
+    let results = validate_symbols_batch(cache, &entries, args.threshold);
+    let output = format_batch_validation_results(&results, &format!("module:{}", module_name));
+
+    Ok(output)
 }
 
 // load_signatures removed - now uses crate::cache::load_function_signatures (DEDUP-105)
@@ -524,4 +669,67 @@ fn run_check_duplicates(
     }
 
     Ok(output)
+}
+
+// ============================================================================
+// DEDUP-307: Public interface for MCP find_duplicates delegation
+// ============================================================================
+
+/// Find duplicates - unified CLI/MCP handler (DEDUP-307)
+///
+/// Two modes:
+/// 1. Single symbol mode (symbol_hash provided): Find duplicates of a specific symbol
+/// 2. Codebase scan mode (default): Find all duplicate clusters
+pub fn run_duplicates(
+    path: Option<&std::path::PathBuf>,
+    symbol_hash: Option<&str>,
+    threshold: f64,
+    module_filter: Option<&str>,
+    exclude_boilerplate: bool,
+    min_lines: usize,
+    sort_by: &str,
+    limit: usize,
+    offset: usize,
+    ctx: &CommandContext,
+) -> Result<String> {
+    let repo_dir = match path {
+        Some(p) => p.clone(),
+        None => std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
+            path: format!("current directory: {}", e),
+        })?,
+    };
+    let cache = CacheDir::for_repo(&repo_dir)?;
+
+    if !cache.exists() {
+        return Err(McpDiffError::GitError {
+            message: "No index found. Run `semfora index generate` first.".to_string(),
+        });
+    }
+
+    // Single symbol mode: check specific symbol for duplicates
+    if let Some(hash) = symbol_hash {
+        return run_check_duplicates(hash, threshold, &cache, ctx);
+    }
+
+    // Codebase scan mode: build ValidateArgs and delegate to run_find_duplicates
+    let args = ValidateArgs {
+        path: Some(repo_dir),
+        target: module_filter.map(String::from),
+        threshold,
+        duplicates: true,
+        include_boilerplate: !exclude_boilerplate,
+        min_lines,
+        limit,
+        offset,
+        sort_by: sort_by.to_string(),
+        // Not used for duplicates
+        symbol_hash: None,
+        file_path: None,
+        line: None,
+        module: None,
+        include_source: false,
+        kind: None,
+    };
+
+    run_find_duplicates(&args, &cache, ctx)
 }

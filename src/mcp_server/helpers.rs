@@ -1,25 +1,22 @@
 //! Helper functions for the MCP server
 //!
 
-#![allow(dead_code)]
+// Helpers module - cache freshness and symbol validation utilities
 
-use crate::utils::truncate_to_char_boundary;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use std::collections::{HashMap, HashSet};
 
-use crate::duplicate::{DuplicateDetector, FunctionSignature};
+use crate::duplicate::DuplicateDetector;
 use crate::indexing::{
     analyze_files_with_stats as indexing_analyze_files_with_stats,
     collect_files as indexing_collect_files, should_skip_path as indexing_should_skip_path,
 };
-use crate::parsing::parse_and_extract as parsing_parse_and_extract;
 use crate::cache::load_function_signatures as cache_load_function_signatures;
 use crate::{
-    extract_module_name, CacheDir, Lang, McpDiffError, SemanticSummary, ShardWriter,
-    SymbolIndexEntry,
+    extract_module_name, CacheDir, Lang, SemanticSummary, ShardWriter, SymbolIndexEntry,
 };
 
 // ============================================================================
@@ -61,51 +58,6 @@ pub struct IndexGenerationResult {
 // ============================================================================
 // Cache Staleness Detection
 // ============================================================================
-
-/// Check if the cache is potentially stale
-/// Compares repo_overview.toon mtime against source files in the repo
-pub fn check_cache_staleness(cache: &CacheDir) -> Option<String> {
-    let overview_path = cache.repo_overview_path();
-    let overview_mtime = match fs::metadata(&overview_path) {
-        Ok(m) => m.modified().ok(),
-        Err(_) => return None,
-    };
-
-    let overview_time = match overview_mtime {
-        Some(t) => t,
-        None => return None,
-    };
-
-    // Scan source files in repo_root for any newer than cache
-    let mut stale_files = Vec::new();
-    let max_to_check = 100; // Limit for performance
-
-    if let Ok(entries) = collect_source_files_for_staleness(&cache.repo_root, max_to_check) {
-        for (path, mtime) in entries {
-            if mtime > overview_time {
-                stale_files.push(path);
-                if stale_files.len() >= 5 {
-                    break; // Don't list too many
-                }
-            }
-        }
-    }
-
-    if stale_files.is_empty() {
-        None
-    } else {
-        let files_str = stale_files.join(", ");
-        Some(format!(
-            "⚠️ Index may be stale. {} file(s) modified since last indexing: {}. Run generate_index to refresh.",
-            stale_files.len(),
-            if files_str.len() > 100 {
-                format!("{}...", truncate_to_char_boundary(&files_str, 100))
-            } else {
-                files_str
-            }
-        ))
-    }
-}
 
 /// Check cache staleness with detailed information
 ///
@@ -204,7 +156,7 @@ fn collect_source_files_recursive(
         let path = entry.path();
 
         // Skip hidden files/directories and common non-source directories
-        if should_skip_path(&path) {
+        if indexing_should_skip_path(&path) {
             continue;
         }
 
@@ -231,52 +183,8 @@ fn collect_source_files_recursive(
 }
 
 // ============================================================================
-// File Collection (DEDUP-102: delegates to shared indexing module)
+// Index Generation
 // ============================================================================
-
-/// Recursively collect supported files from a directory.
-///
-/// This function delegates to `crate::indexing::collect_files`.
-#[inline]
-pub fn collect_files(dir: &Path, max_depth: usize, extensions: &[String]) -> Vec<PathBuf> {
-    indexing_collect_files(dir, max_depth, extensions)
-}
-
-/// Check if a path should be skipped during file collection.
-///
-/// This function delegates to `crate::indexing::should_skip_path`.
-#[inline]
-pub fn should_skip_path(path: &Path) -> bool {
-    indexing_should_skip_path(path)
-}
-
-// ============================================================================
-// Parsing (DEDUP-103: delegates to shared parsing module)
-// ============================================================================
-
-/// Parse source and extract semantic summary.
-///
-/// This function delegates to `crate::parsing::parse_and_extract`.
-#[inline]
-pub fn parse_and_extract(
-    file_path: &Path,
-    source: &str,
-    lang: Lang,
-) -> Result<SemanticSummary, McpDiffError> {
-    parsing_parse_and_extract(file_path, source, lang)
-}
-
-// ============================================================================
-// Index Generation (DEDUP-102: delegates to shared indexing module)
-// ============================================================================
-
-/// Analyze a collection of files and return their semantic summaries with total bytes.
-///
-/// This function delegates to `crate::indexing::analyze_files_with_stats`.
-#[inline]
-pub fn analyze_files_with_stats(files: &[PathBuf]) -> (Vec<SemanticSummary>, usize) {
-    indexing_analyze_files_with_stats(files)
-}
 
 /// Generate a sharded index for a directory.
 ///
@@ -294,7 +202,7 @@ pub fn generate_index_internal(
         .map_err(|e| format!("Failed to initialize shard writer: {}", e))?;
 
     // Collect files
-    let files = collect_files(dir_path, max_depth, extensions);
+    let files = indexing_collect_files(dir_path, max_depth, extensions);
 
     if files.is_empty() {
         return Ok(IndexGenerationResult {
@@ -307,7 +215,7 @@ pub fn generate_index_internal(
     }
 
     // Analyze files
-    let (summaries, total_bytes) = analyze_files_with_stats(&files);
+    let (summaries, total_bytes) = indexing_analyze_files_with_stats(&files);
 
     // Add summaries to shard writer
     shard_writer.add_summaries(summaries.clone());
@@ -396,7 +304,7 @@ pub fn partial_reindex(
     }
 
     // Analyze only the changed files (parallel)
-    let (new_summaries, _) = analyze_files_with_stats(&valid_files);
+    let (new_summaries, _) = indexing_analyze_files_with_stats(&valid_files);
 
     // Build file-to-module mapping from existing cache for consistent module names
     // This ensures partial reindex uses the same module names as the full index
@@ -702,196 +610,6 @@ pub fn format_freshness_note(result: &FreshnessResult) -> Option<String> {
 }
 
 // ============================================================================
-// Repo Overview Filtering
-// ============================================================================
-
-/// Test directory patterns to exclude
-const TEST_DIR_PATTERNS: &[&str] = &[
-    "tests",
-    "__tests__",
-    "test-repos",
-    "test_",
-    "_test",
-    "spec",
-    "fixtures",
-];
-
-/// Check if a module name indicates a test directory
-fn is_test_module(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    TEST_DIR_PATTERNS.iter().any(|pattern| {
-        lower == *pattern
-            || lower.starts_with(&format!("{}/", pattern))
-            || lower.ends_with(&format!("/{}", pattern))
-            || lower.contains(&format!("/{}/", pattern))
-    })
-}
-
-/// Filter repo overview TOON content to limit modules and exclude test dirs
-///
-/// # Arguments
-/// * `content` - The raw TOON content from repo_overview.toon
-/// * `max_modules` - Maximum number of modules to include (0 = no limit)
-/// * `exclude_test_dirs` - Whether to exclude test directories
-///
-/// # Returns
-/// Filtered TOON content with updated module count
-pub fn filter_repo_overview(content: &str, max_modules: usize, exclude_test_dirs: bool) -> String {
-    let lines: Vec<&str> = content.lines().collect();
-    let mut output = String::new();
-    let mut in_modules = false;
-    let mut modules_collected: Vec<&str> = Vec::new();
-    let mut total_modules = 0;
-    let mut excluded_count = 0;
-
-    for line in &lines {
-        // Detect modules section start: "modules[N]{...}:"
-        if line.starts_with("modules[") && line.ends_with(':') {
-            in_modules = true;
-            // Parse original count from "modules[30]..." format
-            if let Some(count_str) = line
-                .strip_prefix("modules[")
-                .and_then(|s| s.split(']').next())
-            {
-                total_modules = count_str.parse().unwrap_or(0);
-            }
-            continue;
-        }
-
-        if in_modules {
-            // Module lines are indented with 2 spaces and contain commas
-            if line.starts_with("  ") && line.contains(',') {
-                // Parse module name (first field)
-                let module_name = line.trim().split(',').next().unwrap_or("");
-
-                // Check if should exclude
-                if exclude_test_dirs && is_test_module(module_name) {
-                    excluded_count += 1;
-                    continue;
-                }
-
-                modules_collected.push(line);
-            } else {
-                // End of modules section - flush collected modules
-                in_modules = false;
-
-                // Apply limit
-                let final_modules: Vec<&str> =
-                    if max_modules > 0 && modules_collected.len() > max_modules {
-                        modules_collected
-                            .iter()
-                            .take(max_modules)
-                            .copied()
-                            .collect()
-                    } else {
-                        modules_collected.clone()
-                    };
-
-                // Write modules header with actual count
-                let header_parts: Vec<&str> = lines
-                    .iter()
-                    .find(|l| l.starts_with("modules["))
-                    .map(|l| l.split(']').collect::<Vec<_>>())
-                    .unwrap_or_default();
-
-                if header_parts.len() >= 2 {
-                    // Show filtered count and note total
-                    if excluded_count > 0
-                        || (max_modules > 0 && modules_collected.len() > max_modules)
-                    {
-                        let showing = final_modules.len();
-                        output.push_str(&format!(
-                            "modules[{}/{}]{}\n",
-                            showing, total_modules, header_parts[1]
-                        ));
-                    } else {
-                        output.push_str(&format!(
-                            "modules[{}]{}\n",
-                            final_modules.len(),
-                            header_parts[1]
-                        ));
-                    }
-                }
-
-                // Write filtered modules
-                for module_line in &final_modules {
-                    output.push_str(module_line);
-                    output.push('\n');
-                }
-
-                // Write the current line (which ended the modules section)
-                output.push_str(line);
-                output.push('\n');
-
-                // Clear for potential future modules sections
-                modules_collected.clear();
-            }
-        } else {
-            output.push_str(line);
-            output.push('\n');
-        }
-    }
-
-    // Handle case where file ends during modules section
-    if in_modules && !modules_collected.is_empty() {
-        let final_modules: Vec<&str> = if max_modules > 0 && modules_collected.len() > max_modules {
-            modules_collected
-                .iter()
-                .take(max_modules)
-                .copied()
-                .collect()
-        } else {
-            modules_collected.clone()
-        };
-
-        for module_line in &final_modules {
-            output.push_str(module_line);
-            output.push('\n');
-        }
-    }
-
-    output
-}
-
-// ============================================================================
-// String Similarity Helpers
-// ============================================================================
-
-/// Simple Levenshtein distance for fuzzy matching suggestions
-pub fn levenshtein_distance(a: &str, b: &str) -> usize {
-    let a_chars: Vec<char> = a.chars().collect();
-    let b_chars: Vec<char> = b.chars().collect();
-    let a_len = a_chars.len();
-    let b_len = b_chars.len();
-
-    if a_len == 0 {
-        return b_len;
-    }
-    if b_len == 0 {
-        return a_len;
-    }
-
-    // Use two rows instead of full matrix for space efficiency
-    let mut prev_row: Vec<usize> = (0..=b_len).collect();
-    let mut curr_row: Vec<usize> = vec![0; b_len + 1];
-
-    for (i, a_char) in a_chars.iter().enumerate() {
-        curr_row[0] = i + 1;
-
-        for (j, b_char) in b_chars.iter().enumerate() {
-            let cost = if a_char == b_char { 0 } else { 1 };
-            curr_row[j + 1] = (prev_row[j + 1] + 1) // deletion
-                .min(curr_row[j] + 1) // insertion
-                .min(prev_row[j] + cost); // substitution
-        }
-
-        std::mem::swap(&mut prev_row, &mut curr_row);
-    }
-
-    prev_row[b_len]
-}
-
-// ============================================================================
 // Symbol Validation Helpers
 // ============================================================================
 
@@ -1018,7 +736,7 @@ pub fn find_symbol_duplicates(
     let mut duplicates = Vec::new();
 
     // Load signatures from cache
-    let signatures = match load_function_signatures(cache) {
+    let signatures = match cache_load_function_signatures(cache) {
         Ok(sigs) => sigs,
         Err(_) => return duplicates,
     };
@@ -1042,14 +760,6 @@ pub fn find_symbol_duplicates(
     }
 
     duplicates
-}
-
-// load_function_signatures removed - now uses crate::cache::load_function_signatures (DEDUP-105)
-
-/// Load function signatures from cache
-#[inline]
-pub fn load_function_signatures(cache: &CacheDir) -> Result<Vec<FunctionSignature>, String> {
-    cache_load_function_signatures(cache)
 }
 
 /// Build a reverse call graph (callee -> callers) from the call graph file
@@ -1424,91 +1134,6 @@ mod tests {
     use super::*;
 
     // ========================================================================
-    // Levenshtein Distance Tests
-    // ========================================================================
-
-    #[test]
-    fn test_levenshtein_identical_strings() {
-        assert_eq!(levenshtein_distance("hello", "hello"), 0);
-        assert_eq!(levenshtein_distance("", ""), 0);
-        assert_eq!(levenshtein_distance("abc", "abc"), 0);
-    }
-
-    #[test]
-    fn test_levenshtein_empty_strings() {
-        assert_eq!(levenshtein_distance("", "hello"), 5);
-        assert_eq!(levenshtein_distance("hello", ""), 5);
-        assert_eq!(levenshtein_distance("abc", ""), 3);
-    }
-
-    #[test]
-    fn test_levenshtein_single_edit() {
-        // Substitution
-        assert_eq!(levenshtein_distance("cat", "bat"), 1);
-        // Insertion
-        assert_eq!(levenshtein_distance("cat", "cats"), 1);
-        // Deletion
-        assert_eq!(levenshtein_distance("cats", "cat"), 1);
-    }
-
-    #[test]
-    fn test_levenshtein_multiple_edits() {
-        assert_eq!(levenshtein_distance("kitten", "sitting"), 3);
-        assert_eq!(levenshtein_distance("saturday", "sunday"), 3);
-        assert_eq!(levenshtein_distance("abc", "xyz"), 3);
-    }
-
-    #[test]
-    fn test_levenshtein_unicode() {
-        assert_eq!(levenshtein_distance("café", "cafe"), 1);
-        assert_eq!(levenshtein_distance("🔥", "🔥"), 0);
-        assert_eq!(levenshtein_distance("hello", "héllo"), 1);
-    }
-
-    // ========================================================================
-    // Test Module Detection Tests
-    // ========================================================================
-
-    #[test]
-    fn test_is_test_module_exact_matches() {
-        assert!(is_test_module("tests"));
-        assert!(is_test_module("__tests__"));
-        assert!(is_test_module("test-repos"));
-        assert!(is_test_module("spec"));
-        assert!(is_test_module("fixtures"));
-    }
-
-    #[test]
-    fn test_is_test_module_subdirectories() {
-        assert!(is_test_module("tests/unit"));
-        assert!(is_test_module("src/__tests__/components"));
-        assert!(is_test_module("packages/app/tests"));
-    }
-
-    #[test]
-    fn test_is_test_module_case_insensitive() {
-        assert!(is_test_module("TESTS"));
-        assert!(is_test_module("Tests"));
-        assert!(is_test_module("__TESTS__"));
-    }
-
-    #[test]
-    fn test_is_test_module_false_cases() {
-        assert!(!is_test_module("src"));
-        assert!(!is_test_module("utils"));
-        assert!(!is_test_module("components"));
-        assert!(!is_test_module("testing")); // Contains "test" but not a match
-        assert!(!is_test_module("contest")); // Contains "test" but not a match
-    }
-
-    #[test]
-    fn test_is_test_module_exact_patterns() {
-        // Exact matches for prefix/suffix patterns
-        assert!(is_test_module("test_"));
-        assert!(is_test_module("_test"));
-    }
-
-    // ========================================================================
     // Complexity Assessment Tests
     // ========================================================================
 
@@ -1803,43 +1428,6 @@ mod tests {
         assert!(output.contains("high_complexity: 1"));
         assert!(output.contains("deep_nesting: 1"));
         assert!(output.contains("complex_fn"));
-    }
-
-    // ========================================================================
-    // Path Skip Logic Tests
-    // ========================================================================
-
-    #[test]
-    fn test_should_skip_path_hidden() {
-        assert!(should_skip_path(Path::new(".git")));
-        assert!(should_skip_path(Path::new(".hidden")));
-    }
-
-    #[test]
-    fn test_should_skip_path_node_modules() {
-        assert!(should_skip_path(Path::new("node_modules")));
-    }
-
-    #[test]
-    fn test_should_skip_path_target() {
-        assert!(should_skip_path(Path::new("target")));
-    }
-
-    #[test]
-    fn test_should_skip_path_common_dirs() {
-        assert!(should_skip_path(Path::new("dist")));
-        assert!(should_skip_path(Path::new("build")));
-        assert!(should_skip_path(Path::new(".next")));
-        assert!(should_skip_path(Path::new("coverage")));
-        assert!(should_skip_path(Path::new("__pycache__")));
-        assert!(should_skip_path(Path::new("vendor")));
-    }
-
-    #[test]
-    fn test_should_skip_path_false_cases() {
-        assert!(!should_skip_path(Path::new("src")));
-        assert!(!should_skip_path(Path::new("lib")));
-        assert!(!should_skip_path(Path::new("main.rs")));
     }
 
     // ========================================================================

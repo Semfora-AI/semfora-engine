@@ -12,9 +12,10 @@ use crate::cli::{AnalyzeArgs, OutputFormat, TokenAnalysisMode};
 use crate::error::{McpDiffError, Result};
 use crate::git::{
     detect_base_branch, get_changed_files, get_commit_changed_files, get_commits_since,
-    get_file_at_ref, get_repo_root, get_staged_changes, get_unstaged_changes, ChangeType,
-    ChangedFile,
+    get_file_at_ref, get_merge_base, get_repo_root, get_staged_changes, get_uncommitted_changes,
+    get_unstaged_changes, ChangeType, ChangedFile,
 };
+use crate::mcp_server::formatting::{format_diff_output_paginated, format_diff_summary};
 use crate::parsing::{parse_and_extract, parse_and_extract_with_options};
 use crate::tokens::{format_analysis_compact, format_analysis_report, TokenAnalyzer};
 use crate::{
@@ -84,7 +85,15 @@ fn resolve_base_ref(args: &AnalyzeArgs, diff_ref: &str) -> Result<String> {
     detect_base_branch(None)
 }
 
+/// Large file thresholds (matching MCP constants)
+const VERY_LARGE_FILE_BYTES: u64 = 500_000;
+const LARGE_FILE_LINES: usize = 3000;
+const LARGE_SYMBOL_COUNT: usize = 50;
+
 /// Analyze a single file
+///
+/// Supports focus mode (start_line/end_line) and output modes (symbols_only, summary, full).
+/// Handles large files with navigation hints when focus mode is not used.
 fn run_single_file(ctx: &CommandContext, args: &AnalyzeArgs, file_path: &Path) -> Result<String> {
     if !file_path.exists() {
         return Err(McpDiffError::FileNotFound {
@@ -108,60 +117,190 @@ fn run_single_file(ctx: &CommandContext, args: &AnalyzeArgs, file_path: &Path) -
         eprintln!("Read {} bytes from {}", source.len(), file_path.display());
     }
 
-    let summary = parse_and_extract_with_options(file_path, &source, lang, args.print_ast)?;
+    // Large file detection
+    let file_size = fs::metadata(file_path).map(|m| m.len()).unwrap_or(0);
+    let line_count = source.lines().count();
+    let has_focus = args.start_line.is_some() && args.end_line.is_some();
 
-    let toon_output = encode_toon(&summary);
-    let json_pretty =
-        serde_json::to_string_pretty(&summary).map_err(|e| McpDiffError::ExtractionFailure {
-            message: format!("JSON serialization failed: {}", e),
-        })?;
-    let json_compact =
-        serde_json::to_string(&summary).map_err(|e| McpDiffError::ExtractionFailure {
-            message: format!("JSON serialization failed: {}", e),
-        })?;
-
-    if let Some(mode) = args.analyze_tokens {
-        let analyzer = TokenAnalyzer::new();
-        let analysis = analyzer.analyze(&source, &json_pretty, &json_compact, &toon_output);
-
-        let report = match mode {
-            TokenAnalysisMode::Full => format_analysis_report(&analysis, args.compare_compact),
-            TokenAnalysisMode::Compact => format_analysis_compact(&analysis, args.compare_compact),
+    // For very large files without focus, return metadata with navigation hints
+    if (file_size > VERY_LARGE_FILE_BYTES || line_count > LARGE_FILE_LINES) && !has_focus {
+        // Do a quick parse to get symbol count for the hint
+        let symbol_hint = if let Ok(summary) = parse_and_extract(file_path, &source, lang) {
+            format!(
+                "\nsymbols_found: {}\nhigh_risk_count: {}\n",
+                summary.symbols.len(),
+                summary
+                    .symbols
+                    .iter()
+                    .filter(|s| s.behavioral_risk == crate::RiskLevel::High)
+                    .count()
+            )
+        } else {
+            String::new()
         };
-        eprintln!("{}", report);
+
+        return Ok(format!(
+            "_type: large_file_notice\n\
+             file: {}\n\
+             size_bytes: {}\n\
+             line_count: {}\n\
+             language: {}\n\
+             {}\n\
+             This file is very large ({:.1}KB, {} lines).\n\
+             Use focus mode to analyze a specific section:\n\
+               semfora-engine analyze {} --start-line N --end-line M\n\n\
+             Or use get-file to see symbol index with line ranges.\n",
+            file_path.display(),
+            file_size,
+            line_count,
+            lang.name(),
+            symbol_hint,
+            file_size as f64 / 1024.0,
+            line_count,
+            file_path.display()
+        ));
     }
 
-    let output = match ctx.format {
-        OutputFormat::Text => {
-            // Human-readable text format
-            let mut text = String::new();
-            text.push_str("═══════════════════════════════════════════\n");
-            text.push_str("  SEMANTIC ANALYSIS\n");
-            text.push_str("═══════════════════════════════════════════\n\n");
-            text.push_str(&format!("file: {}\n", file_path.display()));
-            text.push_str(&format!(
-                "language: {} ({})\n",
-                lang.name(),
-                lang.family().name()
-            ));
-            if let Some(ref sym) = summary.symbol {
-                text.push_str(&format!("symbol: {}\n", sym));
-            }
-            if let Some(ref kind) = summary.symbol_kind {
-                text.push_str(&format!("kind: {:?}\n", kind));
-            }
-            if let Some(start) = summary.start_line {
-                if let Some(end) = summary.end_line {
-                    text.push_str(&format!("lines: {}-{}\n", start, end));
-                }
-            }
-            text.push('\n');
-            // Add the toon output as well for full detail
-            text.push_str(&toon_output);
-            text
+    // Focus mode: extract only specified line range
+    let source_to_analyze = if let (Some(start), Some(end)) = (args.start_line, args.end_line) {
+        let lines: Vec<&str> = source.lines().collect();
+        let start_idx = start.saturating_sub(1);
+        let end_idx = end.min(lines.len());
+
+        if start_idx >= lines.len() {
+            return Err(McpDiffError::ExtractionFailure {
+                message: format!("start_line {} exceeds file length {} lines", start, lines.len()),
+            });
         }
-        OutputFormat::Toon => toon_output,
-        OutputFormat::Json => json_pretty,
+
+        lines[start_idx..end_idx].join("\n")
+    } else {
+        source.clone()
+    };
+
+    let summary = parse_and_extract_with_options(file_path, &source_to_analyze, lang, args.print_ast)?;
+
+    // Handle output mode
+    let output = match args.output_mode.as_str() {
+        "symbols_only" => {
+            // Just list symbols with line ranges
+            let mut out = format!(
+                "_type: symbols_only\nfile: {}\nsymbol_count: {}\n\n",
+                file_path.display(),
+                summary.symbols.len()
+            );
+            for sym in &summary.symbols {
+                out.push_str(&format!(
+                    "- {} ({}) L{}-{}\n",
+                    sym.name,
+                    sym.kind.as_str(),
+                    sym.start_line,
+                    sym.end_line
+                ));
+            }
+            out
+        }
+        "summary" => {
+            // Brief overview only
+            format!(
+                "_type: analysis_summary\n\
+                 file: {}\n\
+                 language: {}\n\
+                 symbols: {}\n\
+                 calls: {}\n\
+                 high_risk: {}\n",
+                file_path.display(),
+                summary.language,
+                summary.symbols.len(),
+                summary.calls.len(),
+                summary
+                    .symbols
+                    .iter()
+                    .filter(|s| s.behavioral_risk == crate::RiskLevel::High)
+                    .count()
+            )
+        }
+        _ => {
+            // Full output (default)
+            let toon_output = encode_toon(&summary);
+            let json_pretty = serde_json::to_string_pretty(&summary)
+                .map_err(|e| McpDiffError::ExtractionFailure {
+                    message: format!("JSON serialization failed: {}", e),
+                })?;
+            let json_compact = serde_json::to_string(&summary)
+                .map_err(|e| McpDiffError::ExtractionFailure {
+                    message: format!("JSON serialization failed: {}", e),
+                })?;
+
+            // Token analysis if requested
+            if let Some(mode) = args.analyze_tokens {
+                let analyzer = TokenAnalyzer::new();
+                let analysis = analyzer.analyze(&source, &json_pretty, &json_compact, &toon_output);
+
+                let report = match mode {
+                    TokenAnalysisMode::Full => format_analysis_report(&analysis, args.compare_compact),
+                    TokenAnalysisMode::Compact => format_analysis_compact(&analysis, args.compare_compact),
+                };
+                eprintln!("{}", report);
+            }
+
+            let mut output = match ctx.format {
+                OutputFormat::Text => {
+                    // Human-readable text format
+                    let mut text = String::new();
+                    text.push_str("═══════════════════════════════════════════\n");
+                    text.push_str("  SEMANTIC ANALYSIS\n");
+                    text.push_str("═══════════════════════════════════════════\n\n");
+                    text.push_str(&format!("file: {}\n", file_path.display()));
+                    text.push_str(&format!(
+                        "language: {} ({})\n",
+                        lang.name(),
+                        lang.family().name()
+                    ));
+                    if let Some(ref sym) = summary.symbol {
+                        text.push_str(&format!("symbol: {}\n", sym));
+                    }
+                    if let Some(ref kind) = summary.symbol_kind {
+                        text.push_str(&format!("kind: {:?}\n", kind));
+                    }
+                    if let Some(start) = summary.start_line {
+                        if let Some(end) = summary.end_line {
+                            text.push_str(&format!("lines: {}-{}\n", start, end));
+                        }
+                    }
+                    text.push('\n');
+                    text.push_str(&toon_output);
+                    text
+                }
+                OutputFormat::Toon => toon_output,
+                OutputFormat::Json => json_pretty,
+            };
+
+            // Add focus context if applicable
+            if has_focus {
+                output = format!(
+                    "_type: focused_analysis\n\
+                     file: {}\n\
+                     focus_range: L{}-{}\n\
+                     ---\n{}",
+                    file_path.display(),
+                    args.start_line.unwrap_or(1),
+                    args.end_line.unwrap_or(0),
+                    output
+                );
+            }
+
+            // Symbol count warning for large files (only for non-JSON formats)
+            if summary.symbols.len() > LARGE_SYMBOL_COUNT && ctx.format != OutputFormat::Json {
+                output = format!(
+                    "# Note: {} symbols found. Consider using --output-mode=symbols_only for overview first.\n\n{}",
+                    summary.symbols.len(),
+                    output
+                );
+            }
+
+            output
+        }
     };
 
     Ok(format!("{}\n", output))
@@ -453,46 +592,63 @@ fn run_uncommitted(ctx: &CommandContext, _args: &AnalyzeArgs, _base_ref: &str) -
 }
 
 /// Analyze diff against a base branch
-fn run_diff_branch(ctx: &CommandContext, _args: &AnalyzeArgs, base_ref: &str) -> Result<String> {
-    let changed_files = get_changed_files(base_ref, "HEAD", None)?;
+///
+/// Supports pagination (limit/offset) and summary_only mode.
+/// Uses the same formatting as MCP analyze_diff for consistent output.
+/// If args.path is set, uses it as the repo root (for MCP working_dir support).
+fn run_diff_branch(ctx: &CommandContext, args: &AnalyzeArgs, base_ref: &str) -> Result<String> {
+    // Use args.path as repo root if provided, otherwise auto-detect
+    let repo_root = match &args.path {
+        Some(p) if p.is_dir() => p.clone(),
+        _ => PathBuf::from(get_repo_root(None)?),
+    };
+    let target_ref = args.target_ref.as_deref().unwrap_or("HEAD");
+
+    // Handle special case for uncommitted changes (WORKING target)
+    let (changed_files, display_target) = if target_ref.eq_ignore_ascii_case("WORKING") {
+        let files = get_uncommitted_changes(base_ref, Some(&repo_root))?;
+        (files, "WORKING (uncommitted)")
+    } else {
+        // Normal comparison between refs
+        let merge_base =
+            get_merge_base(base_ref, target_ref, Some(&repo_root)).unwrap_or_else(|_| base_ref.to_string());
+        let files = get_changed_files(&merge_base, target_ref, Some(&repo_root))?;
+        (files, target_ref)
+    };
 
     if changed_files.is_empty() {
-        return Ok(format!("diff_against: {}\nchanged_files: 0\n", base_ref));
+        return Ok(format!(
+            "_type: analyze_diff\nbase: \"{}\"\ntarget: \"{}\"\ntotal_files: 0\n_note: No files changed.\n",
+            base_ref, display_target
+        ));
     }
 
-    let repo_root = PathBuf::from(get_repo_root(None)?);
-    let verbose = ctx.verbose;
+    // Extract pagination options with defaults
+    let limit = args.limit.unwrap_or(20).min(100); // Default 20, max 100
+    let offset = args.offset.unwrap_or(0);
 
-    let summaries: Vec<SemanticSummary> = changed_files
-        .par_iter()
-        .filter_map(|change| {
-            if change.change_type == ChangeType::Deleted {
-                return None;
-            }
+    // Choose output format based on options
+    let output = if args.summary_only {
+        format_diff_summary(&repo_root, base_ref, display_target, &changed_files)
+    } else {
+        format_diff_output_paginated(
+            &repo_root,
+            base_ref,
+            display_target,
+            &changed_files,
+            offset,
+            limit,
+        )
+    };
 
-            let file_path = repo_root.join(&change.path);
-
-            let lang = match Lang::from_path(&file_path) {
-                Ok(l) => l,
-                Err(_) => return None,
-            };
-
-            let source = match fs::read_to_string(&file_path) {
-                Ok(s) => s,
-                Err(e) => {
-                    if verbose {
-                        eprintln!("Skipping {}: {}", change.path, e);
-                    }
-                    return None;
-                }
-            };
-
-            parse_and_extract_string(&file_path, &source, lang).ok()
-        })
-        .collect();
-
-    let overview = generate_repo_overview(&summaries, &format!("diff:{}", base_ref));
-    let output = encode_toon_directory(&overview, &summaries);
+    if ctx.verbose {
+        eprintln!(
+            "Analyzed diff: {} -> {} ({} files)",
+            base_ref,
+            display_target,
+            changed_files.len()
+        );
+    }
 
     Ok(output)
 }
