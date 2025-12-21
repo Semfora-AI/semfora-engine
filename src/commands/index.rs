@@ -7,6 +7,7 @@ use crate::cache::CacheDir;
 use crate::cli::{IndexArgs, IndexOperation, OutputFormat};
 use crate::commands::CommandContext;
 use crate::error::{McpDiffError, Result};
+use crate::indexing::{analyze_files_parallel, IndexingProgressCallback};
 use crate::shard::ShardWriter;
 use crate::Lang;
 
@@ -108,30 +109,24 @@ fn run_full_index(
     // Create shard writer (takes repo path)
     let mut writer = ShardWriter::new(repo_dir)?;
 
-    // Process each file and collect summaries
-    let mut summaries = Vec::new();
-    let mut errors = 0;
-
-    for (i, file_path) in files.iter().enumerate() {
-        if ctx.progress && i % 50 == 0 {
+    // Process files in parallel (DEDUP-102: fixes the parallelism bug)
+    // Previously used sequential for loop, now uses Rayon par_iter()
+    let progress_cb: Option<IndexingProgressCallback> = if ctx.progress {
+        Some(Box::new(|current: usize, total: usize| {
             eprintln!(
                 "Progress: {}/{} ({:.0}%)",
-                i,
-                files.len(),
-                (i as f64 / files.len() as f64) * 100.0
+                current,
+                total,
+                (current as f64 / total as f64) * 100.0
             );
-        }
+        }))
+    } else {
+        None
+    };
 
-        match process_file_for_index(file_path) {
-            Ok(summary) => summaries.push(summary),
-            Err(e) => {
-                if ctx.verbose {
-                    eprintln!("Error processing {}: {}", file_path.display(), e);
-                }
-                errors += 1;
-            }
-        }
-    }
+    let result = analyze_files_parallel(&files, progress_cb, ctx.verbose);
+    let summaries = result.summaries;
+    let errors = result.errors;
 
     // Add all summaries and write
     writer.add_summaries(summaries.clone());
@@ -379,27 +374,4 @@ fn collect_files_recursive(
     }
 
     Ok(())
-}
-
-/// Process a single file for indexing
-fn process_file_for_index(file_path: &std::path::Path) -> Result<crate::SemanticSummary> {
-    let lang = Lang::from_path(file_path)?;
-    let source = fs::read_to_string(file_path)?;
-
-    // Parse
-    let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&lang.tree_sitter_language())
-        .map_err(|e| McpDiffError::ParseFailure {
-            message: format!("Failed to set language for {}: {}", file_path.display(), e),
-        })?;
-
-    let tree = parser
-        .parse(&source, None)
-        .ok_or_else(|| McpDiffError::ParseFailure {
-            message: format!("Failed to parse file: {}", file_path.display()),
-        })?;
-
-    // Extract
-    crate::extract::extract(file_path, &source, &tree, lang)
 }

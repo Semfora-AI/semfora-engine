@@ -108,11 +108,13 @@ pub mod error;
 pub mod extract;
 pub mod fs_utils;
 pub mod git;
+pub mod indexing;
 pub mod installer;
 pub mod lang;
 pub mod mcp_server;
 pub mod module_registry;
 pub mod overlay;
+pub mod paths;
 pub mod ripgrep;
 pub mod risk;
 pub mod schema;
@@ -226,5 +228,14 @@ pub use security::{
 
 // Re-export filesystem utilities (Windows compatibility)
 pub use fs_utils::{atomic_rename, normalize_path};
+
+// Re-export path resolution utilities (CLI/MCP unification)
+pub use paths::{canonicalize_path, ensure_directory, resolve_path, resolve_path_or_cwd, resolve_pathbuf};
+
+// Re-export indexing utilities (CLI/MCP unification - DEDUP-102)
+pub use indexing::{
+    analyze_files_parallel, collect_files, collect_files_recursive, should_skip_path,
+    IndexGenerationResult, IndexingProgressCallback,
+};
 
 // Test change to trigger semfora-ci workflow

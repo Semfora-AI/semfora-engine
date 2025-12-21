@@ -4,15 +4,17 @@
 #![allow(dead_code)]
 
 use crate::utils::truncate_to_char_boundary;
-use rayon::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::SystemTime;
 
 use std::collections::{HashMap, HashSet};
 
 use crate::duplicate::{DuplicateDetector, FunctionSignature};
+use crate::indexing::{
+    analyze_files_with_stats as indexing_analyze_files_with_stats,
+    collect_files as indexing_collect_files, should_skip_path as indexing_should_skip_path,
+};
 use crate::{
     extract, extract_module_name, CacheDir, Lang, McpDiffError, SemanticSummary, ShardWriter,
     SymbolIndexEntry,
@@ -227,73 +229,23 @@ fn collect_source_files_recursive(
 }
 
 // ============================================================================
-// File Collection
+// File Collection (DEDUP-102: delegates to shared indexing module)
 // ============================================================================
 
-/// Recursively collect supported files from a directory
+/// Recursively collect supported files from a directory.
+///
+/// This function delegates to `crate::indexing::collect_files`.
+#[inline]
 pub fn collect_files(dir: &Path, max_depth: usize, extensions: &[String]) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    collect_files_recursive(dir, max_depth, 0, extensions, &mut files);
-    files
+    indexing_collect_files(dir, max_depth, extensions)
 }
 
-fn collect_files_recursive(
-    dir: &Path,
-    max_depth: usize,
-    current_depth: usize,
-    extensions: &[String],
-    files: &mut Vec<PathBuf>,
-) {
-    if current_depth > max_depth {
-        return;
-    }
-
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-
-        // Skip hidden files/directories and common non-source directories
-        if should_skip_path(&path) {
-            continue;
-        }
-
-        if path.is_dir() {
-            collect_files_recursive(&path, max_depth, current_depth + 1, extensions, files);
-        } else if path.is_file() {
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                // Check extension filter if provided
-                if !extensions.is_empty() && !extensions.iter().any(|e| e == ext) {
-                    continue;
-                }
-
-                // Check if language is supported
-                if Lang::from_extension(ext).is_ok() {
-                    files.push(path);
-                }
-            }
-        }
-    }
-}
-
-/// Check if a path should be skipped during file collection
-fn should_skip_path(path: &Path) -> bool {
-    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-        name.starts_with('.')
-            || name == "node_modules"
-            || name == "target"
-            || name == "dist"
-            || name == "build"
-            || name == ".next"
-            || name == "coverage"
-            || name == "__pycache__"
-            || name == "vendor"
-    } else {
-        false
-    }
+/// Check if a path should be skipped during file collection.
+///
+/// This function delegates to `crate::indexing::should_skip_path`.
+#[inline]
+pub fn should_skip_path(path: &Path) -> bool {
+    indexing_should_skip_path(path)
 }
 
 // ============================================================================
@@ -323,33 +275,15 @@ pub fn parse_and_extract(
 }
 
 // ============================================================================
-// Index Generation
+// Index Generation (DEDUP-102: delegates to shared indexing module)
 // ============================================================================
 
-/// Analyze a collection of files and return their semantic summaries with total bytes
+/// Analyze a collection of files and return their semantic summaries with total bytes.
+///
+/// This function delegates to `crate::indexing::analyze_files_with_stats`.
+#[inline]
 pub fn analyze_files_with_stats(files: &[PathBuf]) -> (Vec<SemanticSummary>, usize) {
-    let total_bytes_atomic = AtomicUsize::new(0);
-
-    let summaries: Vec<SemanticSummary> = files
-        .par_iter()
-        .filter_map(|file_path| {
-            let lang = match Lang::from_path(file_path) {
-                Ok(l) => l,
-                Err(_) => return None,
-            };
-
-            let source = match fs::read_to_string(file_path) {
-                Ok(s) => s,
-                Err(_) => return None,
-            };
-
-            total_bytes_atomic.fetch_add(source.len(), Ordering::Relaxed);
-
-            parse_and_extract(file_path, &source, lang).ok()
-        })
-        .collect();
-
-    (summaries, total_bytes_atomic.load(Ordering::Relaxed))
+    indexing_analyze_files_with_stats(files)
 }
 
 /// Generate a sharded index for a directory.
