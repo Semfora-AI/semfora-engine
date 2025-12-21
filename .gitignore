@@ -17,7 +17,7 @@
 
 # SQLite exports
 *.sqlite
-
+*.db
 # Demo/test output (except repo-compare-website)
 *.html
 !repo-compare-website/**/*.html
