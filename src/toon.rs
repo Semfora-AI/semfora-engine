@@ -7,13 +7,16 @@
 //! - Field headers emitted once per array
 //! - Stable field ordering enforced
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rtoon::encode_default;
 use serde_json::{json, Map, Value};
 
 use crate::analysis::{calculate_cognitive_complexity, max_nesting_depth};
-use crate::schema::{ModuleGroup, RepoOverview, RepoStats, RiskLevel, SemanticSummary, SymbolKind};
+use crate::schema::{
+    FrameworkEntryPoint, ModuleGroup, RepoOverview, RepoStats, RiskLevel, SemanticSummary,
+    SymbolKind,
+};
 use crate::shard::extract_module_name;
 use crate::utils::truncate_to_char_boundary;
 
@@ -551,13 +554,27 @@ fn build_module_groups_with_map(
 
 fn identify_entry_points(summaries: &[SemanticSummary]) -> Vec<String> {
     let mut entries = Vec::new();
+    let mut seen = HashSet::new();
+
+    let push_entry = |value: String, entries: &mut Vec<String>, seen: &mut HashSet<String>| {
+        if seen.insert(value.clone()) {
+            entries.push(value);
+        }
+    };
 
     for s in summaries {
         let file_lower = s.file.to_lowercase();
 
+        match s.framework_entry_point {
+            FrameworkEntryPoint::NextPage | FrameworkEntryPoint::NextSpecialFile => {
+                push_entry(s.file.clone(), &mut entries, &mut seen);
+            }
+            _ => {}
+        }
+
         // Next.js entry points
         if file_lower.ends_with("page.tsx") || file_lower.ends_with("page.jsx") {
-            entries.push(s.file.clone());
+            push_entry(s.file.clone(), &mut entries, &mut seen);
         }
 
         // API routes
@@ -565,7 +582,7 @@ fn identify_entry_points(summaries: &[SemanticSummary]) -> Vec<String> {
             if let Some(ref sym) = s.symbol {
                 let method = sym.to_uppercase();
                 if matches!(method.as_str(), "GET" | "POST" | "PUT" | "DELETE" | "PATCH") {
-                    entries.push(format!("{} {}", method, s.file));
+                    push_entry(format!("{} {}", method, s.file), &mut entries, &mut seen);
                 }
             }
         }
@@ -575,7 +592,7 @@ fn identify_entry_points(summaries: &[SemanticSummary]) -> Vec<String> {
             || file_lower.ends_with("index.ts")
             || file_lower.ends_with("index.js")
         {
-            entries.push(s.file.clone());
+            push_entry(s.file.clone(), &mut entries, &mut seen);
         }
     }
 

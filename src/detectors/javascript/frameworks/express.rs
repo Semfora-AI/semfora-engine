@@ -10,7 +10,7 @@
 use tree_sitter::Node;
 
 use crate::detectors::common::{get_node_text, push_unique_insertion, visit_all};
-use crate::schema::SemanticSummary;
+use crate::schema::{FrameworkEntryPoint, SemanticSummary, SymbolKind};
 
 /// Enhance semantic summary with Express-specific information
 ///
@@ -30,6 +30,48 @@ pub fn enhance(summary: &mut SemanticSummary, root: &Node, source: &str) {
 
     // Detect common patterns
     detect_common_patterns(summary, source);
+
+    // Set framework entry points
+    detect_entry_points(summary, source);
+}
+
+/// Detect and mark Express entry points
+fn detect_entry_points(summary: &mut SemanticSummary, source: &str) {
+    // Entry point detection (app.listen)
+    if is_entry_point(source) {
+        summary.framework_entry_point = FrameworkEntryPoint::ExpressRoute;
+
+        // Mark listen-related symbols
+        for symbol in &mut summary.symbols {
+            if symbol.name == "app" || symbol.name.contains("server") || symbol.name.contains("listen") {
+                symbol.framework_entry_point = FrameworkEntryPoint::ExpressRoute;
+            }
+        }
+    }
+
+    // Route file detection
+    if is_route_file(source) {
+        summary.framework_entry_point = FrameworkEntryPoint::ExpressRoute;
+
+        // Mark exported functions as route handlers
+        for symbol in &mut summary.symbols {
+            if symbol.is_exported && symbol.kind == SymbolKind::Function {
+                symbol.framework_entry_point = FrameworkEntryPoint::ExpressRoute;
+            }
+        }
+    }
+
+    // Middleware file detection
+    if is_middleware_file(source) {
+        summary.framework_entry_point = FrameworkEntryPoint::ExpressMiddleware;
+
+        // Mark exported functions as middleware
+        for symbol in &mut summary.symbols {
+            if symbol.is_exported && symbol.kind == SymbolKind::Function {
+                symbol.framework_entry_point = FrameworkEntryPoint::ExpressMiddleware;
+            }
+        }
+    }
 }
 
 // =============================================================================

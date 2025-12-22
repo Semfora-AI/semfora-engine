@@ -26,9 +26,17 @@ pub fn run_query(args: &QueryArgs, ctx: &CommandContext) -> Result<String> {
             kind,
             risk,
             limit,
+            include_escape_refs,
         } => {
             if *symbols {
-                run_list_module_symbols(name, kind.as_deref(), risk.as_deref(), *limit, ctx)
+                run_list_module_symbols(
+                    name,
+                    kind.as_deref(),
+                    risk.as_deref(),
+                    *limit,
+                    *include_escape_refs,
+                    ctx,
+                )
             } else {
                 run_get_module(name, ctx)
             }
@@ -64,6 +72,7 @@ pub fn run_query(args: &QueryArgs, ctx: &CommandContext) -> Result<String> {
             stats_only,
             limit,
             offset,
+            include_escape_refs,
         } => run_get_callgraph(
             path.as_ref(),
             module.as_deref(),
@@ -72,6 +81,7 @@ pub fn run_query(args: &QueryArgs, ctx: &CommandContext) -> Result<String> {
             *stats_only,
             *limit,
             *offset,
+            *include_escape_refs,
             ctx,
         ),
         QueryType::File {
@@ -81,7 +91,17 @@ pub fn run_query(args: &QueryArgs, ctx: &CommandContext) -> Result<String> {
             kind,
             risk,
             context,
-        } => run_file_symbols(repo_path.as_ref(), path, *source, kind.as_deref(), risk.as_deref(), *context, ctx),
+            include_escape_refs,
+        } => run_file_symbols(
+            repo_path.as_ref(),
+            path,
+            *source,
+            kind.as_deref(),
+            risk.as_deref(),
+            *context,
+            *include_escape_refs,
+            ctx,
+        ),
         QueryType::Languages => run_list_languages(ctx),
     }
 }
@@ -487,6 +507,7 @@ fn run_list_module_symbols(
     kind_filter: Option<&str>,
     risk_filter: Option<&str>,
     limit: usize,
+    include_escape_refs: bool,
     ctx: &CommandContext,
 ) -> Result<String> {
     let repo_dir = std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
@@ -520,6 +541,9 @@ fn run_list_module_symbols(
                 if !entry.risk.eq_ignore_ascii_case(rf) {
                     continue;
                 }
+            }
+            if !include_escape_refs && entry.is_escape_local {
+                continue;
             }
 
             symbols.push(entry);
@@ -945,19 +969,27 @@ pub fn run_get_callers(
         }
     }
 
-    // Load symbol names for resolution
+    // Load symbol entries for resolution
     let mut symbol_names: HashMap<String, String> = HashMap::new();
+    let mut target_entry: Option<SymbolIndexEntry> = None;
     if let Ok(entries) = cache.load_all_symbol_entries() {
         for entry in entries {
+            if entry.hash == hash {
+                target_entry = Some(entry.clone());
+            }
             symbol_names.insert(entry.hash.clone(), entry.symbol.clone());
         }
     }
 
-    // Get target name
+    // Get target name and framework entry point
     let target_name = symbol_names
         .get(hash)
         .cloned()
         .unwrap_or_else(|| hash.to_string());
+    let target_fep = target_entry
+        .as_ref()
+        .map(|e| e.framework_entry_point)
+        .unwrap_or_default();
 
     // BFS to find callers at each depth level
     let depth = depth.min(3); // Max depth 3 like MCP
@@ -1002,13 +1034,22 @@ pub fn run_get_callers(
         })
         .collect();
 
+    // Include framework entry point info for no-caller symbols
+    let fep_str = if target_fep.is_none() {
+        None
+    } else {
+        Some(format!("{:?}", target_fep).to_lowercase())
+    };
+
     let json_value = serde_json::json!({
         "_type": "callers",
         "target": target_name,
         "target_hash": hash,
         "depth": depth,
         "callers": callers_json,
-        "count": all_callers.len()
+        "count": all_callers.len(),
+        "framework_entry_point": fep_str,
+        "is_framework_entry_point": !target_fep.is_none()
     });
 
     let mut output = String::new();
@@ -1024,7 +1065,14 @@ pub fn run_get_callers(
             output.push_str(&format!("total_callers: {}\n", all_callers.len()));
 
             if all_callers.is_empty() {
-                output.push_str("callers: (none - this may be an entry point or unused)\n");
+                if !target_fep.is_none() {
+                    output.push_str(&format!(
+                        "callers: (none - {} framework entry point)\n",
+                        format!("{:?}", target_fep).to_lowercase()
+                    ));
+                } else {
+                    output.push_str("callers: (none - may be unused or an undetected entry point)\n");
+                }
             } else {
                 output.push_str(&format!(
                     "callers[{}]{{name,hash,depth}}:\n",
@@ -1062,7 +1110,14 @@ pub fn run_get_callers(
             output.push_str(&format!("callers[{}]:\n", all_callers.len()));
 
             if all_callers.is_empty() {
-                output.push_str("  (none - this may be an entry point or unused)\n");
+                if !target_fep.is_none() {
+                    output.push_str(&format!(
+                        "  (none - {} framework entry point)\n",
+                        format!("{:?}", target_fep).to_lowercase()
+                    ));
+                } else {
+                    output.push_str("  (none - may be unused or an undetected entry point)\n");
+                }
             } else {
                 for (caller_hash, caller_name, d) in &all_callers {
                     output.push_str(&format!("  [d{}] {} ({})\n", d, caller_name, caller_hash));
@@ -1100,6 +1155,7 @@ pub fn run_get_callgraph(
     stats_only: bool,
     limit: usize,
     offset: usize,
+    include_escape_refs: bool,
     ctx: &CommandContext,
 ) -> Result<String> {
     use std::collections::{HashMap, HashSet};
@@ -1114,7 +1170,7 @@ pub fn run_get_callgraph(
 
     // Handle SQLite export
     if let Some(export_path) = export {
-        return run_export_sqlite(export_path, &cache, ctx);
+        return run_export_sqlite(export_path, &cache, include_escape_refs, ctx);
     }
 
     // Load call graph using TOON parser
@@ -1124,6 +1180,8 @@ pub fn run_get_callgraph(
             path: "Call graph not found or empty. Run `semfora index generate` first.".to_string(),
         });
     }
+
+    let call_graph = filter_escape_edges(call_graph, include_escape_refs);
 
     // Build hash-to-name mapping for symbol resolution
     let hash_to_name: HashMap<String, String> = cache
@@ -1142,7 +1200,7 @@ pub fn run_get_callgraph(
             sym.contains(':') && sym.chars().all(|c| c.is_ascii_hexdigit() || c == ':');
 
         if is_hash_like {
-            Some(std::iter::once(sym.to_string()).collect())
+            Some(std::iter::once(normalize_edge_hash(sym)).collect())
         } else {
             // Search by name - first try exact match, then partial
             let exact_matches: HashSet<String> = hash_to_name
@@ -1263,7 +1321,11 @@ pub fn run_get_callgraph(
 
             // Use resolved symbol hashes for filtering
             let symbol_match = if let Some(ref hashes) = resolved_symbol_hashes {
-                hashes.contains(*caller) || callees.iter().any(|c| hashes.contains(c))
+                hashes.contains(*caller)
+                    || callees.iter().any(|c| {
+                        let edge = crate::schema::CallGraphEdge::decode(c);
+                        hashes.contains(&edge.callee)
+                    })
             } else {
                 true
             };
@@ -1284,9 +1346,9 @@ pub fn run_get_callgraph(
                 .get(*caller_hash)
                 .map(|n| n.as_str())
                 .unwrap_or(*caller_hash);
-            let callee_names: Vec<&str> = callee_hashes
+            let callee_names: Vec<String> = callee_hashes
                 .iter()
-                .map(|h| hash_to_name.get(h).map(|n| n.as_str()).unwrap_or(h.as_str()))
+                .map(|h| format_callee_display(h, &hash_to_name))
                 .collect();
             serde_json::json!({
                 "caller": caller_name,
@@ -1330,10 +1392,10 @@ pub fn run_get_callgraph(
                     .map(|n| n.as_str())
                     .unwrap_or(*caller_hash);
                 // Show caller -> [callees] format with resolved names
-                let callees_display: Vec<&str> = callees
+                let callees_display: Vec<String> = callees
                     .iter()
                     .take(3)
-                    .map(|h| hash_to_name.get(h).map(|n| n.as_str()).unwrap_or(h.as_str()))
+                    .map(|h| format_callee_display(h, &hash_to_name))
                     .collect();
                 let callees_str = if callees.len() > 3 {
                     format!(
@@ -1358,8 +1420,61 @@ pub fn run_get_callgraph(
     Ok(output)
 }
 
+fn filter_escape_edges(
+    call_graph: std::collections::HashMap<String, Vec<String>>,
+    include_escape_refs: bool,
+) -> std::collections::HashMap<String, Vec<String>> {
+    if include_escape_refs {
+        return call_graph;
+    }
+
+    let mut filtered = std::collections::HashMap::new();
+
+    for (caller, callees) in call_graph {
+        let kept: Vec<String> = callees
+            .into_iter()
+            .filter(|callee| {
+                let edge = crate::schema::CallGraphEdge::decode(callee);
+                !edge.edge_kind.is_escape_ref()
+            })
+            .collect();
+
+        if !kept.is_empty() {
+            filtered.insert(caller, kept);
+        }
+    }
+
+    filtered
+}
+
+fn normalize_edge_hash(sym: &str) -> String {
+    crate::schema::CallGraphEdge::decode(sym).callee
+}
+
+fn format_callee_display(
+    callee: &str,
+    hash_to_name: &std::collections::HashMap<String, String>,
+) -> String {
+    let edge = crate::schema::CallGraphEdge::decode(callee);
+    let base = hash_to_name
+        .get(&edge.callee)
+        .map(|n| n.as_str())
+        .unwrap_or(edge.callee.as_str());
+
+    if edge.edge_kind == crate::schema::RefKind::None {
+        base.to_string()
+    } else {
+        format!("{}:{}", base, edge.edge_kind.as_edge_kind())
+    }
+}
+
 /// Export call graph to SQLite
-fn run_export_sqlite(path: &str, cache: &CacheDir, _ctx: &CommandContext) -> Result<String> {
+fn run_export_sqlite(
+    path: &str,
+    cache: &CacheDir,
+    include_escape_refs: bool,
+    _ctx: &CommandContext,
+) -> Result<String> {
     use crate::sqlite_export::{default_export_path, SqliteExporter};
 
     let output_path = if path.is_empty() {
@@ -1371,7 +1486,7 @@ fn run_export_sqlite(path: &str, cache: &CacheDir, _ctx: &CommandContext) -> Res
     eprintln!("Exporting call graph to: {}", output_path.display());
 
     let exporter = SqliteExporter::new();
-    let stats = exporter.export(cache, &output_path, None)?;
+    let stats = exporter.export(cache, &output_path, None, include_escape_refs)?;
 
     Ok(format!(
         "Export complete:\n  Path: {}\n  Nodes: {}\n  Edges: {}\n  Size: {} bytes",
@@ -1391,6 +1506,7 @@ pub fn run_file_symbols(
     kind_filter: Option<&str>,
     risk_filter: Option<&str>,
     context: usize,
+    include_escape_refs: bool,
     ctx: &CommandContext,
 ) -> Result<String> {
     let repo_dir = match repo_path {
@@ -1426,6 +1542,7 @@ pub fn run_file_symbols(
                 e.risk.to_lowercase() == r.to_lowercase()
             })
         })
+        .filter(|e| include_escape_refs || !e.is_escape_local)
         .collect();
 
     if symbols.is_empty() {
@@ -1647,6 +1764,16 @@ fn symbol_from_json(sym: &serde_json::Value, module_name: &str) -> SymbolIndexEn
             .to_string(),
         cognitive_complexity: sym.get("cc").and_then(|c| c.as_u64()).unwrap_or(0) as usize,
         max_nesting: sym.get("nest").and_then(|n| n.as_u64()).unwrap_or(0) as usize,
+        is_escape_local: sym
+            .get("is_escape_local")
+            .or_else(|| sym.get("el"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        framework_entry_point: sym
+            .get("framework_entry_point")
+            .or_else(|| sym.get("fep"))
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default(),
     }
 }
 
