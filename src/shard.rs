@@ -1390,17 +1390,35 @@ fn build_symbol_lookup(summaries: &[SemanticSummary]) -> HashMap<String, Vec<(St
 
 /// Resolve a call name to a symbol hash if possible
 /// Returns the hash if uniquely resolved, or the original name if ambiguous/external
+/// When multiple symbols have the same name, prefers same-file matches (local scope)
 fn resolve_call_to_hash(
     call_name: &str,
     lookup: &HashMap<String, Vec<(String, String)>>,
+    caller_file_hash: &str,
 ) -> String {
+    // Helper to find best match from a list, preferring same-file matches
+    let find_best_match = |matches: &[(String, String)]| -> Option<String> {
+        if matches.is_empty() {
+            return None;
+        }
+        if matches.len() == 1 {
+            return Some(matches[0].0.clone());
+        }
+        // Multiple matches - prefer same file (hash starts with same file_hash prefix)
+        let same_file_prefix = format!("{}:", caller_file_hash);
+        for (hash, _namespace) in matches {
+            if hash.starts_with(&same_file_prefix) {
+                return Some(hash.clone());
+            }
+        }
+        // No same-file match, fall back to first
+        Some(matches[0].0.clone())
+    };
+
     // Try exact match first (e.g., "GetGoldAmount" or "PlayerEntity.GetGoldAmount")
     if let Some(matches) = lookup.get(call_name) {
-        if matches.len() == 1 {
-            return matches[0].0.clone();
-        }
-        if !matches.is_empty() {
-            return matches[0].0.clone();
+        if let Some(resolved) = find_best_match(matches) {
+            return resolved;
         }
     }
 
@@ -1410,12 +1428,8 @@ fn resolve_call_to_hash(
         let method_name = &call_name[dot_pos + 1..];
         if !method_name.is_empty() {
             if let Some(matches) = lookup.get(method_name) {
-                if matches.len() == 1 {
-                    return matches[0].0.clone();
-                }
-                // For ambiguous matches, still prefer resolved over external
-                if !matches.is_empty() {
-                    return matches[0].0.clone();
+                if let Some(resolved) = find_best_match(matches) {
+                    return resolved;
                 }
             }
         }
@@ -1462,6 +1476,17 @@ fn build_call_graph(
 
             let mut entries: Vec<(String, Vec<CallGraphEdge>)> = Vec::new();
 
+            // Compute file hash once for this file (used to prefer same-file call resolution)
+            let caller_file_hash = crate::overlay::extract_file_hash(
+                summary.symbol_id.as_ref().map(|s| s.hash.as_str()).unwrap_or("")
+            ).to_string();
+            // Fallback: compute from file path if no symbol_id
+            let caller_file_hash = if caller_file_hash.is_empty() {
+                format!("{:08x}", crate::schema::fnv1a_hash(&summary.file) as u32)
+            } else {
+                caller_file_hash
+            };
+
             // Process each symbol in the file
             for symbol in &summary.symbols {
                 let hash = compute_symbol_hash(symbol, &summary.file);
@@ -1474,7 +1499,7 @@ fn build_call_graph(
                     } else {
                         c.name.clone()
                     };
-                    let resolved = resolve_call_to_hash(&call_name, &symbol_lookup);
+                    let resolved = resolve_call_to_hash(&call_name, &symbol_lookup, &caller_file_hash);
                     let edge = CallGraphEdge::new(resolved, c.ref_kind);
 
                     // Deduplicate by callee+edge_kind
@@ -1487,7 +1512,7 @@ fn build_call_graph(
                 for state in &symbol.state_changes {
                     if !state.initializer.is_empty() {
                         if let Some(call_name) = extract_call_from_initializer(&state.initializer) {
-                            let resolved = resolve_call_to_hash(&call_name, &symbol_lookup);
+                            let resolved = resolve_call_to_hash(&call_name, &symbol_lookup, &caller_file_hash);
                             let edge = CallGraphEdge::call(resolved);
                             if !edges.iter().any(|e| e.callee == edge.callee && e.edge_kind == edge.edge_kind) {
                                 edges.push(edge);
@@ -1511,7 +1536,7 @@ fn build_call_graph(
                     } else {
                         c.name.clone()
                     };
-                    let resolved = resolve_call_to_hash(&call_name, &symbol_lookup);
+                    let resolved = resolve_call_to_hash(&call_name, &symbol_lookup, &caller_file_hash);
                     let edge = CallGraphEdge::new(resolved, c.ref_kind);
                     if !edges.iter().any(|e| e.callee == edge.callee && e.edge_kind == edge.edge_kind) {
                         edges.push(edge);
@@ -1521,7 +1546,7 @@ fn build_call_graph(
                 for state in &summary.state_changes {
                     if !state.initializer.is_empty() {
                         if let Some(call_name) = extract_call_from_initializer(&state.initializer) {
-                            let resolved = resolve_call_to_hash(&call_name, &symbol_lookup);
+                            let resolved = resolve_call_to_hash(&call_name, &symbol_lookup, &caller_file_hash);
                             let edge = CallGraphEdge::call(resolved);
                             if !edges.iter().any(|e| e.callee == edge.callee && e.edge_kind == edge.edge_kind) {
                                 edges.push(edge);
@@ -1534,7 +1559,7 @@ fn build_call_graph(
                 // Only exclude Rust-style namespace paths (::) - these are always call kind
                 for dep in &summary.added_dependencies {
                     if !dep.contains("::") {
-                        let resolved = resolve_call_to_hash(dep, &symbol_lookup);
+                        let resolved = resolve_call_to_hash(dep, &symbol_lookup, &caller_file_hash);
                         let edge = CallGraphEdge::call(resolved);
                         if !edges.iter().any(|e| e.callee == edge.callee && e.edge_kind == edge.edge_kind) {
                             edges.push(edge);

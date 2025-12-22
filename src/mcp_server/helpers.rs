@@ -14,7 +14,7 @@ use crate::indexing::{
     analyze_files_with_stats as indexing_analyze_files_with_stats,
     collect_files as indexing_collect_files, should_skip_path as indexing_should_skip_path,
 };
-use crate::cache::load_function_signatures as cache_load_function_signatures;
+use crate::cache::{load_function_signatures as cache_load_function_signatures, split_respecting_quotes};
 use crate::{
     extract_module_name, CacheDir, Lang, SemanticSummary, ShardWriter, SymbolIndexEntry,
 };
@@ -785,14 +785,16 @@ pub fn build_reverse_call_graph(cache: &CacheDir) -> HashMap<String, Vec<String>
             continue;
         }
 
-        if let Some(colon_pos) = line.find(':') {
-            let caller = line[..colon_pos].trim().to_string();
-            let rest = line[colon_pos + 1..].trim();
+        // Look for ": [" to find separator between caller hash and callee array
+        // Using just ':' would incorrectly split hashes like "file_hash:symbol_hash"
+        if let Some(sep_pos) = line.find(": [") {
+            let caller = line[..sep_pos].trim().to_string();
+            let rest = line[sep_pos + 2..].trim();
 
             if rest.starts_with('[') && rest.ends_with(']') {
                 let inner = &rest[1..rest.len() - 1];
-                for callee in inner.split(',').filter(|s| !s.is_empty()) {
-                    let callee = callee.trim().trim_matches('"').to_string();
+                // Use split_respecting_quotes for callees with commas in their names
+                for callee in split_respecting_quotes(inner) {
                     // Skip external calls
                     if !callee.starts_with("ext:") {
                         reverse_graph

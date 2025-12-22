@@ -67,6 +67,37 @@ fn match_glob_pattern(symbol: &str, pattern: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Split a string by comma while respecting quoted strings.
+/// Handles entries like: "foo","bar","ext:baz(a, b, c).unwrap"
+pub fn split_respecting_quotes(s: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut start = 0;
+    let mut in_quotes = false;
+    let bytes = s.as_bytes();
+
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'"' => in_quotes = !in_quotes,
+            b',' if !in_quotes => {
+                let part = s[start..i].trim();
+                if !part.is_empty() {
+                    result.push(part.trim_matches('"').to_string());
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+
+    // Don't forget the last part
+    let part = s[start..].trim();
+    if !part.is_empty() {
+        result.push(part.trim_matches('"').to_string());
+    }
+
+    result
+}
+
 /// Metadata for cached files to detect staleness
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheMeta {
@@ -671,14 +702,10 @@ impl CacheDir {
                 let hash = line[..bracket_pos].trim().to_string();
                 let rest = line[bracket_pos + 2..].trim();
 
-                // Parse the array part
+                // Parse the array part (respecting quotes for callees with commas)
                 if rest.starts_with('[') && rest.ends_with(']') {
                     let inner = &rest[1..rest.len() - 1];
-                    let calls: Vec<String> = inner
-                        .split(',')
-                        .map(|s| s.trim().trim_matches('"').to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
+                    let calls = split_respecting_quotes(inner);
 
                     if !calls.is_empty() {
                         graph.insert(hash, calls);
@@ -1923,13 +1950,26 @@ impl CacheDir {
     }
 
     /// Resolve a call name to a symbol hash
+    /// When multiple symbols have the same name, prefers same-file matches (local scope)
     fn resolve_call_to_hash(
         call_name: &str,
         lookup: &std::collections::HashMap<String, Vec<String>>,
+        caller_file_hash: &str,
     ) -> String {
         if let Some(matches) = lookup.get(call_name) {
-            if !matches.is_empty() {
-                // Return first match (could be enhanced with namespace disambiguation)
+            if matches.is_empty() {
+                // No matches
+            } else if matches.len() == 1 {
+                return matches[0].clone();
+            } else {
+                // Multiple matches - prefer same file (hash starts with same file_hash prefix)
+                let same_file_prefix = format!("{}:", caller_file_hash);
+                for hash in matches {
+                    if hash.starts_with(&same_file_prefix) {
+                        return hash.clone();
+                    }
+                }
+                // No same-file match, fall back to first
                 return matches[0].clone();
             }
         }
@@ -1975,6 +2015,17 @@ impl CacheDir {
 
                 let mut entries: Vec<(String, Vec<String>)> = Vec::new();
 
+                // Compute file hash once for this file (used to prefer same-file call resolution)
+                let caller_file_hash = crate::overlay::extract_file_hash(
+                    summary.symbol_id.as_ref().map(|s| s.hash.as_str()).unwrap_or("")
+                ).to_string();
+                // Fallback: compute from file path if no symbol_id
+                let caller_file_hash = if caller_file_hash.is_empty() {
+                    format!("{:08x}", crate::schema::fnv1a_hash(&summary.file) as u32)
+                } else {
+                    caller_file_hash
+                };
+
                 // Process each symbol in the file
                 for symbol in &summary.symbols {
                     total_symbols_from_vec.fetch_add(1, Ordering::Relaxed);
@@ -1988,7 +2039,7 @@ impl CacheDir {
                         } else {
                             c.name.clone()
                         };
-                        let resolved = Self::resolve_call_to_hash(&call_name, &symbol_lookup);
+                        let resolved = Self::resolve_call_to_hash(&call_name, &symbol_lookup, &caller_file_hash);
                         if !calls.contains(&resolved) {
                             calls.push(resolved);
                         }
@@ -2001,7 +2052,7 @@ impl CacheDir {
                                 Self::extract_call_from_initializer(&state.initializer)
                             {
                                 let resolved =
-                                    Self::resolve_call_to_hash(&call_name, &symbol_lookup);
+                                    Self::resolve_call_to_hash(&call_name, &symbol_lookup, &caller_file_hash);
                                 if !calls.contains(&resolved) {
                                     calls.push(resolved);
                                 }
@@ -2025,7 +2076,7 @@ impl CacheDir {
                         } else {
                             c.name.clone()
                         };
-                        let resolved = Self::resolve_call_to_hash(&call_name, &symbol_lookup);
+                        let resolved = Self::resolve_call_to_hash(&call_name, &symbol_lookup, &caller_file_hash);
                         if !calls.contains(&resolved) {
                             calls.push(resolved);
                         }
@@ -2037,7 +2088,7 @@ impl CacheDir {
                                 Self::extract_call_from_initializer(&state.initializer)
                             {
                                 let resolved =
-                                    Self::resolve_call_to_hash(&call_name, &symbol_lookup);
+                                    Self::resolve_call_to_hash(&call_name, &symbol_lookup, &caller_file_hash);
                                 if !calls.contains(&resolved) {
                                     calls.push(resolved);
                                 }
@@ -2059,7 +2110,7 @@ impl CacheDir {
                                 .map(|c| c.is_lowercase())
                                 .unwrap_or(false)
                             {
-                                let resolved = Self::resolve_call_to_hash(dep, &symbol_lookup);
+                                let resolved = Self::resolve_call_to_hash(dep, &symbol_lookup, &caller_file_hash);
                                 if !calls.contains(&resolved) {
                                     calls.push(resolved);
                                 }

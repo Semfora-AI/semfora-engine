@@ -409,7 +409,8 @@ impl SqliteExporter {
                 if rest.starts_with('[') && rest.ends_with(']') {
                     let inner = &rest[1..rest.len() - 1];
 
-                    for callee_str in inner.split(',').filter(|s| !s.is_empty()) {
+                    // Split by comma while respecting quoted strings
+                    for callee_str in split_respecting_quotes(inner) {
                         // Parse edge with optional edge_kind suffix
                         let edge = CallGraphEdge::decode(callee_str);
                         let callee = &edge.callee;
@@ -662,6 +663,37 @@ impl SqliteExporter {
 /// Get default export path for a repository
 pub fn default_export_path(cache: &CacheDir) -> PathBuf {
     cache.root.join("call_graph.sqlite")
+}
+
+/// Split a string by comma while respecting quoted strings.
+/// Handles entries like: "foo","bar","ext:baz(a, b, c).unwrap"
+fn split_respecting_quotes(s: &str) -> Vec<&str> {
+    let mut result = Vec::new();
+    let mut start = 0;
+    let mut in_quotes = false;
+    let bytes = s.as_bytes();
+
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'"' => in_quotes = !in_quotes,
+            b',' if !in_quotes => {
+                let part = s[start..i].trim();
+                if !part.is_empty() {
+                    result.push(part);
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+
+    // Don't forget the last part
+    let part = s[start..].trim();
+    if !part.is_empty() {
+        result.push(part);
+    }
+
+    result
 }
 
 /// Parse line range string (e.g., "45-89") into (start, end)
