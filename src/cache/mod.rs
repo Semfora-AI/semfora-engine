@@ -2371,8 +2371,9 @@ pub struct SymbolIndexEntry {
     #[serde(rename = "h")]
     pub hash: String,
 
-    /// Semantic hash (for move detection and duplicate finding)
-    #[serde(rename = "sh", default, skip_serializing_if = "String::is_empty")]
+    /// Semantic hash (for internal move detection and duplicate finding)
+    /// Note: Not serialized to API responses - only full hash (h) works with get_callers/get_symbol
+    #[serde(skip_serializing, default)]
     pub semantic_hash: String,
 
     /// Symbol kind (fn, struct, component, enum, trait, etc.)
