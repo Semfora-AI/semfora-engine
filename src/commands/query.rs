@@ -64,6 +64,7 @@ pub fn run_query(args: &QueryArgs, ctx: &CommandContext) -> Result<String> {
             stats_only,
             limit,
             offset,
+            include_escape_refs,
         } => run_get_callgraph(
             path.as_ref(),
             module.as_deref(),
@@ -72,6 +73,7 @@ pub fn run_query(args: &QueryArgs, ctx: &CommandContext) -> Result<String> {
             *stats_only,
             *limit,
             *offset,
+            *include_escape_refs,
             ctx,
         ),
         QueryType::File {
@@ -1131,6 +1133,7 @@ pub fn run_get_callgraph(
     stats_only: bool,
     limit: usize,
     offset: usize,
+    include_escape_refs: bool,
     ctx: &CommandContext,
 ) -> Result<String> {
     use std::collections::{HashMap, HashSet};
@@ -1145,7 +1148,7 @@ pub fn run_get_callgraph(
 
     // Handle SQLite export
     if let Some(export_path) = export {
-        return run_export_sqlite(export_path, &cache, ctx);
+        return run_export_sqlite(export_path, &cache, include_escape_refs, ctx);
     }
 
     // Load call graph using TOON parser
@@ -1155,6 +1158,8 @@ pub fn run_get_callgraph(
             path: "Call graph not found or empty. Run `semfora index generate` first.".to_string(),
         });
     }
+
+    let call_graph = filter_escape_edges(call_graph, include_escape_refs);
 
     // Build hash-to-name mapping for symbol resolution
     let hash_to_name: HashMap<String, String> = cache
@@ -1389,8 +1394,40 @@ pub fn run_get_callgraph(
     Ok(output)
 }
 
+fn filter_escape_edges(
+    call_graph: std::collections::HashMap<String, Vec<String>>,
+    include_escape_refs: bool,
+) -> std::collections::HashMap<String, Vec<String>> {
+    if include_escape_refs {
+        return call_graph;
+    }
+
+    let mut filtered = std::collections::HashMap::new();
+
+    for (caller, callees) in call_graph {
+        let kept: Vec<String> = callees
+            .into_iter()
+            .filter(|callee| {
+                let edge = crate::schema::CallGraphEdge::decode(callee);
+                !edge.edge_kind.is_escape_ref()
+            })
+            .collect();
+
+        if !kept.is_empty() {
+            filtered.insert(caller, kept);
+        }
+    }
+
+    filtered
+}
+
 /// Export call graph to SQLite
-fn run_export_sqlite(path: &str, cache: &CacheDir, _ctx: &CommandContext) -> Result<String> {
+fn run_export_sqlite(
+    path: &str,
+    cache: &CacheDir,
+    include_escape_refs: bool,
+    _ctx: &CommandContext,
+) -> Result<String> {
     use crate::sqlite_export::{default_export_path, SqliteExporter};
 
     let output_path = if path.is_empty() {
@@ -1402,7 +1439,7 @@ fn run_export_sqlite(path: &str, cache: &CacheDir, _ctx: &CommandContext) -> Res
     eprintln!("Exporting call graph to: {}", output_path.display());
 
     let exporter = SqliteExporter::new();
-    let stats = exporter.export(cache, &output_path, None)?;
+    let stats = exporter.export(cache, &output_path, None, include_escape_refs)?;
 
     Ok(format!(
         "Export complete:\n  Path: {}\n  Nodes: {}\n  Edges: {}\n  Size: {} bytes",

@@ -556,7 +556,7 @@ fn identify_entry_points(summaries: &[SemanticSummary]) -> Vec<String> {
     let mut entries = Vec::new();
     let mut seen = HashSet::new();
 
-    let mut push_entry = |value: String, entries: &mut Vec<String>, seen: &mut HashSet<String>| {
+    let push_entry = |value: String, entries: &mut Vec<String>, seen: &mut HashSet<String>| {
         if seen.insert(value.clone()) {
             entries.push(value);
         }

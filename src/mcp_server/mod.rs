@@ -553,6 +553,7 @@ impl McpDiffServer {
         let limit = request.limit.unwrap_or(500).min(2000) as usize;
         let offset = request.offset.unwrap_or(0) as usize;
         let stats_only = request.summary_only.unwrap_or(false);
+        let include_escape_refs = request.include_escape_refs.unwrap_or(false);
 
         let ctx = CommandContext {
             format: OutputFormat::Toon,
@@ -568,6 +569,7 @@ impl McpDiffServer {
             stats_only,
             limit,
             offset,
+            include_escape_refs,
             &ctx,
         ) {
             Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),

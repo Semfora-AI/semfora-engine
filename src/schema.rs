@@ -1025,7 +1025,7 @@ pub struct JsxElement {
 }
 
 /// Kind of reference for variable tracking
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub enum RefKind {
     /// Not a variable reference (regular function call)
     #[default]
@@ -1036,12 +1036,26 @@ pub enum RefKind {
     Write,
     /// Both reading and writing (e.g., x += 1)
     ReadWrite,
+    /// Reading a local variable that escapes its scope (passed/returned)
+    EscapeRead,
+    /// Writing a local variable that escapes its scope
+    EscapeWrite,
+    /// Read+write on a local variable that escapes its scope
+    EscapeReadWrite,
 }
 
 impl RefKind {
     /// Returns true if this is any kind of variable reference
     pub fn is_variable_ref(&self) -> bool {
         !matches!(self, RefKind::None)
+    }
+
+    /// Returns true if this is a local-escape variable reference
+    pub fn is_escape_ref(&self) -> bool {
+        matches!(
+            self,
+            RefKind::EscapeRead | RefKind::EscapeWrite | RefKind::EscapeReadWrite
+        )
     }
 
     /// Returns the edge kind string for SQLite export
@@ -1051,6 +1065,9 @@ impl RefKind {
             RefKind::Read => "read",
             RefKind::Write => "write",
             RefKind::ReadWrite => "readwrite",
+            RefKind::EscapeRead => "escape_read",
+            RefKind::EscapeWrite => "escape_write",
+            RefKind::EscapeReadWrite => "escape_readwrite",
         }
     }
 
@@ -1060,6 +1077,9 @@ impl RefKind {
             "read" => RefKind::Read,
             "write" => RefKind::Write,
             "readwrite" => RefKind::ReadWrite,
+            "escape_read" => RefKind::EscapeRead,
+            "escape_write" => RefKind::EscapeWrite,
+            "escape_readwrite" => RefKind::EscapeReadWrite,
             _ => RefKind::None, // "call" or any other value
         }
     }
@@ -1106,7 +1126,16 @@ impl CallGraphEdge {
         if let Some(colon_pos) = s.rfind(':') {
             // Check if the suffix after the last colon is an edge kind
             let suffix = &s[colon_pos + 1..];
-            if matches!(suffix, "read" | "write" | "readwrite" | "call") {
+            if matches!(
+                suffix,
+                "read"
+                    | "write"
+                    | "readwrite"
+                    | "escape_read"
+                    | "escape_write"
+                    | "escape_readwrite"
+                    | "call"
+            ) {
                 return Self {
                     callee: s[..colon_pos].to_string(),
                     edge_kind: RefKind::from_edge_kind(suffix),

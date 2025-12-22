@@ -396,6 +396,10 @@ pub enum QueryType {
         /// Skip first N edges (for pagination)
         #[arg(long, default_value = "0")]
         offset: usize,
+
+        /// Include local variables that escape their scope (passed/returned)
+        #[arg(long)]
+        include_escape_refs: bool,
     },
 
     /// Get all symbols in a file

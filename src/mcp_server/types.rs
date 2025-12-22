@@ -242,6 +242,12 @@ pub struct GetCallgraphRequest {
     )]
     pub summary_only: Option<bool>,
 
+    /// Include local variable references that escape their scope (passed/returned)
+    #[schemars(
+        description = "Include local variable references that escape their scope (passed/returned)"
+    )]
+    pub include_escape_refs: Option<bool>,
+
     /// Export format: "sqlite" to export to SQLite database (expensive operation)
     #[schemars(
         description = "Export format: 'sqlite' to export call graph to SQLite database (expensive disk-writing operation)"
