@@ -76,6 +76,10 @@ pub struct SymbolInfo {
     /// Whether this is a default export
     pub is_default_export: bool,
 
+    /// Whether this is a local variable that escapes its defining scope
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_escape_local: bool,
+
     /// Stable hash identifier for this symbol
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
@@ -111,6 +115,11 @@ pub struct SymbolInfo {
 
     /// Behavioral risk level for this symbol
     pub behavioral_risk: RiskLevel,
+
+    /// Framework entry point type (if this symbol is invoked by a framework)
+    /// Symbols with non-None values should not be flagged as "dead code"
+    #[serde(default, skip_serializing_if = "FrameworkEntryPoint::is_none")]
+    pub framework_entry_point: FrameworkEntryPoint,
 }
 
 impl SymbolInfo {
@@ -664,6 +673,11 @@ pub struct SemanticSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_fallback: Option<String>,
 
+    /// Framework entry point type for the primary symbol
+    /// Symbols with non-None values should not be flagged as "dead code"
+    #[serde(default, skip_serializing_if = "FrameworkEntryPoint::is_none")]
+    pub framework_entry_point: FrameworkEntryPoint,
+
     /// Whether extraction was complete
     #[serde(skip)]
     pub extraction_complete: bool,
@@ -694,6 +708,8 @@ pub enum SymbolKind {
     Module,
     /// Type alias
     TypeAlias,
+    /// Variable declaration (module-level constant, static, or class field)
+    Variable,
 }
 
 impl SymbolKind {
@@ -710,6 +726,7 @@ impl SymbolKind {
             Self::Enum => "enum",
             Self::Module => "module",
             Self::TypeAlias => "type_alias",
+            Self::Variable => "variable",
         }
     }
 
@@ -726,7 +743,97 @@ impl SymbolKind {
             "enum" => Self::Enum,
             "module" | "mod" => Self::Module,
             "type_alias" | "type" => Self::TypeAlias,
+            "variable" | "var" | "const" | "static" | "field" => Self::Variable,
             _ => Self::Function, // Default fallback
+        }
+    }
+}
+
+/// Framework entry point type - symbols invoked by frameworks, not application code
+///
+/// These symbols appear to have "no callers" in static analysis but are actually
+/// invoked by the framework's runtime (routing, dependency injection, lifecycle hooks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum FrameworkEntryPoint {
+    /// Not a framework entry point (default)
+    #[default]
+    None,
+
+    // === Next.js Entry Points ===
+    /// Next.js page component (pages/ or app/ directory)
+    NextPage,
+    /// Next.js layout component (app/ directory)
+    NextLayout,
+    /// Next.js API route handler (GET, POST, etc.)
+    NextApiRoute,
+    /// Next.js special file (_app, _document, _error)
+    NextSpecialFile,
+    /// Next.js SSR data fetching (getServerSideProps, getStaticProps, getInitialProps)
+    NextDataFetching,
+    /// Next.js middleware
+    NextMiddleware,
+
+    // === NestJS Entry Points ===
+    /// NestJS @Injectable() decorated service
+    NestService,
+    /// NestJS @Controller() decorated controller
+    NestController,
+    /// NestJS @Module() decorated module
+    NestModule,
+    /// NestJS bootstrap function (main.ts entry point)
+    NestBootstrap,
+
+    // === Express/Koa Entry Points ===
+    /// Express/Koa route handler
+    ExpressRoute,
+    /// Express middleware function
+    ExpressMiddleware,
+
+    // === React Entry Points ===
+    /// React component exported from index file
+    ReactRootComponent,
+
+    // === Generic Entry Points ===
+    /// CLI entry point (main function)
+    CliMain,
+    /// Test function
+    TestFunction,
+    /// Exported from package index
+    PackageExport,
+}
+
+impl FrameworkEntryPoint {
+    /// Check if this is None (for serde skip_serializing_if)
+    pub fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    /// Check if this is a framework entry point (not None)
+    pub fn is_entry_point(&self) -> bool {
+        !self.is_none()
+    }
+
+    /// Get a human-readable description
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::None => "not a framework entry point",
+            Self::NextPage => "Next.js page component",
+            Self::NextLayout => "Next.js layout component",
+            Self::NextApiRoute => "Next.js API route handler",
+            Self::NextSpecialFile => "Next.js special file (_app/_document/_error)",
+            Self::NextDataFetching => "Next.js SSR data fetching function",
+            Self::NextMiddleware => "Next.js middleware",
+            Self::NestService => "NestJS injectable service",
+            Self::NestController => "NestJS controller",
+            Self::NestModule => "NestJS module",
+            Self::NestBootstrap => "NestJS bootstrap entry point",
+            Self::ExpressRoute => "Express route handler",
+            Self::ExpressMiddleware => "Express middleware",
+            Self::ReactRootComponent => "React root component",
+            Self::CliMain => "CLI main entry point",
+            Self::TestFunction => "test function",
+            Self::PackageExport => "package export",
         }
     }
 }
@@ -921,6 +1028,132 @@ pub struct JsxElement {
     pub location: Location,
 }
 
+/// Kind of reference for variable tracking
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Hash)]
+pub enum RefKind {
+    /// Not a variable reference (regular function call)
+    #[default]
+    None,
+    /// Reading a variable's value
+    Read,
+    /// Writing/assigning to a variable
+    Write,
+    /// Both reading and writing (e.g., x += 1)
+    ReadWrite,
+    /// Reading a local variable that escapes its scope (passed/returned)
+    EscapeRead,
+    /// Writing a local variable that escapes its scope
+    EscapeWrite,
+    /// Read+write on a local variable that escapes its scope
+    EscapeReadWrite,
+}
+
+impl RefKind {
+    /// Returns true if this is any kind of variable reference
+    pub fn is_variable_ref(&self) -> bool {
+        !matches!(self, RefKind::None)
+    }
+
+    /// Returns true if this is a local-escape variable reference
+    pub fn is_escape_ref(&self) -> bool {
+        matches!(
+            self,
+            RefKind::EscapeRead | RefKind::EscapeWrite | RefKind::EscapeReadWrite
+        )
+    }
+
+    /// Returns the edge kind string for SQLite export
+    pub fn as_edge_kind(&self) -> &'static str {
+        match self {
+            RefKind::None => "call",
+            RefKind::Read => "read",
+            RefKind::Write => "write",
+            RefKind::ReadWrite => "readwrite",
+            RefKind::EscapeRead => "escape_read",
+            RefKind::EscapeWrite => "escape_write",
+            RefKind::EscapeReadWrite => "escape_readwrite",
+        }
+    }
+
+    /// Parse from edge kind string (for call graph format)
+    pub fn from_edge_kind(s: &str) -> Self {
+        match s {
+            "read" => RefKind::Read,
+            "write" => RefKind::Write,
+            "readwrite" => RefKind::ReadWrite,
+            "escape_read" => RefKind::EscapeRead,
+            "escape_write" => RefKind::EscapeWrite,
+            "escape_readwrite" => RefKind::EscapeReadWrite,
+            _ => RefKind::None, // "call" or any other value
+        }
+    }
+}
+
+/// Edge in call graph with edge kind information
+///
+/// Used for call graph storage and SQLite export. Includes
+/// edge_kind to distinguish function calls from variable references.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CallGraphEdge {
+    /// Target symbol hash (callee)
+    pub callee: String,
+    /// Kind of edge: call (function), read, write, or readwrite (variable)
+    pub edge_kind: RefKind,
+}
+
+impl CallGraphEdge {
+    /// Create a new call graph edge
+    pub fn new(callee: String, edge_kind: RefKind) -> Self {
+        Self { callee, edge_kind }
+    }
+
+    /// Create a function call edge (edge_kind = None/call)
+    pub fn call(callee: String) -> Self {
+        Self {
+            callee,
+            edge_kind: RefKind::None,
+        }
+    }
+
+    /// Encode to string for call graph format: "hash" or "hash:kind"
+    pub fn encode(&self) -> String {
+        if self.edge_kind == RefKind::None {
+            format!("\"{}\"", self.callee)
+        } else {
+            format!("\"{}:{}\"", self.callee, self.edge_kind.as_edge_kind())
+        }
+    }
+
+    /// Decode from string: "hash" or "hash:kind"
+    pub fn decode(s: &str) -> Self {
+        let s = s.trim().trim_matches('"');
+        if let Some(colon_pos) = s.rfind(':') {
+            // Check if the suffix after the last colon is an edge kind
+            let suffix = &s[colon_pos + 1..];
+            if matches!(
+                suffix,
+                "read"
+                    | "write"
+                    | "readwrite"
+                    | "escape_read"
+                    | "escape_write"
+                    | "escape_readwrite"
+                    | "call"
+            ) {
+                return Self {
+                    callee: s[..colon_pos].to_string(),
+                    edge_kind: RefKind::from_edge_kind(suffix),
+                };
+            }
+        }
+        // No edge kind suffix - default to call
+        Self {
+            callee: s.to_string(),
+            edge_kind: RefKind::None,
+        }
+    }
+}
+
 /// Function/method call for analysis
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Call {
@@ -946,6 +1179,10 @@ pub struct Call {
     /// Whether this is an I/O operation
     #[serde(skip)]
     pub is_io: bool,
+
+    /// Kind of variable reference (None = function call, Read/Write/ReadWrite = variable)
+    #[serde(skip)]
+    pub ref_kind: RefKind,
 
     /// Source location
     #[serde(skip)]

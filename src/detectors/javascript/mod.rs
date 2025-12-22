@@ -43,6 +43,7 @@ pub mod frameworks;
 use tree_sitter::{Parser, Tree};
 
 use crate::detectors::common::push_unique_insertion;
+use crate::detectors::variable_refs;
 use crate::error::Result;
 use crate::lang::Lang;
 use crate::schema::SemanticSummary;
@@ -60,6 +61,9 @@ pub fn extract(summary: &mut SemanticSummary, source: &str, tree: &Tree, lang: L
 
     // Phase 1: Core JavaScript/TypeScript extraction
     core::extract_core(summary, &root, source, lang)?;
+
+    // Phase 1b: Variable references (include escaping locals for JS/TS/TSX)
+    variable_refs::extract_variable_references(summary, &root, source, Some(lang), true);
 
     // Phase 2: Detect frameworks from imports and patterns
     let frameworks = detect_frameworks(summary, source);
@@ -83,6 +87,10 @@ pub fn extract(summary: &mut SemanticSummary, source: &str, tree: &Tree, lang: L
 
     if frameworks.is_vue {
         frameworks::vue::enhance(summary, &root, source);
+    }
+
+    if frameworks.is_nestjs {
+        frameworks::nestjs::enhance(summary, source);
     }
 
     Ok(())
@@ -133,6 +141,7 @@ pub fn extract_vue_sfc(summary: &mut SemanticSummary, source: &str) -> Result<()
     // Run standard extraction on the script content
     let root = tree.root_node();
     core::extract_core(summary, &root, &sfc_script.content, sfc_script.lang)?;
+    variable_refs::extract_variable_references(summary, &root, &sfc_script.content, Some(sfc_script.lang), true);
 
     // Detect frameworks in the script
     let frameworks = detect_frameworks(summary, &sfc_script.content);

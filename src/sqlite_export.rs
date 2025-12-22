@@ -11,6 +11,7 @@ use std::time::Instant;
 
 use rusqlite::{params, Connection};
 
+use crate::schema::CallGraphEdge;
 use crate::{CacheDir, McpDiffError, Result, SymbolIndexEntry};
 
 /// Export statistics returned after successful export
@@ -85,6 +86,7 @@ impl SqliteExporter {
         cache: &CacheDir,
         output_path: &Path,
         progress: Option<ProgressCallback>,
+        include_escape_refs: bool,
     ) -> Result<ExportStats> {
         let start = Instant::now();
 
@@ -118,11 +120,16 @@ impl SqliteExporter {
 
         // Insert nodes and get module mapping for edges
         let (nodes_inserted, node_modules) =
-            self.insert_nodes_streaming(&mut conn, cache, &progress)?;
+            self.insert_nodes_streaming(&mut conn, cache, &progress, include_escape_refs)?;
 
         // Insert edges and collect module edge counts
-        let (edges_inserted, module_edge_counts) =
-            self.insert_edges_streaming(&mut conn, cache, &node_modules, &progress)?;
+        let (edges_inserted, module_edge_counts) = self.insert_edges_streaming(
+            &mut conn,
+            cache,
+            &node_modules,
+            &progress,
+            include_escape_refs,
+        )?;
 
         // Insert module-level edges
         let module_edges_inserted =
@@ -202,11 +209,13 @@ impl SqliteExporter {
             );
 
             -- Edges table: function call relationships
+            -- edge_kind: 'call' (function), 'read' (variable read), 'write' (variable write), 'readwrite' (compound)
             CREATE TABLE edges (
                 caller_hash TEXT NOT NULL,
                 callee_hash TEXT NOT NULL,
                 call_count INTEGER DEFAULT 1,
-                PRIMARY KEY (caller_hash, callee_hash)
+                edge_kind TEXT NOT NULL DEFAULT 'call',
+                PRIMARY KEY (caller_hash, callee_hash, edge_kind)
             );
 
             -- Module-level aggregated edges for high-level visualization
@@ -231,6 +240,7 @@ impl SqliteExporter {
         conn: &mut Connection,
         cache: &CacheDir,
         progress: &Option<ProgressCallback>,
+        include_escape_refs: bool,
     ) -> Result<(usize, HashMap<String, String>)> {
         let index_path = cache.symbol_index_path();
         if !index_path.exists() {
@@ -266,6 +276,10 @@ impl SqliteExporter {
                 Ok(e) => e,
                 Err(_) => continue,
             };
+
+            if entry.is_escape_local && !include_escape_refs {
+                continue;
+            }
 
             // Track module for this hash
             node_modules.insert(entry.hash.clone(), entry.module.clone());
@@ -354,6 +368,7 @@ impl SqliteExporter {
         cache: &CacheDir,
         node_modules: &HashMap<String, String>,
         progress: &Option<ProgressCallback>,
+        include_escape_refs: bool,
     ) -> Result<(usize, HashMap<(String, String), usize>)> {
         let graph_path = cache.call_graph_path();
         if !graph_path.exists() {
@@ -370,7 +385,8 @@ impl SqliteExporter {
         // Track external nodes we need to create
         let mut external_nodes: HashMap<String, String> = HashMap::new();
 
-        let mut batch: Vec<(String, String)> = Vec::with_capacity(self.batch_size);
+        // Batch: (caller_hash, callee_hash, edge_kind)
+        let mut batch: Vec<(String, String, String)> = Vec::with_capacity(self.batch_size);
         let mut total_inserted = 0;
 
         if let Some(ref cb) = progress {
@@ -395,7 +411,7 @@ impl SqliteExporter {
                 continue;
             }
 
-            // Parse "caller_hash: [callee1, callee2, ...]" format
+            // Parse "caller_hash: [callee1, callee2:read, callee3:write, ...]" format
             // Note: hash may contain colons (two-part format), so find ": ["
             if let Some(bracket_pos) = line.find(": [") {
                 let caller = line[..bracket_pos].trim();
@@ -405,8 +421,15 @@ impl SqliteExporter {
                 if rest.starts_with('[') && rest.ends_with(']') {
                     let inner = &rest[1..rest.len() - 1];
 
-                    for callee in inner.split(',').filter(|s| !s.is_empty()) {
-                        let callee = callee.trim().trim_matches('"');
+                    // Split by comma while respecting quoted strings
+                    for callee_str in split_respecting_quotes(inner) {
+                        // Parse edge with optional edge_kind suffix
+                        let edge = CallGraphEdge::decode(callee_str);
+                        if edge.edge_kind.is_escape_ref() && !include_escape_refs {
+                            continue;
+                        }
+                        let callee = &edge.callee;
+                        let edge_kind = edge.edge_kind.as_edge_kind().to_string();
 
                         // Handle external calls - create node with kind='external'
                         if callee.starts_with("ext:") {
@@ -419,14 +442,14 @@ impl SqliteExporter {
                         let callee_mod = if callee.starts_with("ext:") {
                             Some("__external__".to_string())
                         } else {
-                            node_modules.get(callee).cloned()
+                            node_modules.get(callee.as_str()).cloned()
                         };
 
                         if let (Some(cm), Some(ce)) = (caller_mod, callee_mod) {
                             *module_edge_counts.entry((cm, ce)).or_default() += 1;
                         }
 
-                        batch.push((caller.to_string(), callee.to_string()));
+                        batch.push((caller.to_string(), callee.clone(), edge_kind));
 
                         if batch.len() >= self.batch_size {
                             total_inserted += self.flush_edge_batch(conn, &batch)?;
@@ -473,8 +496,12 @@ impl SqliteExporter {
         Ok((total_inserted, module_edge_counts))
     }
 
-    /// Flush a batch of edges to SQLite
-    fn flush_edge_batch(&self, conn: &mut Connection, batch: &[(String, String)]) -> Result<usize> {
+    /// Flush a batch of edges to SQLite with edge_kind
+    fn flush_edge_batch(
+        &self,
+        conn: &mut Connection,
+        batch: &[(String, String, String)],
+    ) -> Result<usize> {
         let tx = conn.transaction().map_err(|e| McpDiffError::ExportError {
             message: format!("Transaction failed: {}", e),
         })?;
@@ -482,16 +509,16 @@ impl SqliteExporter {
         {
             let mut stmt = tx
                 .prepare_cached(
-                    "INSERT OR IGNORE INTO edges (caller_hash, callee_hash, call_count)
-                     VALUES (?1, ?2, 1)
-                     ON CONFLICT(caller_hash, callee_hash) DO UPDATE SET call_count = call_count + 1",
+                    "INSERT OR IGNORE INTO edges (caller_hash, callee_hash, edge_kind, call_count)
+                     VALUES (?1, ?2, ?3, 1)
+                     ON CONFLICT(caller_hash, callee_hash, edge_kind) DO UPDATE SET call_count = call_count + 1",
                 )
                 .map_err(|e| McpDiffError::ExportError {
                     message: format!("Prepare failed: {}", e),
                 })?;
 
-            for (caller, callee) in batch {
-                stmt.execute(params![caller, callee])
+            for (caller, callee, edge_kind) in batch {
+                stmt.execute(params![caller, callee, edge_kind])
                     .map_err(|e| McpDiffError::ExportError {
                         message: format!("Insert edge failed: {}", e),
                     })?;
@@ -651,6 +678,37 @@ impl SqliteExporter {
 /// Get default export path for a repository
 pub fn default_export_path(cache: &CacheDir) -> PathBuf {
     cache.root.join("call_graph.sqlite")
+}
+
+/// Split a string by comma while respecting quoted strings.
+/// Handles entries like: "foo","bar","ext:baz(a, b, c).unwrap"
+fn split_respecting_quotes(s: &str) -> Vec<&str> {
+    let mut result = Vec::new();
+    let mut start = 0;
+    let mut in_quotes = false;
+    let bytes = s.as_bytes();
+
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'"' => in_quotes = !in_quotes,
+            b',' if !in_quotes => {
+                let part = s[start..i].trim();
+                if !part.is_empty() {
+                    result.push(part);
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+
+    // Don't forget the last part
+    let part = s[start..].trim();
+    if !part.is_empty() {
+        result.push(part);
+    }
+
+    result
 }
 
 /// Parse line range string (e.g., "45-89") into (start, end)

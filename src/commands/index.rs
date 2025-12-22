@@ -272,7 +272,7 @@ fn run_export(path: Option<String>, ctx: &CommandContext) -> Result<String> {
     }
 
     let exporter = SqliteExporter::new();
-    let stats = exporter.export(&cache, &output_path, None)?;
+    let stats = exporter.export(&cache, &output_path, None, false)?;
 
     let mut output = String::new();
 

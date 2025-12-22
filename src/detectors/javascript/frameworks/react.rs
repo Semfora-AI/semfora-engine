@@ -12,7 +12,7 @@
 use tree_sitter::Node;
 
 use crate::detectors::common::{get_node_text, push_unique_insertion, visit_all};
-use crate::schema::{Call, SemanticSummary, StateChange};
+use crate::schema::{Call, FrameworkEntryPoint, SemanticSummary, StateChange, SymbolKind};
 
 /// Enhance semantic summary with React-specific information
 ///
@@ -33,6 +33,46 @@ pub fn enhance(summary: &mut SemanticSummary, root: &Node, source: &str) {
 
     // Extract JSX patterns
     extract_jsx_insertions(summary, root, source);
+
+    // Detect React root/entry point
+    detect_react_entry_points(summary, source);
+}
+
+/// Detect React application entry points
+///
+/// Marks components used with:
+/// - ReactDOM.createRoot().render()
+/// - ReactDOM.render()
+/// - App component in entry files (index.tsx, main.tsx)
+fn detect_react_entry_points(summary: &mut SemanticSummary, source: &str) {
+    let file_lower = summary.file.to_lowercase();
+    let is_entry_file = file_lower.ends_with("/index.tsx")
+        || file_lower.ends_with("/index.jsx")
+        || file_lower.ends_with("/main.tsx")
+        || file_lower.ends_with("/main.jsx")
+        || file_lower.ends_with("/app.tsx")
+        || file_lower.ends_with("/app.jsx");
+
+    // ReactDOM.createRoot or ReactDOM.render indicates root component
+    let is_root_file = source.contains("createRoot") || source.contains("ReactDOM.render");
+
+    if is_root_file || is_entry_file {
+        // Mark exported components as root components
+        for symbol in &mut summary.symbols {
+            if symbol.is_exported && symbol.kind == SymbolKind::Component {
+                symbol.framework_entry_point = FrameworkEntryPoint::ReactRootComponent;
+            }
+        }
+
+        if is_root_file {
+            summary.framework_entry_point = FrameworkEntryPoint::ReactRootComponent;
+            push_unique_insertion(
+                &mut summary.insertions,
+                "React root mount".to_string(),
+                "root mount",
+            );
+        }
+    }
 }
 
 // =============================================================================
