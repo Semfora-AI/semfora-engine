@@ -9,6 +9,7 @@
 
 # Semfora cache
 .semfora_index/
+.semfora/
 
 # Logs and output
 *.log
