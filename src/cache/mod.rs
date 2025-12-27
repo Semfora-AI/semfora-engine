@@ -860,21 +860,42 @@ impl CacheDir {
         self.signature_index_path().exists()
     }
 
-    /// Path to the BM25 semantic search index file (JSON format)
-    /// Used for loose term queries like "authentication" or "error handling"
+    /// Path to the unified index SQLite database
+    /// Used for module registry and BM25 index storage
+    pub fn index_db_path(&self) -> PathBuf {
+        self.root.join("index.sqlite")
+    }
+
+    /// Path to the BM25 semantic search index (stored in index.sqlite)
     pub fn bm25_index_path(&self) -> PathBuf {
-        self.root.join("bm25_index.json")
+        self.index_db_path()
     }
 
-    /// Check if BM25 index exists
+    /// Check if BM25 index exists (bm25_meta table present)
     pub fn has_bm25_index(&self) -> bool {
-        self.bm25_index_path().exists()
+        let path = self.bm25_index_path();
+        if !path.exists() {
+            return false;
+        }
+        let Ok(conn) = rusqlite::Connection::open(path) else {
+            return false;
+        };
+        let mut stmt = match conn.prepare(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='bm25_meta'",
+        ) {
+            Ok(stmt) => stmt,
+            Err(_) => return false,
+        };
+        let Ok(mut rows) = stmt.query([]) else {
+            return false;
+        };
+        rows.next().ok().flatten().is_some()
     }
 
-    /// Path to the module registry SQLite database
+    /// Path to the module registry SQLite database (stored in index.sqlite)
     /// Used for conflict-aware module naming at scale
     pub fn module_registry_path(&self) -> PathBuf {
-        self.root.join("module_registry.sqlite")
+        self.index_db_path()
     }
 
     /// Update symbol index for a single file (incremental update)

@@ -20,6 +20,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
+use rusqlite::{params, Connection};
 
 /// BM25 parameters
 const K1: f64 = 1.2;
@@ -292,6 +293,162 @@ impl Bm25Index {
         let index: Self = serde_json::from_str(&content)?;
         Ok(index)
     }
+}
+
+pub fn init_bm25_sqlite(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS bm25_documents (
+            doc_id TEXT PRIMARY KEY,
+            symbol TEXT,
+            file TEXT,
+            lines TEXT,
+            kind TEXT,
+            module TEXT,
+            risk TEXT,
+            doc_length INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS bm25_terms (
+            term TEXT,
+            doc_id TEXT,
+            tf INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS bm25_meta (
+            total_docs INTEGER,
+            avg_doc_length REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_bm25_terms_term ON bm25_terms(term);
+        CREATE INDEX IF NOT EXISTS idx_bm25_terms_doc ON bm25_terms(doc_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_bm25_terms_unique ON bm25_terms(term, doc_id);
+        "#,
+    )?;
+    Ok(())
+}
+
+pub fn clear_bm25_sqlite(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        r#"
+        DELETE FROM bm25_terms;
+        DELETE FROM bm25_documents;
+        DELETE FROM bm25_meta;
+        "#,
+    )?;
+    Ok(())
+}
+
+pub fn write_bm25_meta(
+    conn: &Connection,
+    total_docs: u32,
+    avg_doc_length: f64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO bm25_meta (total_docs, avg_doc_length) VALUES (?, ?)",
+        params![total_docs as i64, avg_doc_length],
+    )?;
+    Ok(())
+}
+
+pub fn search_sqlite(
+    path: &Path,
+    query: &str,
+    limit: usize,
+) -> std::io::Result<Vec<Bm25SearchResult>> {
+    let conn = Connection::open(path).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let (total_docs, avg_doc_length): (f64, f64) = conn
+        .query_row(
+            "SELECT total_docs, avg_doc_length FROM bm25_meta LIMIT 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)? as f64, row.get::<_, f64>(1)?)),
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+    let query_terms = tokenize(query);
+    if query_terms.is_empty() || total_docs == 0.0 {
+        return Ok(Vec::new());
+    }
+
+    let mut scores: HashMap<String, (f64, Vec<String>, Bm25Document)> = HashMap::new();
+
+    for term in &query_terms {
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT t.doc_id, t.tf, d.symbol, d.file, d.lines, d.kind, d.module, d.risk, d.doc_length
+                FROM bm25_terms t
+                JOIN bm25_documents d ON d.doc_id = t.doc_id
+                WHERE t.term = ?
+                "#,
+            )
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+        let postings = stmt
+            .query_map([term], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? as f64,
+                    Bm25Document {
+                        hash: row.get::<_, String>(0)?,
+                        symbol: row.get::<_, String>(2)?,
+                        file: row.get::<_, String>(3)?,
+                        lines: row.get::<_, String>(4)?,
+                        kind: row.get::<_, String>(5)?,
+                        module: row.get::<_, String>(6)?,
+                        risk: row.get::<_, String>(7)?,
+                        doc_length: row.get::<_, i64>(8)? as u32,
+                    },
+                ))
+            })
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+        let mut posting_vec = Vec::new();
+        for row in postings {
+            posting_vec.push(row.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?);
+        }
+
+        let df = posting_vec.len() as f64;
+        if df == 0.0 {
+            continue;
+        }
+        let idf = ((total_docs - df + 0.5) / (df + 0.5) + 1.0).ln();
+
+        for (doc_id, tf, doc) in posting_vec {
+            let doc_len = doc.doc_length as f64;
+            let numerator = tf * (K1 + 1.0);
+            let denominator = tf + K1 * (1.0 - B + B * doc_len / avg_doc_length);
+            let term_score = idf * numerator / denominator;
+
+            let entry = scores
+                .entry(doc_id)
+                .or_insert((0.0, Vec::new(), doc));
+            entry.0 += term_score;
+            if !entry.1.contains(term) {
+                entry.1.push(term.clone());
+            }
+        }
+    }
+
+    let mut results: Vec<Bm25SearchResult> = scores
+        .into_iter()
+        .map(|(_doc_id, (score, matched_terms, doc))| Bm25SearchResult {
+            hash: doc.hash,
+            symbol: doc.symbol,
+            file: doc.file,
+            lines: doc.lines,
+            kind: doc.kind,
+            module: doc.module,
+            risk: doc.risk,
+            score,
+            matched_terms,
+        })
+        .collect();
+
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    results.truncate(limit);
+    Ok(results)
 }
 
 /// Tokenize text into searchable terms

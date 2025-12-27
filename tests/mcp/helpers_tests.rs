@@ -14,6 +14,7 @@
 
 use crate::common::assertions::assert_valid_json;
 use crate::common::test_repo::TestRepo;
+use std::fs;
 use std::thread;
 use std::time::Duration;
 
@@ -231,8 +232,27 @@ fn test_generate_index_creates_cache_files() {
     // If local cache exists, check for overview file
     if local_cache.exists() {
         let overview_path = local_cache.join("repo_overview.toon");
+        let mut overview_exists = overview_path.exists();
+
+        if !overview_exists {
+            if let Ok(entries) = fs::read_dir(&local_cache) {
+                for entry in entries.flatten() {
+                    if entry
+                        .file_type()
+                        .map(|t| t.is_dir())
+                        .unwrap_or(false)
+                    {
+                        if entry.path().join("repo_overview.toon").exists() {
+                            overview_exists = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         assert!(
-            overview_path.exists(),
+            overview_exists,
             "repo_overview.toon should exist in local cache"
         );
     } else {

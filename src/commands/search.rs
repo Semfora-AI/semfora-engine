@@ -270,6 +270,8 @@ fn run_symbol_search(args: &SearchArgs, ctx: &CommandContext) -> Result<String> 
     } else {
         // Normal indexed search results
         let mut results = search_result.indexed_results.unwrap_or_default();
+        let symbol_scope = args.symbol_scope.for_kind(args.kind.as_deref());
+        results.retain(|entry| symbol_scope.matches_kind(&entry.kind));
         if !args.include_escape_refs {
             results.retain(|entry| !entry.is_escape_local);
         }
@@ -306,7 +308,7 @@ fn run_symbol_search(args: &SearchArgs, ctx: &CommandContext) -> Result<String> 
 
 /// Semantic-only search (BM25 natural language matching)
 fn run_semantic_search(args: &SearchArgs, ctx: &CommandContext) -> Result<String> {
-    use crate::bm25::Bm25Index;
+    use crate::bm25::search_sqlite;
 
     let repo_dir = std::env::current_dir().map_err(|e| McpDiffError::FileNotFound {
         path: format!("current directory: {}", e),
@@ -320,11 +322,11 @@ fn run_semantic_search(args: &SearchArgs, ctx: &CommandContext) -> Result<String
     }
 
     let bm25_path = cache.bm25_index_path();
-    let index = Bm25Index::load(&bm25_path).map_err(|e| McpDiffError::GitError {
-        message: format!("Failed to load BM25 index: {}", e),
+    let mut results = search_sqlite(&bm25_path, &args.query, args.limit * 2).map_err(|e| {
+        McpDiffError::GitError {
+            message: format!("Failed to search BM25 index: {}", e),
+        }
     })?;
-
-    let mut results = index.search(&args.query, args.limit * 2);
 
     // Apply filters
     if let Some(ref kind_filter) = args.kind {
@@ -335,6 +337,8 @@ fn run_semantic_search(args: &SearchArgs, ctx: &CommandContext) -> Result<String
         let module_lower = module_filter.to_lowercase();
         results.retain(|r| r.module.to_lowercase() == module_lower);
     }
+    let symbol_scope = args.symbol_scope.for_kind(args.kind.as_deref());
+    results.retain(|r| symbol_scope.matches_kind(&r.kind));
     if !args.include_escape_refs {
         let escape_hashes = load_escape_local_hashes(&cache);
         results.retain(|r| !escape_hashes.contains(&r.hash));
@@ -344,7 +348,7 @@ fn run_semantic_search(args: &SearchArgs, ctx: &CommandContext) -> Result<String
 
     let mut output = String::new();
 
-    let suggestions = index.suggest_related_terms(&args.query, 5);
+    let suggestions: Vec<String> = Vec::new();
 
     let json_value = serde_json::json!({
         "_type": "semantic_search",
@@ -612,6 +616,8 @@ fn get_symbol_matches(cache: &CacheDir, args: &SearchArgs) -> Option<SymbolSearc
         Some(SymbolSearchResults { results })
     } else {
         let mut indexed = search_result.indexed_results.unwrap_or_default();
+        let symbol_scope = args.symbol_scope.for_kind(args.kind.as_deref());
+        indexed.retain(|entry| symbol_scope.matches_kind(&entry.kind));
         if !args.include_escape_refs {
             indexed.retain(|entry| !entry.is_escape_local);
         }
@@ -633,16 +639,14 @@ fn get_symbol_matches(cache: &CacheDir, args: &SearchArgs) -> Option<SymbolSearc
 
 /// Get semantic matches from the BM25 index
 fn get_semantic_matches(cache: &CacheDir, args: &SearchArgs) -> Option<SemanticSearchResults> {
-    use crate::bm25::Bm25Index;
+    use crate::bm25::search_sqlite;
 
     if !cache.has_bm25_index() {
         return None;
     }
 
     let bm25_path = cache.bm25_index_path();
-    let index = Bm25Index::load(&bm25_path).ok()?;
-
-    let mut results = index.search(&args.query, args.limit);
+    let mut results = search_sqlite(&bm25_path, &args.query, args.limit).ok()?;
 
     // Apply filters
     if let Some(ref kind_filter) = args.kind {
@@ -653,6 +657,8 @@ fn get_semantic_matches(cache: &CacheDir, args: &SearchArgs) -> Option<SemanticS
         let module_lower = module_filter.to_lowercase();
         results.retain(|r| r.module.to_lowercase() == module_lower);
     }
+    let symbol_scope = args.symbol_scope.for_kind(args.kind.as_deref());
+    results.retain(|r| symbol_scope.matches_kind(&r.kind));
     if !args.include_escape_refs {
         let escape_hashes = load_escape_local_hashes(cache);
         results.retain(|r| !escape_hashes.contains(&r.hash));
@@ -660,7 +666,7 @@ fn get_semantic_matches(cache: &CacheDir, args: &SearchArgs) -> Option<SemanticS
 
     results.truncate(args.limit / 2); // Half limit for hybrid
 
-    let suggestions = index.suggest_related_terms(&args.query, 3);
+    let suggestions: Vec<String> = Vec::new();
 
     let semantic_results: Vec<SemanticEntry> = results
         .iter()

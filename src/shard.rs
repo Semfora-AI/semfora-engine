@@ -17,9 +17,8 @@ use serde::{Deserialize, Serialize};
 use rayon::prelude::*;
 
 use crate::analysis::{calculate_cognitive_complexity, max_nesting_depth};
-use crate::bm25::{
-    extract_terms_from_file_path, extract_terms_from_toon, Bm25Document, Bm25Index,
-};
+use crate::bm25::{extract_terms_from_file_path, Bm25Document};
+use rusqlite::Connection;
 use crate::cache::{CacheDir, IndexingStatus, SourceFileInfo};
 use crate::duplicate::FunctionSignature;
 use crate::error::Result;
@@ -562,7 +561,7 @@ impl ShardWriter {
         // Write symbol shards
         if !self.stage_completed("symbol_shards", &[], &progress_state) {
             emit_progress(&progress, "Symbol shards", 0, 1);
-            self.write_symbol_shards(&mut stats)?;
+            self.write_symbol_shards(&mut stats, &progress)?;
             emit_progress(&progress, "Symbol shards", 1, 1);
             self.mark_stage_completed("symbol_shards", &mut progress_state)?;
         }
@@ -716,7 +715,26 @@ impl ShardWriter {
     ///
     /// This now iterates over summary.symbols to capture ALL symbols in each file,
     /// not just the primary symbol. This is the key fix for multi-symbol files.
-    fn write_symbol_shards(&self, stats: &mut ShardStats) -> Result<()> {
+    fn write_symbol_shards(
+        &self,
+        stats: &mut ShardStats,
+        progress: &Option<ShardProgressCallback>,
+    ) -> Result<()> {
+        let total_symbols: usize = self
+            .all_summaries
+            .iter()
+            .map(|summary| {
+                if !summary.symbols.is_empty() {
+                    summary.symbols.len()
+                } else if summary.symbol_id.is_some() {
+                    1
+                } else {
+                    0
+                }
+            })
+            .sum();
+        let mut processed = 0usize;
+
         for summary in &self.all_summaries {
             let namespace = SymbolId::namespace_from_path(&summary.file);
 
@@ -732,6 +750,10 @@ impl ShardWriter {
 
                     stats.symbol_bytes += toon.len();
                     stats.symbols_written += 1;
+                    processed += 1;
+                    if processed % 1000 == 0 || processed == total_symbols {
+                        emit_progress(progress, "Symbol shards", processed, total_symbols.max(1));
+                    }
                 }
             } else if let Some(ref symbol_id) = summary.symbol_id {
                 // Fallback to old single-symbol format for backward compatibility
@@ -743,6 +765,10 @@ impl ShardWriter {
 
                 stats.symbol_bytes += toon.len();
                 stats.symbols_written += 1;
+                processed += 1;
+                if processed % 1000 == 0 || processed == total_symbols {
+                    emit_progress(progress, "Symbol shards", processed, total_symbols.max(1));
+                }
             }
         }
 
@@ -1012,8 +1038,8 @@ impl ShardWriter {
         stats: &mut ShardStats,
         progress: &Option<ShardProgressCallback>,
     ) -> Result<()> {
-        let index = std::sync::Arc::new(std::sync::Mutex::new(Bm25Index::new()));
         let entries = AtomicUsize::new(0);
+        let total_length = AtomicUsize::new(0);
         let total_docs: usize = self
             .all_summaries
             .iter()
@@ -1033,7 +1059,10 @@ impl ShardWriter {
 
         emit_progress(progress, "BM25 index", 0, total_docs.max(1));
 
-        self.all_summaries.par_iter().for_each(|summary| {
+        let docs_by_summary: Vec<Vec<(Bm25Document, Vec<String>)>> = self
+            .all_summaries
+            .par_iter()
+            .map(|summary| {
             let namespace = SymbolId::namespace_from_path(&summary.file);
             // Get the optimal module name from registry, fallback to extraction
             let module_name = file_to_module
@@ -1041,10 +1070,8 @@ impl ShardWriter {
                 .cloned()
                 .unwrap_or_else(|| extract_module_name(&summary.file));
 
-            // Get TOON content for term extraction (from the file-level summary)
-            let toon_content = encode_toon(summary);
             let file_terms = extract_terms_from_file_path(&summary.file);
-            let toon_terms = extract_terms_from_toon(&toon_content);
+            let module_terms = crate::bm25::tokenize(&module_name);
 
             let mut docs: Vec<(Bm25Document, Vec<String>)> = Vec::new();
 
@@ -1059,7 +1086,7 @@ impl ShardWriter {
                     terms.extend(crate::bm25::tokenize(&symbol_info.name));
                     terms.extend(file_terms.iter().cloned());
                     terms.push(kind_str.clone());
-                    terms.extend(toon_terms.iter().cloned());
+                    terms.extend(module_terms.iter().cloned());
                     let mut seen = std::collections::HashSet::new();
                     terms.retain(|t| seen.insert(t.clone()));
 
@@ -1089,7 +1116,7 @@ impl ShardWriter {
                 ));
                 terms.extend(file_terms.iter().cloned());
                 terms.push(kind_str.clone());
-                terms.extend(toon_terms.iter().cloned());
+                terms.extend(module_terms.iter().cloned());
                 let mut seen = std::collections::HashSet::new();
                 terms.retain(|t| seen.insert(t.clone()));
 
@@ -1111,35 +1138,104 @@ impl ShardWriter {
                 docs.push((doc, terms));
             }
 
-            if docs.is_empty() {
-                return;
-            }
+            docs
+        })
+        .collect();
+        let docs: Vec<(Bm25Document, Vec<String>)> = docs_by_summary.into_iter().flatten().collect();
 
-            if let Ok(mut locked) = index.lock() {
-                for (doc, terms) in docs {
-                    locked.add_document_unique_terms(doc, terms);
-                    let current = entries.fetch_add(1, Ordering::Relaxed) + 1;
-                    if current % 1000 == 0 || current == total_docs {
-                        emit_progress(progress, "BM25 index", current, total_docs.max(1));
-                    }
+        let db_path = self.cache.bm25_index_path();
+        let mut conn = Connection::open(&db_path).map_err(|e| {
+            crate::McpDiffError::ExtractionFailure {
+                message: format!("Failed to open BM25 sqlite: {}", e),
+            }
+        })?;
+        crate::bm25::init_bm25_sqlite(&conn).map_err(|e| {
+            crate::McpDiffError::ExtractionFailure {
+                message: format!("Failed to init BM25 sqlite: {}", e),
+            }
+        })?;
+        crate::bm25::clear_bm25_sqlite(&conn).map_err(|e| {
+            crate::McpDiffError::ExtractionFailure {
+                message: format!("Failed to clear BM25 sqlite: {}", e),
+            }
+        })?;
+        let tx = conn.transaction().map_err(|e| {
+            crate::McpDiffError::ExtractionFailure {
+                message: format!("Failed to start BM25 sqlite transaction: {}", e),
+            }
+        })?;
+        {
+            let mut insert_doc = tx.prepare(
+                "INSERT OR IGNORE INTO bm25_documents (doc_id, symbol, file, lines, kind, module, risk, doc_length) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ).map_err(|e| {
+                crate::McpDiffError::ExtractionFailure {
+                    message: format!("Failed to prepare BM25 doc insert: {}", e),
+                }
+            })?;
+            let mut insert_term = tx.prepare(
+                "INSERT OR IGNORE INTO bm25_terms (term, doc_id, tf) VALUES (?, ?, ?)",
+            ).map_err(|e| {
+                crate::McpDiffError::ExtractionFailure {
+                    message: format!("Failed to prepare BM25 term insert: {}", e),
+                }
+            })?;
+
+            for (doc, terms) in docs {
+                let doc_length = terms.len() as u32;
+                let doc_id = doc.hash.clone();
+            let inserted = insert_doc.execute(rusqlite::params![
+                doc_id,
+                doc.symbol,
+                doc.file,
+                doc.lines,
+                doc.kind,
+                doc.module,
+                doc.risk,
+                doc_length as i64
+            ]).map_err(|e| {
+                crate::McpDiffError::ExtractionFailure {
+                    message: format!("Failed to insert BM25 doc: {}", e),
+                }
+            })?;
+            if inserted > 0 {
+                for term in terms {
+                    insert_term
+                        .execute(rusqlite::params![term, doc_id, 1i64])
+                        .map_err(|e| crate::McpDiffError::ExtractionFailure {
+                            message: format!("Failed to insert BM25 term: {}", e),
+                        })?;
                 }
             }
-        });
+                total_length.fetch_add(doc_length as usize, Ordering::Relaxed);
+                let current = entries.fetch_add(1, Ordering::Relaxed) + 1;
+                if current % 1000 == 0 || current == total_docs {
+                    emit_progress(progress, "BM25 index", current, total_docs.max(1));
+                }
+            }
+        }
 
         emit_progress(progress, "BM25 index", total_docs, total_docs.max(1));
         stats.bm25_entries = entries.load(Ordering::Relaxed);
 
-        // Finalize index (compute averages)
-        if let Ok(mut locked) = index.lock() {
-            locked.finalize();
-        }
+        let total_docs_u32 = stats.bm25_entries as u32;
+        let avg_doc_length = if total_docs_u32 > 0 {
+            total_length.load(Ordering::Relaxed) as f64 / total_docs_u32 as f64
+        } else {
+            0.0
+        };
 
-        // Write to cache
+        tx.commit().map_err(|e| {
+            crate::McpDiffError::ExtractionFailure {
+                message: format!("Failed to commit BM25 sqlite: {}", e),
+            }
+        })?;
+        crate::bm25::write_bm25_meta(&conn, total_docs_u32, avg_doc_length).map_err(|e| {
+            crate::McpDiffError::ExtractionFailure {
+                message: format!("Failed to write BM25 meta: {}", e),
+            }
+        })?;
+
         let path = self.cache.bm25_index_path();
-        if let Ok(locked) = index.lock() {
-            locked.save(&path)?;
-        }
-
         stats.bm25_bytes = fs::metadata(&path).map(|m| m.len() as usize).unwrap_or(0);
         stats.files_written += 1;
         Ok(())
@@ -2853,7 +2949,7 @@ mod tests {
     #[test]
     fn test_build_call_graph_empty() {
         let summaries: Vec<SemanticSummary> = vec![];
-        let graph = build_call_graph(&summaries, false);
+        let graph = build_call_graph(&summaries, &None);
         assert!(
             graph.is_empty(),
             "Empty summaries should produce empty graph"
@@ -2879,7 +2975,7 @@ mod tests {
             ..Default::default()
         }];
 
-        let graph = build_call_graph(&summaries, false);
+        let graph = build_call_graph(&summaries, &None);
         // No calls means no edges in the graph
         assert!(
             graph.is_empty() || graph.values().all(|v| v.is_empty()),
@@ -2928,7 +3024,7 @@ mod tests {
             },
         ];
 
-        let graph = build_call_graph(&summaries, false);
+        let graph = build_call_graph(&summaries, &None);
         // Should have at least one entry for main calling helper
         assert!(!graph.is_empty(), "Should produce a call graph with edges");
     }
