@@ -6,32 +6,47 @@ Semantic code analyzer that produces compressed TOON (Text Object-Oriented Notat
 
 ```bash
 cargo build --release
+# Binaries land in target/release/
 ```
 
 ## Binaries
 
-The project builds three binaries:
+The project builds four binaries:
 
 | Binary | Purpose |
 |--------|---------|
-| `semfora-engine` | CLI for semantic analysis, indexing, and querying |
-| `semfora-engine-server` | MCP server for AI agent integration |
-| `semfora-daemon` | WebSocket daemon for real-time updates |
+| `semfora-engine` | Main CLI: analysis, indexing, querying, and MCP server |
+| `semfora-daemon` | WebSocket daemon for real-time index updates |
+| `semfora-benchmark-builder` | Benchmark tooling |
+| `semfora-security-compiler` | Security pattern compiler |
+
+> **Note:** The MCP server is built into `semfora-engine` as the `serve` subcommand.
+> There is no separate `semfora-engine-server` binary.
 
 ## Usage
 
 ```bash
 # Analyze a single file
-semfora-engine path/to/file.rs
+semfora-engine analyze path/to/file.rs
 
-# Analyze a directory and create sharded index
-semfora-engine --dir . --shard
+# Analyze a directory
+semfora-engine analyze ./src
+
+# Analyze uncommitted changes
+semfora-engine analyze --uncommitted
+
+# Generate a semantic index for the current project
+semfora-engine index generate .
+
+# Search for symbols by name
+semfora-engine search "authenticate"
 
 # Query the index
-semfora-engine --search-symbols "authenticate"
+semfora-engine query overview
+semfora-engine query symbol --help
 
-# Start MCP server (for AI agents)
-semfora-engine-server
+# Start MCP server (for AI coding assistants)
+semfora-engine serve --repo /path/to/project
 
 # Start WebSocket daemon (for real-time updates)
 semfora-daemon
@@ -397,10 +412,12 @@ src/
 | Document | Description |
 |----------|-------------|
 | [Quick Start](docs/quickstart.md) | Get up and running in 5 minutes |
-| [CLI Reference](docs/cli.md) | Complete CLI usage, flags, and examples |
+| [CLI Reference](docs/cli.md) | Complete CLI usage, subcommands, and examples |
 | [Features](docs/features.md) | Incremental indexing, layered indexes, risk assessment |
+| [MCP Tools Reference](docs/mcp-tools-reference.md) | All MCP tools for AI agent integration |
+| [MCP Workflows](docs/mcp-workflows.md) | Common MCP usage patterns |
 | [WebSocket Daemon](docs/websocket-daemon.md) | Real-time updates, protocol, and query methods |
 | [Adding Languages](docs/adding-languages.md) | Guide for adding new language support |
-| [Engineering](docs/engineering.md) | Implementation details and status |
+| [Architecture](docs/architecture.md) | Implementation details and design |
 
 ## License
