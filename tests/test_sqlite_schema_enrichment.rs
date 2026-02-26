@@ -26,7 +26,11 @@ mod sqlite_schema_tests {
                 decorators TEXT DEFAULT '',
                 framework_entry_point TEXT DEFAULT '',
                 arity INTEGER DEFAULT 0,
-                is_self_recursive INTEGER DEFAULT 0
+                is_self_recursive INTEGER DEFAULT 0,
+                is_async INTEGER DEFAULT 0,
+                return_type TEXT DEFAULT '',
+                ext_package TEXT DEFAULT '',
+                base_classes TEXT DEFAULT ''
             );
 
             CREATE TABLE edges (
