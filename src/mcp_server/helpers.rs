@@ -1153,6 +1153,10 @@ mod tests {
             is_exported: false,
             decorators: String::new(),
             arity: 0,
+            is_async: false,
+            return_type: String::new(),
+            ext_package: String::new(),
+            base_classes: String::new(),
         }
     }
 

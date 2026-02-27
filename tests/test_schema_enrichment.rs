@@ -23,6 +23,10 @@ mod schema_enrichment_tests {
             is_exported: true,
             decorators: "@pytest.fixture,@app.route".to_string(),
             arity: 3,
+            is_async: false,
+            return_type: String::new(),
+            ext_package: String::new(),
+            base_classes: String::new(),
         };
 
         assert_eq!(entry.symbol, "test_function");
@@ -50,6 +54,10 @@ mod schema_enrichment_tests {
             is_exported: false,
             decorators: String::new(),
             arity: 0,
+            is_async: false,
+            return_type: String::new(),
+            ext_package: String::new(),
+            base_classes: String::new(),
         };
 
         assert!(!entry.is_exported);
@@ -74,7 +82,11 @@ mod schema_enrichment_tests {
             framework_entry_point: FrameworkEntryPoint::None,
             is_exported: true,
             decorators: "@Component,@Input".to_string(),
-            arity: 12, // Large parameter count
+            arity: 12,
+            is_async: false,
+            return_type: String::new(),
+            ext_package: String::new(),
+            base_classes: String::new(), // Large parameter count
         };
 
         assert_eq!(entry.arity, 12);
@@ -122,6 +134,10 @@ mod schema_enrichment_tests {
                 is_exported: false,
                 decorators: decorator.to_string(),
                 arity: 0,
+            is_async: false,
+            return_type: String::new(),
+            ext_package: String::new(),
+            base_classes: String::new(),
             };
 
             assert_eq!(entry.decorators, decorator);
@@ -147,6 +163,10 @@ mod schema_enrichment_tests {
             is_exported: false,
             decorators: decorators.to_string(),
             arity: 1,
+            is_async: false,
+            return_type: String::new(),
+            ext_package: String::new(),
+            base_classes: String::new(),
         };
 
         // Verify all decorators are preserved
@@ -204,6 +224,10 @@ mod schema_enrichment_tests {
                 is_exported: false,
                 decorators: String::new(),
                 arity: case.expected_arity,
+                is_async: false,
+                return_type: String::new(),
+                ext_package: String::new(),
+                base_classes: String::new(),
             };
 
             assert_eq!(entry.arity, case.expected_arity);
@@ -228,6 +252,10 @@ mod schema_enrichment_tests {
             is_exported: true,
             decorators: String::new(),
             arity: 0,
+            is_async: false,
+            return_type: String::new(),
+            ext_package: String::new(),
+            base_classes: String::new(),
         };
 
         let private = SymbolIndexEntry {
@@ -246,6 +274,10 @@ mod schema_enrichment_tests {
             is_exported: false,
             decorators: String::new(),
             arity: 1,
+            is_async: false,
+            return_type: String::new(),
+            ext_package: String::new(),
+            base_classes: String::new(),
         };
 
         assert!(exported.is_exported);

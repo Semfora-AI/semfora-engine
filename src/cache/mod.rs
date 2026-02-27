@@ -2613,6 +2613,24 @@ pub struct SymbolIndexEntry {
     /// Parameter count (function arity = arguments + props)
     #[serde(rename = "ar", default, skip_serializing_if = "is_zero_usize")]
     pub arity: usize,
+
+    /// Whether this function/method is declared async
+    #[serde(rename = "async", default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_async: bool,
+
+    /// Return type annotation (from type hints / JSDoc / Rust -> T)
+    #[serde(rename = "rt", default, skip_serializing_if = "String::is_empty")]
+    pub return_type: String,
+
+    /// Package that provides this symbol (for ext: nodes only)
+    /// e.g. "react" for ext:useState, "numpy" for ext:array
+    #[serde(rename = "pkg", default, skip_serializing_if = "String::is_empty")]
+    pub ext_package: String,
+
+    /// Base classes / parent interfaces (comma-separated), e.g. "BaseModel,Mixin"
+    /// Only populated for class/interface/struct nodes
+    #[serde(rename = "bc", default, skip_serializing_if = "String::is_empty")]
+    pub base_classes: String,
 }
 
 fn is_zero_usize(v: &usize) -> bool {
@@ -4779,6 +4797,8 @@ mod tests {
             decorators: Vec::new(),
             is_escape_local: false,
             framework_entry_point: crate::schema::FrameworkEntryPoint::None,
+            is_async: false,
+            base_classes: Vec::new(),
         };
 
         let hash1 = compute_symbol_hash(&symbol, "/path/to/file.ts");
@@ -4966,6 +4986,10 @@ export { formatName, processData };
                 is_exported: symbol.is_exported,
                 decorators: symbol.decorators.join(","),
                 arity: symbol.arguments.len() + symbol.props.len(),
+                is_async: symbol.is_async,
+                return_type: symbol.return_type.clone().unwrap_or_default(),
+                ext_package: String::new(),
+                base_classes: symbol.base_classes.join(","),
             });
         }
 
